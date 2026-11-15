@@ -35,3 +35,67 @@ RED: in a minimal core-only workspace, `cargo test -p forgedm-core --test tls_sm
 Key resolved versions: tokio 1.54.1, reqwest 0.13.5, rustls 0.23.46, aws-lc-rs 1.19.0, sqlx 0.9.0, libsqlite3-sys 0.37.0, serde 1.0.229, serde_json 1.0.154, clap 4.6.7, sha2 0.11.1 (and 0.10.9 transitive via sqlx), uuid 1.29.2, url 2.5.8, windows 0.62.2.
 
 Not run in S0.1: `cargo deny --locked check` (scheduled for the Phase 0/1 gates) and coverage (no logic exists yet).
+
+### S0.3 Protocol v1 (2026-11-15)
+
+RED: not recorded in the slice results (no RED run was reported).
+
+| Command | Exit | Result |
+|---|---|---|
+| `cargo fmt -p forgedm-protocol -- --check` | 0 | clean |
+| `cargo clippy -p forgedm-protocol --all-targets --locked -- -D warnings` | 0 | clean |
+| `cargo test -p forgedm-protocol --locked` | 0 | 21 passed, 0 failed, 0 ignored: envelope 8, frame 6, golden 1, proptests 3, validate 1, version 2 |
+| `git diff --exit-code Cargo.lock` | 0 | unchanged |
+
+An earlier run of `cargo test -p forgedm-protocol --locked` failed on a new test written in this slice: its input used a tolerant enum, so it parsed. The input was changed to a strict enum (`priority`); no implementation or other test was changed. The exit code of that earlier run was not recorded.
+
+ecc:code-reviewer reported re-running the same test command with the same result (reviewer report, not a coordinator run).
+
+NOT RUN (plan_tests_missing): none. All 12 plan tests exist under their exact names and pass. 5 tests were added beyond the plan.
+
+### S0.4 Platform security primitives (2026-11-15)
+
+RED: `cargo test -p forgedm-platform --locked --no-run` failed before implementation: `could not compile forgedm-platform (test "dpapi") due to 2 previous errors`, `(test "folders") due to 3`, `(test "security") due to 36`; e.g. E0425 cannot find function `create_pipe_instance` in module `pipe`, E0432 unresolved import `forgedm_platform::PlatformError`.
+
+| Command | Exit | Result |
+|---|---|---|
+| `cargo test -p forgedm-platform --locked --test security` (first run, after the new tests were added) | 101 | not green: the new surrogate and pass-through tests and the SACL-flag assertion failed. Causes: test literals lost a backslash; the SACL expectation was wrong. |
+| `cargo fmt -p forgedm-platform -- --check` | 0 | clean, after running `cargo fmt -p forgedm-platform` |
+| `cargo clippy -p forgedm-platform --all-targets --locked -- -D warnings` | 0 | clean; no lint relaxed |
+| `cargo test -p forgedm-platform --locked` | 0 | 23 passed, 0 failed, 0 ignored: security 14, folders 3, dpapi 6 (lib and doc-test binaries run 0 tests) |
+| `git diff --exit-code Cargo.lock` | 0 | unchanged |
+
+The surrogate test was written against the lossless `wide.rs` implementation and has no direct red run against the old lossy behaviour. That behaviour was reproduced earlier by the verifier, not in this slice's runs.
+
+NOT RUN (plan_tests_missing): none. 8 tests were added beyond the plan minimum.
+Not covered: no test shows that a low-integrity or foreign principal is denied, and `PIPE_REJECT_REMOTE_CLIENTS` is not asserted. Cross-user denial is verified only by the SDDL readback (open issue).
+
+### S0.5 Fixture server baseline (2026-11-15)
+
+RED: `cargo test -p forgedm-fixture --locked` before implementation: error[E0432] unresolved imports `forgedm_fixture::verify`, `forgedm_fixture::FixtureServer` and `forgedm_fixture::content` ("no content in the root"); `could not compile forgedm-fixture (test "content") due to 2 previous errors` and `(test "server") due to 1 previous error`.
+
+| Command | Exit | Result |
+|---|---|---|
+| `cargo fmt -p forgedm-fixture -- --check` | 0 | clean |
+| `cargo clippy -p forgedm-fixture --all-targets --locked -- -D warnings` | 0 | clean; only the 2 pre-existing root `clippy.toml` unreachable-path warnings |
+| `cargo test -p forgedm-fixture --locked` | 0 | 22 passed, 0 failed, 0 ignored: unit 6, cli 2, content 3, server 11 |
+| `git diff --exit-code Cargo.lock` | 0 | unchanged |
+
+ecc:rust-reviewer reported re-running the same test command with the same passing counts (reviewer report, not a coordinator run).
+
+NOT RUN (plan_tests_missing): none. Not covered: the ctrl_c-failure fallback and the accept-error backoff have no regression tests (open issue).
+
+### W1 wave gate (2026-11-15)
+
+RED: not applicable. This is the gate run over the workspace after S0.3, S0.4 and S0.5; their RED lines are in the sections above.
+
+| Command | Exit | Result |
+|---|---|---|
+| `cargo fmt --all -- --check` | 0 | no formatting differences reported across the workspace |
+| `cargo clippy --workspace --all-targets --locked -- -D warnings` | 0 | all 8 crates checked; no warnings or errors |
+| `cargo test --workspace --locked` | 0 | 67 passed, 0 failed, 0 ignored across 30 result lines: core tls_smoke 1; fixture 22; platform 23; protocol 21; all other suites 0 tests |
+| `git diff --exit-code Cargo.lock` | 0 | unchanged |
+
+Run with cargo 1.100.0 and `CARGO_TARGET_DIR` unset. Gate all_green: true. Fixes applied during the gate: none. Full test log kept in the session scratchpad as `w1_test.log`.
+
+NOT RUN (plan_tests_missing): none reported for the W1 slices.

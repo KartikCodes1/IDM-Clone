@@ -13,8 +13,10 @@ Updated 2026-11-15.
 - `CLAUDE.md` exists and stays concise.
 
 ## Next
-1. **GATE 2:** show the user the S0.1+S0.2 diff summary and proposed commit messages, and get confirmation before committing. Ask whether later commits may be confirmed per wave.
-2. **W1, in parallel in the main checkout:**
+1. **Done:** GATE 2 confirmed, commits `a47b9d5` (scaffold) and `b1e8727` (docs + specs). The user chose **one commit confirmation per wave**, with one commit per slice.
+   - Reusable wave workflow script: `~/.claude/projects/C--Users-karti-Desktop-IDM-Clone/<session>/workflows/scripts/forgedm-wave-*.js`
+   - It takes args `{wave, slices:[{id,title,crate,owns,refs,reviewers,notes}]}`.
+2. **W1 (running), in parallel in the main checkout:**
    - S0.3 Protocol v1 (owns `crates/forgedm-protocol/**`)
    - S0.4 Platform security primitives (platform files per PLAN S0.4)
    - S0.5 Fixture baseline (`tests/fixtures/**`)
