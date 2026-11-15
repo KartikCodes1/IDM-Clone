@@ -6,6 +6,8 @@
 //!   before the first write, correlate responses by `request_id`, 10 s request timeout.
 //! - [`identity`]: the pure identity decision shared by both sides.
 //! - [`subscribe`]: the bounded per-connection event queue (the hub is in the agent).
+//! - [`paths`]: the default data root and the pipe name shared by the agent and its clients.
+//! - [`bootstrap`]: connect to the agent, starting it when it is not running.
 //!
 //! All Win32 FFI goes through `forgedm-platform`; this crate contains no `unsafe`.
 
@@ -13,15 +15,19 @@
 
 use std::time::Duration;
 
+pub mod bootstrap;
 pub mod client;
 pub mod error;
 pub mod identity;
+pub mod paths;
 pub mod server;
 pub mod subscribe;
 
+pub use bootstrap::{BootstrapError, BootstrapOptions, ensure_agent, ensure_agent_with};
 pub use client::{Client, ClientConfig};
 pub use error::IpcError;
 pub use identity::{decide_identity, verify_pid};
+pub use paths::{default_data_root, pipe_name_for};
 pub use server::{
     CloseReason, Connection, HandlerFuture, RequestHandler, Server, ServerOptions, Timeouts,
     serve_connection,
