@@ -60,6 +60,10 @@ This log records the reviews that actually ran: the reviewer, the scope, each fi
 | 2026-11-15 | S0.10b | ecc:rust-reviewer | 0 | 0 | 0 | 3 (reported 1 Medium, verified Low) | 0 |
 | 2026-11-15 | S0.10b | ecc:security-reviewer | 0 | 0 | 0 | 0 | 0 |
 | 2026-11-15 | S0.10b | ecc:code-reviewer | 0 | 0 | 0 | 4 (reported 1 Medium, verified Low) | 0 |
+| 2026-11-15 | S1.7 | ecc:rust-reviewer | 0 | 0 | 1 (fixed) | 6 (3 fixed, 3 not fixed) | 0 |
+| 2026-11-15 | S1.7 | ecc:security-reviewer | 0 | 0 | 0 | 3 (not fixed) | 0 |
+| 2026-11-15 | S1.7 | ecc:code-reviewer | 0 | 0 | 1 (fixed) | 2 (not fixed) | 0 |
+| 2026-11-15 | S1.7 | ecc:silent-failure-hunter | 0 | 0 | 1 (fixed, fail-closed agent side) | 7 (1 fixed, 6 not fixed) | 0 |
 
 Process: each Medium or higher finding went to an independent verifier asked to refute it, and was fixed only if confirmed. Low findings were passed to the fixer unverified.
 
@@ -401,6 +405,36 @@ Other Low findings:
 Verifier-rejected: none.
 The ecc:security-reviewer reported no findings (count 0).
 Re-review: none recorded.
+
+### S1.7 Single-stream vertical slice through agent and CLI (0 Critical/High; 3 Medium, all fixed; 18 Low, 4 fixed)
+
+Confirmed (verified) findings:
+- S1.7-silent-failure-hunter-14 (MEDIUM): the expected SHA-256 could be silently lost, so checksum verification failed open. **Fixed (agent side)**: `require_expected_sha` fails closed; a missing enqueued event or unreadable JSON returns StoreError, and job_from uses it. Unit test added. The column-writer fix needs a forgedm-storage change, outside ownership, so it is open. Side effect: once the 200-event retention prunes the enqueued event, such a job fails to load (an error, not a silent skip).
+- S1.7-rust-reviewer-3 (MEDIUM): `watch` and `add --watch` never ended for a download paused by disk full. **Fixed**: the CLI follow ends a download paused with disk_full or destination_unavailable with exit 13; ending_text includes the state_reason; unit test added. Design decision to confirm: A.8 defines no exit 13 for paused.
+- S1.7-code-reviewer-11 (MEDIUM): the "restarts from 0" notice depended on a transient state_reason and was untested in the CLI. **Fixed**: follow reads DownloadDetail.recent_events and prints the notice on a durable restart_from_zero event; the transient check is kept. No CLI e2e test for it.
+- S1.7-rust-reviewer-1 (LOW): enqueue can report busy after the job was in fact created. **Not fixed**: the behaviour matches the contract, which defers idempotency keys.
+- S1.7-rust-reviewer-2 (LOW): staging file leaked when probe-fact persistence failed after create_part. **Fixed**: stage() deletes the new staging file by handle via a save_facts helper. No dedicated test; a store failure cannot be injected cheaply.
+- S1.7-silent-failure-hunter-15 (LOW): panic recovery swallows store errors and can leave the download non-terminal. **Not fixed**.
+- S1.7-silent-failure-hunter-16 (LOW): settle/park failures only log, leaving the DB state stale and no terminal event emitted. **Not fixed**.
+- S1.7-silent-failure-hunter-17 (LOW): HubSink drops state events when the summary cannot be loaded or the hub is gone, with no resync. **Not fixed**.
+- S1.7-silent-failure-hunter-18 (LOW): a missing staging file id is downgraded to a warning, which later disables safe cleanup silently. **Not fixed**: refusing to delete a file without a recorded id is the intended fail-safe.
+
+Other LOW findings (not verified, per the process above):
+- S1.7-rust-reviewer-4: blocking free-space query runs on the async runtime. **Not fixed**.
+- S1.7-rust-reviewer-5: get_download_true_bytes_midway can fail spuriously. **Not fixed**.
+- S1.7-rust-reviewer-6: expected checksum recovered from a bounded, newest-first event scan. **Fixed**: same change as silent-failure-hunter-14 (fails closed).
+- S1.7-rust-reviewer-7: doc claimed the file cursor is never used, but seek_write moves it. **Fixed**: the writer.rs module doc says writes are positional.
+- S1.7-security-reviewer-8: no test proves the path_escape invariant (FS-02). **Not fixed**.
+- S1.7-security-reviewer-9: target directory not re-verified at finalize time. **Not fixed**.
+- S1.7-security-reviewer-10: unknown-length downloads recheck free space only every 1 GiB. **Not fixed**.
+- S1.7-code-reviewer-12: ENGINE_REPLY_TIMEOUT defined twice. **Not fixed**.
+- S1.7-code-reviewer-13: events_hub.rs is 844 lines, over the 800-line soft ceiling, with no in-code rationale. **Not fixed**.
+- S1.7-silent-failure-hunter-19: free-space query failure fails open. **Not fixed**.
+- S1.7-silent-failure-hunter-20: writer thread join result discarded. **Fixed**: logged at error level; the frontier is still returned.
+- S1.7-silent-failure-hunter-21: MOTW status and checksum-mismatch audit events are best-effort. **Not fixed**.
+
+Verifier-rejected: none.
+Re-review: none recorded (re-review null). The MEDIUM and LOW fixes have not been re-reviewed.
 
 ## Not run
 

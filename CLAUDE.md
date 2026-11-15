@@ -30,5 +30,6 @@ Source of truth:
 ## Gates
 - Tests come first (RED, then GREEN). Fresh-context ECC reviewers check every slice. Zero open Critical/High before a slice is done.
 - Evidence goes in `docs/TEST_EVIDENCE.md`: real commands and exit codes. Anything not run is recorded as NOT RUN.
-- Never commit without the user's GATE 2 confirmation. Never push without asking. Use conventional commits.
+- GATE 2: since 2026-11-16 the user allows the coordinator to auto-commit each wave once its gate is green and the coordinator's own re-run matches. Implementer and reviewer agents never commit. Never push without asking. Use conventional commits.
+- Load: `CARGO_BUILD_JOBS=6`, `RUST_TEST_THREADS=6`, and one heavy build at a time. Parallel full builds froze the PC once.
 - Don't use `tauri dev`, which the ECC hook blocks. Use `tauri build --debug --no-bundle`.

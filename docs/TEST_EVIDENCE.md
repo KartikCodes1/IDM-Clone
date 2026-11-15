@@ -433,3 +433,71 @@ Gate all_green: true. Workspace tests: 448 passed, 0 failed, 1 ignored. Fixes ap
 
 NOT RUN (plan_tests_missing): none listed for S1.5, S1.6, S1.8, S0.9 or S0.10b (all empty). Not in the W4 gate command list, so not run: `cargo deny --locked check` and coverage (cargo-llvm-cov). The 80% coverage target is therefore not verified for this wave. The ignored real-IAE test was run in S1.6 with `--include-ignored` (21 passed) but not in this gate.
 
+### S1.7 Single-stream vertical slice through agent and CLI (2026-11-15)
+
+RED: not captured. The tests and implementation already existed from an interrupted attempt, so a RED-first run could not be reproduced honestly. The only failure observed was the initial `cargo clippy -D warnings` run on `crates/forgedm-cli/tests/e2e_single_stream.rs` (3 expect/unwrap lints; exit not recorded). It is fixed. No RED run was captured for the new tests, which were written with their fixes.
+
+| Command | Exit | Result |
+|---|---|---|
+| `cargo fmt -p forgedm-core -p forgedm-agent -p forgedm-cli` | 0 | formatted |
+| `cargo clippy -p forgedm-core -p forgedm-agent -p forgedm-cli --all-targets --locked -- -D warnings` | 0 | clean |
+| `cargo test -p forgedm-core --locked` | 0 | all suites pass, 0 failed |
+| `cargo test -p forgedm-agent -p forgedm-cli --locked` | 0 | agent 66 unit, 9 enqueue_e2e, 2 hub, 13 process; cli 22 unit, 9 cli_basic, 5 e2e; 0 failed |
+| `cargo fmt -p forgedm-core -- --check` | 0 | clean |
+| `git diff --exit-code Cargo.lock` | 0 | unchanged |
+
+Per-suite counts are copied from filtered test output. The slice's own total was not summed by the implementer, so no slice total is recorded here. The workspace total for this wave is in the W5 wave gate section below.
+
+NOT RUN (plan_tests_missing): none reported. Not run: coverage (cargo-llvm-cov). No coverage was measured for S1.7. The CLI paths have unit tests only; no CLI e2e test covers the restart notice or a paused download.
+
+Deviations:
+- Resumed work: the interrupted attempt had already written essentially all of the slice. It was inspected, built and run. The one change was a file-level `#![allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]` in `crates/forgedm-cli/tests/e2e_single_stream.rs`, as the sibling test files do. No lint was relaxed elsewhere and no test was altered.
+- The MEDIUM fixes were applied in forgedm-agent and forgedm-cli as well as forgedm-core, because the findings sit in those crates and they are in ownership.
+- `watch` and `add --watch` end a download paused with `disk_full` or `destination_unavailable` with exit 13. A.8 defines no exit code for paused. This extends the `needs_*` precedent and is a design decision for the coordinator to confirm.
+- `follow` reads `DownloadDetail.recent_events` and prints the restart notice on a durable `restart_from_zero` event; the transient `state_reason` check is kept. The CLI has its own literal for the event kind, not a shared constant.
+- The expected SHA-256 lookup fails closed: a missing enqueued event or unreadable JSON returns StoreError. A unit test was added.
+- `stage()` deletes the new staging file by handle when probe-fact persistence fails (new `save_facts` helper in `engine/task.rs`). No dedicated test; a store failure cannot be injected cheaply.
+- `writer.rs` logs a writer-thread join failure at error level and still returns the frontier. Its module doc now says writes are positional and the cursor is not relied on.
+- The review findings come from reviewer reports supplied with this slice. The implementer did not run those agents, and they are not coordinator runs. Several reviewers reported that they did not run cargo.
+- `crates/forgedm-agent/src/events_hub.rs` is 844 lines, over the 800-line soft ceiling. Tests make up the module from line 463 onward.
+
+Open:
+- S1.7-silent-failure-hunter-14: the proper fix is a `checksum_expected` column writer in forgedm-storage, which is outside ownership. The agent-side fix fails closed for now. Side effect: once the 200-event retention prunes the enqueued event, such a job fails to load. That is an error instead of a silent skip of the checksum.
+- Not fixed (LOW, optional): S1.7-rust-reviewer-1, -4, -5; S1.7-silent-failure-hunter-15, -16, -17, -18, -19, -21; S1.7-security-reviewer-8, -9, -10; S1.7-code-reviewer-12, -13 (events_hub.rs size).
+- No re-review was recorded for S1.7 (re-review null).
+
+### W5 wave gate (2026-11-15)
+
+RED: not applicable. This is the gate run over the workspace after S1.7; its RED note is in the section above.
+
+| Command | Exit | Result |
+|---|---|---|
+| `cargo fmt --all -- --check` (first pass, CARGO_TARGET_DIR unset, default target dir) | 0 | no formatting differences |
+| `cargo clippy --workspace --all-targets --locked -- -D warnings` (first pass) | 0 | clean, zero warnings; finished in 20.69s |
+| `cargo test --workspace --locked` (first pass) | 101 | compile failure: E0432/E0433 "could not find error/ports/client/engine/writer in forgedm_core" in forgedm-agent (lib and lib test) and in the forgedm-core test single_stream. Cause: a stale build artifact, not the source. The forgedm-core lib unit under `target/debug/build` was built at 01:42:05 from a checkout without the W5 modules, and cargo judged it fresh |
+| `cargo test -p forgedm-core --locked --no-run -v` (diagnostic) | 0 | with a different feature set, forgedm-core rebuilt and all its test targets compiled; the source is fine |
+| `cargo test --workspace --locked --no-run -v` (diagnostic) | 101 | confirmed forgedm-agent linked the stale `libforgedm_core-a3bf5fca883fed6d.rmeta` |
+| `cargo clean --locked -p forgedm-core -p forgedm-agent -p forgedm-cli` | 0 | removed 7600 files (3.4 GiB) of build output; no source touched |
+| `cargo test --workspace --locked` (second pass) | 101 | everything compiled. `forgedm-protocol --test golden` failed: `golden_files_roundtrip_value_equal` gave `Error: Os { code: 3, kind: NotFound }`. Cause: a stale binary with `CARGO_MANIFEST_DIR` baked in from a separate checkout, `C:\Users\karti\Desktop\forgedm-p0gate`, which no longer exists. Units of forgedm-desktop, forgedm-protocol and forgedm-storage (x5) carried that path |
+| `cargo clean --locked -p forgedm-protocol -p forgedm-platform -p forgedm-ipc -p forgedm-storage -p forgedm-fixture -p forgedm-desktop -p forgedm-core -p forgedm-agent -p forgedm-cli` | 0 | removed 20723 files (11.1 GiB) of workspace-member build output; afterwards no dep-info under `target/debug/build` references forgedm-p0gate |
+| `cargo fmt --all -- --check` (rerun after clean) | 0 | no formatting differences |
+| `cargo clippy --workspace --all-targets --locked -- -D warnings` (rerun after clean) | 0 | all 9 members re-checked; zero warnings or errors |
+| `cargo test --workspace --locked` (rerun after clean; CARGO_BUILD_JOBS=6, RUST_TEST_THREADS=6) | 0 | 67 test-result blocks: 535 passed, 0 failed, 1 ignored (forgedm-platform `iae_from_sta_writes_zone_identifier`, which needs the real shell attachment service). Includes forgedm-cli e2e_single_stream 5/5 (incl. add_watch_completes_prints_sha, wrong_sha_exits_13), forgedm-agent enqueue_e2e and forgedm-core single_stream |
+| `git diff --exit-code Cargo.lock` | 0 | unchanged (checked before the build and again at the end) |
+| `cargo build --workspace --bins --locked` | 0 | built forgedm.exe, forgedm-agent.exe, forgedm-desktop.exe and forgedm-fixture.exe in 14.52s |
+| `target\debug\forgedm-fixture.exe serve --port 0` (background) | 0 | pid 8796, printed base `http://127.0.0.1:58352`; killed at the end of the smoke |
+| `target\debug\forgedm-fixture.exe hash --seed 42 --size 10485763` | 0 | `8249c7229eb3f629303c4dcc7d8b9c0b3d1c06d0763739fb3aec54dd2d681af6` |
+| `target\debug\forgedm.exe --data-dir <smoke data> add <fixture URL>/f/42/10485763 --dir dl-ok --sha256 <hash> --watch` | 0 | no agent was running; bootstrap auto-started it (forgedm.db, run\agent.lock and logs created). queued -> probing -> downloading -> verifying -> finalizing -> completed; printed final path and sha256 |
+| verify dl-ok (size, `Get-FileHash -Algorithm SHA256`, `Get-Content -Stream Zone.Identifier`, `*.forgedm.part`) | 0 | file is 10485763 bytes; SHA256 matches the expected hash; Zone.Identifier has ZoneId=3 and a query-free HostUrl; 0 `.part` files left |
+| `forgedm ... add <fixture URL>/f/42/10485763 --dir dl-badsha --sha256 0000...0000 --watch` | 13 | queued -> probing -> downloading -> verifying -> failed. stderr: `the download ended: failed (checksum_mismatch): the SHA-256 checksum does not match`. The `.part` was kept (10485763 bytes) |
+| `forgedm ... agent stop` | 0 | "agent is shutting down"; the agent log shows "agent stopped" |
+| `Get-Process forgedm*` after agent stop and fixture kill (+3 s); `tasklist` grep for forgedm, cargo and rustc | 0 | 0 forgedm processes left; no cargo or rustc left (grep exit 1 = no match) |
+| `powershell -NoProfile -ExecutionPolicy Bypass -File scripts\check.ps1` | 0 | 13 PASS, 0 FAIL, 0 NOT RUN (no-tls-bypass, no-assert-sql-safe, unsafe-only-in-platform, command-new-allowlist, layering, no-fixture-in-shipped, no-fault-injection-in-release, no-reqwest-compression, tauri-versions-match, no-loose-versions, lockfiles-committed, manifest-asinvoker, eslint-bans) |
+
+Gate all_green: true. Workspace tests: 535 passed, 0 failed, 1 ignored. Fixes applied during the gate: no source, test, manifest or lockfile changes. Only build output was cleaned. The two `cargo test --workspace` runs that exited 101 before the clean were stale-artifact compile failures; they are recorded above and are not counted as results.
+
+Problems and notes:
+- Process hazard, resolved for this gate: a run from the separate checkout `C:\Users\karti\Desktop\forgedm-p0gate` wrote into this repo's target dir (`C:\Users\karti\Desktop\IDM Clone\target`) at about 01:42. It left fingerprints that poisoned workspace members. Any future out-of-tree copy must use its own CARGO_TARGET_DIR. That build overlapped the W5 slice builds and may have added to the load on the PC; this cannot be confirmed from the artifacts.
+- Observation, not a failure: the smoke file's Zone.Identifier ends with a 0x00 byte and has no trailing CRLF (71 bytes). The agent attributes the rewrite to IAttachmentExecute in apply_motw. ZoneId=3 and a query-free HostUrl are present. The only ignored test covering this real-shell path (`iae_from_sta_writes_zone_identifier`) was not run in this gate, so the smoke is its only live evidence here.
+- Not run: `cargo deny --locked check` and coverage (cargo-llvm-cov) are not in the gate command list. No coverage was measured for W5. The gate report's own NOT RUN list was truncated, so no further items are recorded.
+
