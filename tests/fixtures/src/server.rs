@@ -2,8 +2,11 @@
 
 use crate::body::FixtureBody;
 use crate::flags::{self, Flags};
-use crate::log::{LoggedRequest, RequestLog};
-use crate::response::{self, Target};
+use crate::log::{InFlight, LoggedRequest, RequestLog};
+use crate::raw;
+use crate::response::{self, error_response};
+use crate::scenario::{self, Ctx, Resolved};
+use crate::state::Shared;
 use http::{Method, Request, Response, StatusCode, header};
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
@@ -13,7 +16,7 @@ use std::io;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use tokio::net::TcpListener;
+use tokio::net::{TcpListener, TcpStream};
 use tokio::task::{JoinHandle, JoinSet};
 
 /// Errors starting the fixture server.
@@ -63,7 +66,8 @@ impl FixtureServer {
             .map_err(|source| FixtureError::Bind { port, source })?;
         let addr = listener.local_addr().map_err(FixtureError::LocalAddr)?;
         let log = RequestLog::default();
-        let task = tokio::spawn(accept_loop(listener, log.clone()));
+        let shared = Shared::new(log.clone(), addr.port());
+        let task = tokio::spawn(accept_loop(listener, shared));
         Ok(Self { addr, log, task })
     }
 
@@ -92,14 +96,23 @@ impl Drop for FixtureServer {
     }
 }
 
+/// Identity of one accepted connection.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Conn {
+    /// Server-assigned connection id.
+    pub id: u64,
+    /// Remote TCP port.
+    pub peer_port: u16,
+}
+
 const ACCEPT_BACKOFF: Duration = Duration::from_millis(50);
 
-async fn accept_loop(listener: TcpListener, log: RequestLog) {
+async fn accept_loop(listener: TcpListener, shared: Shared) {
     let next_conn = AtomicU64::new(0);
     // Dropping the set (when this task is aborted) aborts every connection task.
     let mut connections = JoinSet::new();
     loop {
-        let (stream, _peer) = match listener.accept().await {
+        let (stream, peer) = match listener.accept().await {
             Ok(accepted) => accepted,
             Err(e) => {
                 // Per-connection failures are retried at once; anything else (for example
@@ -113,20 +126,30 @@ async fn accept_loop(listener: TcpListener, log: RequestLog) {
                 continue;
             }
         };
-        let conn_id = next_conn.fetch_add(1, Ordering::Relaxed);
-        let log = log.clone();
-        connections.spawn(async move {
-            let service = service_fn(move |req: Request<hyper::body::Incoming>| {
-                let log = log.clone();
-                async move { Ok::<_, Infallible>(respond(&req, conn_id, &log)) }
-            });
-            // A connection error (peer reset, deliberate drop_after) only ends that connection.
-            let _ = http1::Builder::new()
-                .serve_connection(TokioIo::new(stream), service)
-                .await;
-        });
+        let conn = Conn {
+            id: next_conn.fetch_add(1, Ordering::Relaxed),
+            peer_port: peer.port(),
+        };
+        connections.spawn(serve_connection(stream, shared.clone(), conn));
         while connections.try_join_next().is_some() {}
     }
+}
+
+/// Routes the connection to the raw socket path when its first request asks for a raw mode,
+/// otherwise to hyper.
+async fn serve_connection(stream: TcpStream, shared: Shared, conn: Conn) {
+    if raw::wants_raw(&stream).await {
+        raw::serve(stream, &shared, conn).await;
+        return;
+    }
+    let service = service_fn(move |req: Request<hyper::body::Incoming>| {
+        let shared = shared.clone();
+        async move { Ok::<_, Infallible>(respond(&req, conn, &shared)) }
+    });
+    // A connection error (peer reset, deliberate drop_after) only ends that connection.
+    let _ = http1::Builder::new()
+        .serve_connection(TokioIo::new(stream), service)
+        .await;
 }
 
 fn unix_ms() -> u64 {
@@ -135,7 +158,7 @@ fn unix_ms() -> u64 {
         .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
 }
 
-fn header_text<B>(req: &Request<B>, name: header::HeaderName) -> Option<String> {
+pub(crate) fn header_text<B>(req: &Request<B>, name: header::HeaderName) -> Option<String> {
     req.headers()
         .get(name)
         .and_then(|v| v.to_str().ok())
@@ -144,7 +167,7 @@ fn header_text<B>(req: &Request<B>, name: header::HeaderName) -> Option<String> 
 
 /// Why a request is refused before any content is produced.
 #[derive(Debug, thiserror::Error)]
-enum Rejection {
+pub(crate) enum Rejection {
     #[error("not found")]
     NotFound,
     #[error("seed and size must be u64")]
@@ -153,21 +176,31 @@ enum Rejection {
     BadFlag(#[from] flags::FlagError),
     #[error("method not allowed")]
     MethodNotAllowed,
+    #[error("raw and lie_cl flags need the first request of a fresh connection")]
+    RawNeedsFreshConnection,
+    #[error("lie_cl cannot be combined with the {0} flag")]
+    UnsupportedWithLieCl(&'static str),
 }
 
 impl Rejection {
-    fn into_response(self) -> Response<FixtureBody> {
-        let status = match self {
+    pub(crate) fn status(&self) -> StatusCode {
+        match self {
             Self::NotFound => StatusCode::NOT_FOUND,
-            Self::BadPath | Self::BadFlag(_) => StatusCode::BAD_REQUEST,
+            Self::BadPath
+            | Self::BadFlag(_)
+            | Self::RawNeedsFreshConnection
+            | Self::UnsupportedWithLieCl(_) => StatusCode::BAD_REQUEST,
             Self::MethodNotAllowed => StatusCode::METHOD_NOT_ALLOWED,
-        };
-        response::error_response(status, &self.to_string())
+        }
+    }
+
+    fn into_response(self) -> Response<FixtureBody> {
+        error_response(self.status(), &self.to_string())
     }
 }
 
 /// Splits `/f/{seed}/{size}` into its numbers.
-fn parse_path(path: &str) -> Result<(u64, u64), Rejection> {
+pub(crate) fn parse_path(path: &str) -> Result<(u64, u64), Rejection> {
     let mut parts = path.strip_prefix("/f/").unwrap_or("").split('/');
     let (Some(seed), Some(size), None) = (parts.next(), parts.next(), parts.next()) else {
         return Err(Rejection::NotFound);
@@ -178,11 +211,14 @@ fn parse_path(path: &str) -> Result<(u64, u64), Rejection> {
     }
 }
 
-/// Logs the request and produces its response.
-fn respond<B>(req: &Request<B>, conn_id: u64, log: &RequestLog) -> Response<FixtureBody> {
-    let query = req.uri().query().unwrap_or("");
-    let pairs = flags::parse_query(query);
-    log.record(LoggedRequest {
+/// Appends the request to the log (header values are never stored, only presence).
+pub(crate) fn log_request<B>(
+    req: &Request<B>,
+    conn: Conn,
+    shared: &Shared,
+    pairs: &[(&str, &str)],
+) {
+    shared.log.record(LoggedRequest {
         seq: 0,
         method: req.method().to_string(),
         target: req
@@ -191,14 +227,35 @@ fn respond<B>(req: &Request<B>, conn_id: u64, log: &RequestLog) -> Response<Fixt
             .map_or_else(|| req.uri().path().to_owned(), ToString::to_string),
         range: header_text(req, header::RANGE),
         if_range: header_text(req, header::IF_RANGE),
-        conn_id,
-        test_key: Flags::test_key_of(&pairs),
+        conn_id: conn.id,
+        test_key: Flags::test_key_of(pairs),
         at_unix_ms: unix_ms(),
+        peer_port: conn.peer_port,
+        has_authorization: req.headers().contains_key(header::AUTHORIZATION),
+        has_cookie: req.headers().contains_key(header::COOKIE),
     });
-    route(req, &pairs).unwrap_or_else(Rejection::into_response)
 }
 
-fn route<B>(req: &Request<B>, pairs: &[(&str, &str)]) -> Result<Response<FixtureBody>, Rejection> {
+/// True when the request carries `Authorization: Basic ...` (the credentials are not checked).
+fn has_basic_auth<B>(req: &Request<B>) -> bool {
+    header_text(req, header::AUTHORIZATION).is_some_and(|v| {
+        v.get(..6)
+            .is_some_and(|scheme| scheme.eq_ignore_ascii_case("basic "))
+    })
+}
+
+/// Logs the request and produces its response.
+fn respond<B>(req: &Request<B>, conn: Conn, shared: &Shared) -> Response<FixtureBody> {
+    let pairs = flags::parse_query(req.uri().query().unwrap_or(""));
+    log_request(req, conn, shared, &pairs);
+    route(req, &pairs, shared).unwrap_or_else(Rejection::into_response)
+}
+
+fn route<B>(
+    req: &Request<B>,
+    pairs: &[(&str, &str)],
+    shared: &Shared,
+) -> Result<Response<FixtureBody>, Rejection> {
     let (seed, size) = parse_path(req.uri().path())?;
     let flags = Flags::from_pairs(pairs)?;
     let is_head = match *req.method() {
@@ -206,14 +263,37 @@ fn route<B>(req: &Request<B>, pairs: &[(&str, &str)]) -> Result<Response<Fixture
         Method::HEAD if flags.head => true,
         _ => return Err(Rejection::MethodNotAllowed),
     };
-    let range = header_text(req, header::RANGE);
-    let if_range = header_text(req, header::IF_RANGE);
-    let target = Target {
-        is_head,
-        seed,
-        size,
-        range: range.as_deref(),
-        if_range: if_range.as_deref(),
+    if flags.raw.is_some() || flags.lie_cl.is_some() {
+        return Err(Rejection::RawNeedsFreshConnection);
+    }
+    let Some(slot) = shared.log.try_enter(flags.max_conns) else {
+        return Ok(error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "max_conns exceeded",
+        ));
     };
-    Ok(response::build(&flags, &target))
+    let ctx = Ctx {
+        path: req.uri().path(),
+        query: req.uri().query().unwrap_or(""),
+        size,
+        has_basic_auth: has_basic_auth(req),
+        shared,
+    };
+    let resp = scenario::early_response(&flags, &ctx).unwrap_or_else(|| {
+        let resolved = Resolved::new(
+            &flags,
+            shared,
+            ctx.path,
+            header_text(req, header::RANGE),
+            header_text(req, header::IF_RANGE),
+        );
+        response::build(&flags, &resolved.target(is_head, seed, size))
+    });
+    Ok(attach(resp, slot))
+}
+
+/// Keeps `slot` held until the response body is finished or dropped.
+fn attach(resp: Response<FixtureBody>, slot: InFlight) -> Response<FixtureBody> {
+    let (parts, body) = resp.into_parts();
+    Response::from_parts(parts, body.with_guard(slot))
 }

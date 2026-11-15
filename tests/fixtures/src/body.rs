@@ -1,6 +1,7 @@
-//! Response body: generated content streamed in chunks, optionally throttled or aborted.
+//! Response body: generated content streamed in chunks, optionally throttled, stalled or aborted.
 
 use crate::content;
+use crate::log::InFlight;
 use bytes::Bytes;
 use futures_util::{Stream, StreamExt, stream};
 use hyper::body::{Body, Frame, SizeHint};
@@ -26,12 +27,18 @@ pub struct Delivery {
     pub slow_bps: Option<u64>,
     /// Abort the connection once this many body bytes were sent.
     pub drop_after: Option<u64>,
+    /// Stop sending (but keep the connection open) once this many body bytes were sent.
+    pub stall_after: Option<u64>,
+    /// Absolute content offset from which `slow_bps` applies (0 when absent).
+    pub slow_from: Option<u64>,
 }
 
 /// The body type for every fixture response.
 pub struct FixtureBody {
     stream: ChunkStream,
     exact_len: Option<u64>,
+    /// Held until the body is finished or dropped, so concurrency covers the whole transfer.
+    guard: Option<InFlight>,
 }
 
 impl FixtureBody {
@@ -41,6 +48,7 @@ impl FixtureBody {
         Self {
             stream: Box::pin(stream::empty()),
             exact_len: Some(0),
+            guard: None,
         }
     }
 
@@ -51,6 +59,7 @@ impl FixtureBody {
         Self {
             stream: Box::pin(stream::once(async move { Ok(data) })),
             exact_len: Some(len),
+            guard: None,
         }
     }
 
@@ -71,7 +80,15 @@ impl FixtureBody {
         Self {
             stream: Box::pin(stream),
             exact_len: exact_length.then_some(len),
+            guard: None,
         }
+    }
+
+    /// Ties a concurrency slot to this body's lifetime.
+    #[must_use]
+    pub fn with_guard(mut self, guard: InFlight) -> Self {
+        self.guard = Some(guard);
+        self
     }
 }
 
@@ -98,38 +115,50 @@ struct GenState {
     seed: u64,
     pos: u64,
     end: u64,
-    cutoff: u64,
-    chunk: u64,
-    delay: Option<Duration>,
-    sent_any: bool,
+    drop_cutoff: u64,
+    stall_cutoff: u64,
+    /// Throttled chunk size, when `slow_bps` is set.
+    slow_chunk: Option<u64>,
+    slow_from: u64,
+    sent_throttled: bool,
     failed: bool,
 }
 
 impl GenState {
     fn new(seed: u64, start: u64, len: u64, delivery: Delivery) -> Self {
-        let end = start.saturating_add(len);
-        let chunk = delivery
-            .slow_bps
-            .map_or(CHUNK, |bps| (bps / TICKS_PER_SECOND).clamp(1, CHUNK));
+        let cutoff = |n: Option<u64>| n.map_or(u64::MAX, |n| start.saturating_add(n));
         Self {
             seed,
             pos: start,
-            end,
-            cutoff: delivery
-                .drop_after
-                .map_or(u64::MAX, |n| start.saturating_add(n)),
-            chunk,
-            delay: delivery.slow_bps.map(|_| SLOW_TICK),
-            sent_any: false,
+            end: start.saturating_add(len),
+            drop_cutoff: cutoff(delivery.drop_after),
+            stall_cutoff: cutoff(delivery.stall_after),
+            slow_chunk: delivery
+                .slow_bps
+                .map(|bps| (bps / TICKS_PER_SECOND).clamp(1, CHUNK)),
+            slow_from: delivery.slow_from.unwrap_or(0),
+            sent_throttled: false,
             failed: false,
         }
+    }
+
+    /// The size of the next chunk and whether it is delivered throttled.
+    fn next_size(&self) -> (u64, bool) {
+        let limit = self.end.min(self.drop_cutoff).min(self.stall_cutoff);
+        let (want, throttled, limit) = match self.slow_chunk {
+            Some(chunk) if self.pos >= self.slow_from => (chunk, true, limit),
+            // The fast prefix must stop exactly where throttling begins.
+            Some(_) => (CHUNK, false, limit.min(self.slow_from)),
+            None => (CHUNK, false, limit),
+        };
+        (want.min(limit - self.pos), throttled)
     }
 
     async fn next_chunk(mut self) -> Option<(Result<Bytes, io::Error>, Self)> {
         if self.failed || self.pos >= self.end {
             return None;
         }
-        if self.pos >= self.cutoff {
+        if self.pos >= self.drop_cutoff {
             self.failed = true;
             // Yield to the connection task (Pending) so hyper flushes the bytes already queued
             // before the abort; otherwise the headers and prefix could be discarded unsent.
@@ -140,14 +169,19 @@ impl GenState {
             );
             return Some((Err(err), self));
         }
-        if let (Some(delay), true) = (self.delay, self.sent_any) {
-            tokio::time::sleep(delay).await;
+        if self.pos >= self.stall_cutoff {
+            // Never completes: the connection stays open and silent until the peer gives up.
+            std::future::pending::<()>().await;
+            return None;
         }
-        let n = self.chunk.min(self.end.min(self.cutoff) - self.pos);
+        let (n, throttled) = self.next_size();
+        if throttled && self.sent_throttled {
+            tokio::time::sleep(SLOW_TICK).await;
+        }
         let mut buf = vec![0u8; usize::try_from(n).unwrap_or(0)];
         content::fill(self.seed, self.pos, &mut buf);
         self.pos += n;
-        self.sent_any = true;
+        self.sent_throttled |= throttled;
         Some((Ok(Bytes::from(buf)), self))
     }
 }

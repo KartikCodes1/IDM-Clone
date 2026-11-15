@@ -50,6 +50,46 @@ impl Client {
     }
 
     pub async fn send(&mut self, method: &str, target: &str, headers: &[(&str, &str)]) -> Response {
+        self.write_request(method, target, headers).await;
+        self.read_response(method == "HEAD").await
+    }
+
+    /// Sends a request and returns once the head is read, leaving the body unread.
+    pub async fn send_head_only(
+        &mut self,
+        method: &str,
+        target: &str,
+        headers: &[(&str, &str)],
+    ) -> Response {
+        self.write_request(method, target, headers).await;
+        self.read_response(true).await
+    }
+
+    /// Reads exactly `n` more bytes (panics on EOF).
+    pub async fn read_n(&mut self, n: usize) -> Vec<u8> {
+        let mut buf = vec![0u8; n];
+        self.reader.read_exact(&mut buf).await.expect("read_n");
+        buf
+    }
+
+    /// True when nothing arrives (and the peer does not close) for `d`.
+    pub async fn idle_for(&mut self, d: std::time::Duration) -> bool {
+        let mut b = [0u8; 1];
+        tokio::time::timeout(d, self.reader.read(&mut b))
+            .await
+            .is_err()
+    }
+
+    /// The client's local TCP port, as the server sees it.
+    pub fn local_port(&self) -> u16 {
+        self.reader
+            .get_ref()
+            .local_addr()
+            .expect("local addr")
+            .port()
+    }
+
+    async fn write_request(&mut self, method: &str, target: &str, headers: &[(&str, &str)]) {
         let mut req = format!("{method} {target} HTTP/1.1\r\nHost: fixture\r\n");
         for (k, v) in headers {
             req.push_str(&format!("{k}: {v}\r\n"));
@@ -60,7 +100,6 @@ impl Client {
             .write_all(req.as_bytes())
             .await
             .expect("write");
-        self.read_response(method == "HEAD").await
     }
 
     async fn read_line(&mut self) -> Option<String> {
@@ -147,4 +186,29 @@ impl Client {
             }
         }
     }
+}
+
+/// Sends `request` verbatim on a fresh connection and returns every byte until EOF (5 s cap).
+pub async fn raw_exchange(base: &str, request: &str) -> Vec<u8> {
+    let mut stream = TcpStream::connect(host_port(base)).await.expect("connect");
+    stream.write_all(request.as_bytes()).await.expect("write");
+    let mut out = Vec::new();
+    let _ = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        stream.read_to_end(&mut out),
+    )
+    .await;
+    out
+}
+
+/// Splits raw response bytes at the first blank line into (head text, body bytes).
+pub fn split_head(raw: &[u8]) -> (String, Vec<u8>) {
+    let at = raw
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .expect("head terminator");
+    (
+        String::from_utf8_lossy(&raw[..at]).into_owned(),
+        raw[at + 4..].to_vec(),
+    )
 }
