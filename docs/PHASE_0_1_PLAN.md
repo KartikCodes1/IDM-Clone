@@ -454,6 +454,21 @@ flowchart LR
 
 **Critical path:** S0.1 -> S0.4 -> S0.7 -> S0.8 -> S0.9 -> S0.11 -> S1.7 -> S1.9 -> S1.11 -> S1.12 -> S1.13 -> S1.14 -> S1.15. S1.11-S1.14 are serial because they share engine/worker files.
 
+**Re-sequencing (2026-11-16, user request: "get it ready and usable asap"; coordinator decision)**
+
+Waves after W4:
+- **W5:** S0.11 Phase 0 gate in parallel with S1.7. S0.11 only adds `scripts/` and docs and runs read-only reviews; S1.7 edits core/agent/cli. Any Critical/High that S0.11 finds is fixed before either is committed.
+- **W6:** S1.9.
+- **W7:** S1.10+ (desktop usable MVP) in parallel with S1.11.
+- **W8-W10:** S1.12 -> S1.13 -> S1.14 -> S1.15.
+
+S1.10+ is S1.10 extended with three Phase 2 items, pulled forward as a deliberate deviation:
+- desktop write commands: EnqueueUrl, Pause, Resume, Cancel, Retry, Remove, open folder, start engine. Each command and capability is listed explicitly.
+- live progress (1 Hz snapshot polling; event subscription stays Phase 2).
+- a per-user NSIS setup exe. It bundles forgedm-agent.exe and forgedm.exe next to the desktop exe. It is asInvoker, has no autostart and is unsigned (SmartScreen warns).
+
+Phase 2 still owns the rest: premium UI and motion, tray and notifications, opt-in autostart, scheduler, settings UI, and installer hardening and review.
+
 ---
 
 ## 7. Definition of Done

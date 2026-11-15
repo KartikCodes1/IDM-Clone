@@ -32,7 +32,12 @@ Updated 2026-11-15.
      - A small desktop follow-up (S0.10b, with S1.10) does three things: it uses that function instead of `whoami.exe`; it installs a tracing subscriber writing to `%LOCALAPPDATA%\ForgeDM\logs\desktop.*` (coordinator approves the `tracing-subscriber` + `tracing-appender` edges; this resolves the open S0.10 Medium); and it logs startup errors.
      - S1.15 removes unused deps (anyhow, serde in agent; others found by `unused_dependencies`).
      - Agent `--data-dir` user-only ACL check and log-filter scoping (S0.8 security Lows) are deferred to S1.14 / Phase 2.
-5. **Then:** W4 (S0.9 CLI, S1.5 fs, S1.6 MOTW, S1.8 bootstrap) and S0.11, the Phase 0 gate.
+5. **W4 is running** (serial: S1.5 -> S1.6 -> S1.8 -> {S0.9 CLI, S0.10b desktop logging + shared pipe name}). The coordinator committed nothing new before W4. Cargo.lock differs from HEAD only by 2 desktop edges (tracing-subscriber, tracing-appender).
+6. **Re-sequenced for "usable ASAP"** (PLAN section 6, 2026-11-16):
+   - W5: S0.11 in parallel with S1.7
+   - W6: S1.9
+   - W7: S1.10+ (desktop add-URL, controls, live progress, per-user NSIS setup exe) in parallel with S1.11
+   - W8-W10: S1.12, S1.13, S1.14, then S1.15, with a final installer rebuild
 4. **W1 slices as originally planned (all done):**
    - S0.3 Protocol v1 (owns `crates/forgedm-protocol/**`)
    - S0.4 Platform security primitives (platform files per PLAN S0.4)
