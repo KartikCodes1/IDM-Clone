@@ -45,6 +45,21 @@ This log records the reviews that actually ran: the reviewer, the scope, each fi
 | 2026-11-15 | S0.10 | ecc:security-reviewer | 0 | 0 | 0 | 0 | 0 |
 | 2026-11-15 | S0.10 | ecc:rust-reviewer | 0 | 0 | 1 (not fixed, open) | 5 | 0 |
 | 2026-11-15 | S0.10 | ecc:code-reviewer | 0 | 0 | 0 | 0 | 0 |
+| 2026-11-15 | S1.5 | ecc:rust-reviewer | 0 | 0 | 0 | 3 | 0 |
+| 2026-11-15 | S1.5 | ecc:security-reviewer | 0 | 0 | 0 | 2 | 0 |
+| 2026-11-15 | S1.5 | ecc:code-reviewer | 0 | 0 | 0 | 2 | 0 |
+| 2026-11-15 | S1.6 | ecc:rust-reviewer | 0 | 0 | 1 (fixed) | 3 | 0 |
+| 2026-11-15 | S1.6 | ecc:security-reviewer | 0 | 1 (fixed) | 0 (1 Medium rejected by verifier) | 1 | 0 |
+| 2026-11-15 | S1.6 | ecc:code-reviewer | 0 | 0 | 1 (fixed) | 2 | 0 |
+| 2026-11-15 | S1.8 | ecc:rust-reviewer | 0 | 0 | 1 (fixed) | 1 | 0 |
+| 2026-11-15 | S1.8 | ecc:security-reviewer | 0 | 0 | 0 | 0 | 0 |
+| 2026-11-15 | S1.8 | ecc:code-reviewer | 0 | 0 | 0 | 2 | 0 |
+| 2026-11-15 | S0.9 | ecc:rust-reviewer | 0 | 0 | 0 | 3 | 0 |
+| 2026-11-15 | S0.9 | ecc:security-reviewer | 0 | 0 | 0 | 3 | 0 |
+| 2026-11-15 | S0.9 | ecc:code-reviewer | 0 | 0 | 0 | 2 | 0 |
+| 2026-11-15 | S0.10b | ecc:rust-reviewer | 0 | 0 | 0 | 3 (reported 1 Medium, verified Low) | 0 |
+| 2026-11-15 | S0.10b | ecc:security-reviewer | 0 | 0 | 0 | 0 | 0 |
+| 2026-11-15 | S0.10b | ecc:code-reviewer | 0 | 0 | 0 | 4 (reported 1 Medium, verified Low) | 0 |
 
 Process: each Medium or higher finding went to an independent verifier asked to refute it, and was fixed only if confirmed. Low findings were passed to the fixer unverified.
 
@@ -298,6 +313,93 @@ Other Low findings:
 - S0.10-rust-reviewer-11: handler and manifest checks parse source text with string splitting. **Not fixed**.
 
 Verifier-rejected: none.
+Re-review: none recorded.
+
+### S1.5 Platform filesystem primitives (0 Critical/High/Medium after verification; 7 Low)
+
+Confirmed (verified) findings:
+- S1.5-security-reviewer-4 (Low): finalize_move name check too weak for `\\?\` verbatim paths (FS-01, Inv-11 defence in depth). **Fixed**: `is_plain_file_name` now rejects trailing '.' or ' ', control characters, `<>"|?*`, DOS device names (CON, PRN, AUX, NUL, COM0-9, LPT0-9, CONIN$, CONOUT$, with or without an extension) and names over 233 UTF-16 units. Tests `finalize_rejects_win32_unsafe_names` and `finalize_accepts_boundary_and_lookalike_names`.
+
+Other Low findings:
+- S1.5-rust-reviewer-1: genuine ACL access-denied reported as SharingViolation after budget exhaustion. **Fixed**: an exhausted budget goes through `exhausted_error(code)`; code 5 stays Win32 5 and code 32 stays SharingViolation. Test `exhausted_access_denied_keeps_its_win32_code`.
+- S1.5-rust-reviewer-2: is_plain_file_name gaps (trailing dot or space, Win32-invalid characters, over-long suffixed names). **Fixed**: same hardening as S1.5-security-reviewer-4.
+- S1.5-rust-reviewer-3: the persist callback runs before the Exists check. **Fixed** by documentation: a persisted candidate may already exist; recovery must compare file id or existence.
+- S1.5-security-reviewer-5: allocated_size follows links and is path based (FS-02, TOCTOU). **Fixed** by documentation only: marked for diagnostics and tests; the path-based form is kept.
+- S1.5-code-reviewer-6: exhausted retries on Win32 5 reported as SharingViolation. **Fixed**: same change as rust-reviewer-1; the finalize_move error docs describe both outcomes.
+- S1.5-code-reviewer-7: collision suffix can push a name past NAME_MAX. **Fixed**: names over 233 units are rejected up front; the boundary is tested (233 accepted, 234 rejected).
+
+Verifier-rejected: none.
+Re-review: none recorded.
+
+### S1.6 Mark-of-the-Web (0 Critical; 1 High; 2 Medium after verification; 6 Low)
+
+Confirmed (verified) findings:
+- S1.6-security-reviewer-6 (HIGH in the confirmed record; the reviewer rated it Medium): IAE errors other than a CheckPolicy block fall through to a direct write and report success (fails open). **Fixed**: `INET_E_SECURITY_PROBLEM` corrected from 0x800C0016 to 0x800C000E (matches Urlmon.h); Save() errors use the same mapping; any CheckPolicy failure is BlockedByPolicy, and `protect()` returns BlockedByPolicy with no direct write. Tests `security_problem_hresult_is_blocked_from_check_policy_and_save` and `other_check_policy_failure_is_blocked_but_other_save_failure_is_not`. Re-review: fixed. Residual: Save() failures with other HRESULTs, and setup failures before CheckPolicy, still become Failed and fall back to a direct write that reports MarkedDirect when the file exists (a judgement call, not a regression). Policy behaviour under a real group policy is untested (fakes only).
+- S1.6-rust-reviewer-1 (MEDIUM): skipping an abandoned job can leave the worker permanently poisoned. **Fixed**: the worker skip branch takes the poison lock, re-checks abandoned and clears the flag, in the same lock order as run_iae. Regression test `skipping_abandoned_job_never_leaves_worker_poisoned` is timing-based (400-trial spin sweep, so probabilistic): it failed at trial 37 with the fix removed and passes with it. Re-review: fixed.
+- S1.6-code-reviewer-8 (MEDIUM): same poison-flag defect as rust-reviewer-1. **Fixed**: same fix and test.
+
+Other Low findings:
+- S1.6-rust-reviewer-2: a timeout with the file already gone was reported as RemovedByAntivirus. **Fixed**: returns `PlatformError::Io(NotFound)`; RemovedByAntivirus only when IAE answered. Test `timeout_with_file_gone_is_not_attributed_to_antivirus`. Re-review: fixed.
+- S1.6-rust-reviewer-3: `let _ = job.reply.send(result)` silences the send result. **No change needed**: intentional and commented (the receiver may be gone).
+- S1.6-rust-reviewer-4: the real IAE test cannot tell IAE from the direct fallback. **Fixed**: the ignored test asserts `MotwOutcome::Marked`; it passed with `--include-ignored`.
+- S1.6-security-reviewer-7: host validation is lax and the control-character check misses Unicode line separators. **Fixed in part**: `reject_control_chars` now rejects U+2028 and U+2029 (test `unicode_line_separators_rejected`). Strict authority parsing (numeric port, IPv6 brackets, host charset) is not done. Re-review: partial fix confirmed; not CRITICAL or HIGH.
+- S1.6-code-reviewer-9: same as rust-reviewer-4. **Fixed**.
+- S1.6-code-reviewer-10: protect() and write_zone_identifier() trust callers to pass pre-sanitised URLs. **Not fixed** (LOW, optional). No ZoneInfo constructor that calls zone_source_url was added.
+
+Verifier-rejected:
+- S1.6-security-reviewer-5 (reported Medium): D8 sanitisation and zone choice are caller conventions, not enforced by the API. Rejected by verifier.
+
+Re-review:
+- Four items were re-reviewed and confirmed fixed: S1.6-security-reviewer-6, S1.6-rust-reviewer-1, S1.6-rust-reviewer-2 and S1.6-security-reviewer-7 (partial, as stated above). The re-reviewer reported `cargo test --locked -p forgedm-platform --test motw` as 20 passed, 0 failed, 1 ignored (reviewer report, not a coordinator run).
+- The re-review also reported **1 new item** with no ID, severity or detail in the record. It is not classified here. Until it is triaged, "no CRITICAL/HIGH open" cannot be confirmed, so IMPLEMENTATION_STATUS marks S1.6 Partial.
+
+### S1.8 Agent bootstrap and shared pipe-name/data-root helpers (0 Critical/High; 1 Medium fixed; 3 Low)
+
+Confirmed (verified) findings:
+- S1.8-rust-reviewer-1 (Medium): the pipe-name hash can differ between client and agent for a not-yet-created data dir. **Fixed**: `normalized_root` uses `canonical_or_projected`. For a missing path, `.` and `..` are resolved lexically, the deepest existing ancestor is canonicalised, and the missing components are appended; forward slashes are handled. Regression test `missing_non_canonical_root_hashes_like_its_canonical_form_after_creation` compares the hash and pipe name before and after creation. Not handled: junctions or 8.3 names inside a missing tail (these cannot exist before creation). Not re-reviewed.
+
+Other Low findings:
+- S1.8-rust-reviewer-2: the spawned child is leaked when connect fails with a non-retryable error. **Fixed**: `kill_child` now runs before the error is returned. The first-connect Busy still returns at once by design (a busy pipe means an agent already exists). No dedicated test for the kill-on-error branch.
+- S1.8-code-reviewer-3: `hex` and `sha2` are now unused in forgedm-agent. **No change in this slice**: Cargo.toml is outside ownership and the removal changes Cargo.lock. Open for the lock owner.
+- S1.8-code-reviewer-4: the test-only seam is part of the public API. **No change needed**: documented and checked with a mutation test.
+
+The ecc:security-reviewer reported no findings (count 0).
+
+Verifier-rejected: none.
+Re-review: none recorded.
+
+### S0.9 CLI skeleton (0 Critical/High/Medium; 8 Low)
+
+Confirmed (verified) findings: none.
+
+Other Low findings (all eight are recorded as fixed; one test gap remains open):
+- S0.9-rust-reviewer-1: println!/eprintln! panic on a closed stdout or stderr. **Fixed**: `output::line` and `error_line` write through locked handles and ignore I/O errors. No test for the broken-pipe case.
+- S0.9-rust-reviewer-2: exit 12 and exit 14 have no process-level test. **Fixed for exit 14** (`cli_not_next_to_the_real_agent_exits_14`). Exit 12 still has only the unit mapping test (open).
+- S0.9-rust-reviewer-3: the ProtocolMismatch message hardcodes the protocol version. **Fixed**: the message no longer names a version.
+- S0.9-security-reviewer-4: terminal escape and control-character injection via display_name and data_dir. **Fixed**: `sanitize_for_terminal` replaces control, bidi and format characters; applied to both fields; unit tests.
+- S0.9-security-reviewer-5: unbounded accumulation in list paging driven by a peer-supplied total. **Fixed**: capped at 1000 pages and 100,000 rows; a page over 500 rows is rejected; all three cases return `CliError::Unexpected`; fake-source unit tests.
+- S0.9-security-reviewer-6: no test proves the IPC-01 client-side server-identity check for the CLI. **Fixed in part**: a process test copies the CLI to another directory while the real agent runs; the CLI exits 14 and prints nothing on stdout. No exit 12 fake-server test.
+- S0.9-code-reviewer-7: the protocol mismatch message hardcodes the version. **Fixed** (same as rust-reviewer-3).
+- S0.9-code-reviewer-8: exit 14 has no test. **Fixed** (same as rust-reviewer-2; the process test covers the path).
+
+Verifier-rejected: none.
+Re-review: none recorded.
+
+### S0.10b Desktop logging and shared pipe name (W3 follow-up) (0 Critical/High/Medium; 7 Low)
+
+Confirmed (verified) findings:
+- S0.10b-rust-reviewer-1 (LOW; the reviewer rated it Medium): the LogGuard is never dropped on normal exit, so buffered log lines can be lost. **Fixed**: run() uses `Builder::build(..).run(closure)` and drops the LogGuard on RunEvent::Exit.
+- S0.10b-code-reviewer-4 (LOW; the reviewer rated it Medium): the log format is plain text, but ARCHITECTURE 8 specifies JSON. **Fixed**: subscriber_with emits JSON lines; the test parses the first line as JSON and checks fields.message.
+
+Other Low findings:
+- S0.10b-rust-reviewer-2: the set_global_default error is silently discarded, and the init() fallback can lose its own warning. **Fixed**: `LoggingError::AlreadyInitialised` and a public `install_global`; file_guard propagates it; init() writes straight to stderr if no subscriber can be installed. A test covers the second install. An invalid RUST_LOG still falls back to info without a warning, by design.
+- S0.10b-rust-reviewer-3: the source-grep test is fragile and weak. **Fixed**: it recurses over .rs files, skips comment lines, and checks process::Command, process::{, tokio::process, whoami and Command::new.
+- S0.10b-code-reviewer-5: a set_global_default failure is swallowed and still reports success. **Fixed**: same as rust-reviewer-2; a test uses install_global as the non-fallback path.
+- S0.10b-code-reviewer-6: redundant match in default_filter. **Fixed**: uses `parse_lossy(directives.unwrap_or_default())`; RUST_LOG is read once in init(); a test covers an invalid directive.
+- S0.10b-code-reviewer-7: desktop_code_spawns_no_subprocess is a brittle source-text scan. **Fixed**: same as rust-reviewer-3.
+
+Verifier-rejected: none.
+The ecc:security-reviewer reported no findings (count 0).
 Re-review: none recorded.
 
 ## Not run

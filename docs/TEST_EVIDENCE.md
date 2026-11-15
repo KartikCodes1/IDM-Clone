@@ -312,3 +312,124 @@ Problems (all non-blocking):
 
 NOT RUN: not in the W3 gate command list, so not run: `cargo deny --locked check` and coverage (cargo-llvm-cov). The 80% coverage target is therefore not verified for this wave. Plan item not run: S1.4 optional TLS mode (D9), deferred to S1.12.
 
+### S1.5 Platform filesystem primitives (2026-11-15)
+
+RED: `cargo test -p forgedm-platform --locked --test fs --no-run` failed with `error[E0432]: unresolved imports forgedm_platform::fs::IoClass, allocated_size, classify_io, create_part_file, delete_by_handle, ensure_within, file_id, final_path, finalize_move, free_space, is_name_surrogate, move_no_replace, reparse_tag_is_name_surrogate, set_sparse, volume_info` and `could not compile forgedm-platform (test "fs"`. The exit code was not recorded, and the recorded text ends there. Review-fix tests were added with their fixes and were not run red first (all findings are LOW).
+
+| Command | Exit | Result |
+|---|---|---|
+| `cargo fmt -p forgedm-platform -- --check` | 0 | clean |
+| `cargo clippy -p forgedm-platform --all-targets --locked -- -D warnings` | 0 | clean; the 2 pre-existing clippy.toml path warnings remain. An earlier run (exit not recorded) failed on a panic in a test, which was fixed |
+| `cargo test -p forgedm-platform --locked` | 0 | 50 passed, 0 failed, 0 ignored: lib 1, dpapi 6, folders 3, fs 24, security 16 |
+| `git diff --exit-code Cargo.lock` | 1 | Non-zero from a Cargo.lock diff already present at session start, not from this slice. Its md5 was identical across this slice's runs. All cargo commands used `--locked` |
+
+Deviations: `finalize_move` takes `on_candidate` as a fallible `FnMut(&Path) -> Result<(), PlatformError>`, so a failed persist aborts the move; the sleeper is an `FnMut(Duration)` closure, not a trait. `on_candidate` runs once per candidate, before its first attempt. The retry budget is the sum of requested sleeps (100 ms doubling, 2 s cap, shared across candidates), so tests never sleep. Budget exhaustion is reported as the Win32 code for 5 and as SharingViolation for 32 (see SECURITY_REVIEW S1.5). Added beyond the list: `create_part_file`, `open_part_file`, `delete_by_handle`, `FileId`, `VolumeInfo`, `IoClass`, `classify_code`, `reparse_tag_is_name_surrogate`; `finalize_move` rejects empty names and names containing separators, ':' or NUL. The name limit is 233 UTF-16 units (Appendix A.9 cap, leaving room for the ' (999)' suffix). Five extra tests. `tests/fs.rs` has a file-level `allow(clippy::expect_used, clippy::print_stderr)`; workspace lints are unchanged. `error.rs`, `lib.rs` and `Cargo.toml` were not touched.
+
+Open: no integration test for an ACL-denied destination directory (needs icacls setup). The mapping is covered by the unit test `exhausted_access_denied_keeps_its_win32_code` and the sharing path by `retry_budget_exhausts`. The Cargo.lock diff predates this slice.
+
+NOT RUN (plan_tests_missing): none.
+
+### S1.6 Mark-of-the-Web (2026-11-15)
+
+RED: not recorded in the slice results (red field empty). The worker-skip regression test was shown failing by a temporary mutation (row 2 below), not by a red run before the fix.
+
+| Command | Exit | Result |
+|---|---|---|
+| `cargo test -p forgedm-platform --locked --test motw -- --include-ignored` (after fixes) | 0 | 21 passed, 0 failed, 0 ignored; the real-IAE test now asserts `Marked` and passed |
+| Mutation: flag-clear in the worker skip branch removed, then `cargo test --test motw skipping`, then restored | 101 | Regression test failed with "stuck poisoned in trial 37", so it catches the bug. The first version (100 trials, sleep-based offsets) did not catch it and was replaced with a spin-based sweep of 400 trials |
+| `cargo fmt -p forgedm-platform -- --check` | 0 | clean |
+| `cargo clippy -p forgedm-platform --all-targets --locked -- -D warnings` | 0 | clean; only the 2 pre-existing clippy.toml warnings |
+| `cargo test -p forgedm-platform --locked` (3 runs) | 0 | Each run: lib 1, dpapi 6, folders 3, fs 24, motw 20 (+1 ignored), security 16; 0 failed in every run; stable across the 3 runs. Per run: 70 passed, 0 failed, 1 ignored |
+| `git diff --exit-code Cargo.lock` | 1 | Differs from HEAD only by the 2 added lines (tracing-appender, tracing-subscriber) that were present at session start, from another slice. This slice's `--locked` commands all succeeded |
+
+Deviations: Cargo.toml, lib.rs and error.rs were not touched (Win32_System_Com and Win32_UI_Shell are already enabled in the workspace windows dependency; the existing MOTW variants suffice). `tests/motw.rs` has a file-level `allow(clippy::expect_used, clippy::unwrap_used)` for helpers outside `#[test]`. The direct ADS write uses std OpenOptions on a verbatim path (no unsafe); unsafe is only in the COM calls, each with a SAFETY comment. Extra tests: record_full, referrer omitted or idempotent, missing base file not created, paths over 260 characters, and IAE success, policy, AV-removed and failure-fallback cases. API additions: AttachmentExecutor trait, IaeRequest, IaeFailure, MotwService::{start, with_executor, protect, is_poisoned}, and `pub fn iae_failure_from_hresult`. Any CheckPolicy failure maps to BlockedByPolicy; Save() failures map to BlockedByPolicy only for INET_E_SECURITY_PROBLEM or access denied (the constant was corrected during review, see SECURITY_REVIEW S1.6). The client GUID is hard-coded (7b3f1c52-9e4a-4d18-a6c7-2f8e5b0d91a3). Drop detaches rather than joins a stuck worker.
+
+Re-review: the re-reviewer reported `cargo test --locked -p forgedm-platform --test motw` as 20 passed, 0 failed, 1 ignored (reviewer report, not a coordinator run).
+
+Open: group-policy and antivirus behaviour is not verified against a real policy or AV; only the HRESULT mapping is unit tested. UnsupportedFs (needs a FAT volume) and long-path (260 characters or more) IAE behaviour remain unverified. The worker-skip regression test is timing-based and probabilistic. Strict host and port parsing and a sanitising ZoneInfo constructor (LOW) are not done. The Cargo.lock diff predates this slice.
+
+NOT RUN (plan_tests_missing): none.
+
+### S1.8 Agent bootstrap and shared pipe-name/data-root helpers (2026-11-15)
+
+RED: not captured (red field empty). The regression test for the reported hash bug was not run against the old code.
+
+| Command | Exit | Result |
+|---|---|---|
+| `cargo fmt -p forgedm-ipc -- --check` | 0 | clean |
+| `cargo clippy -p forgedm-ipc --all-targets --locked -- -D warnings` | 0 | clean |
+| `cargo test -p forgedm-ipc --locked` | 0 | 43 passed, 0 failed, 0 ignored: bootstrap 6, identity 7, paths 9, subscribe 3, transport 18 |
+| `git diff --exit-code Cargo.lock` | 1 | 2-line diff that predates this slice (already modified at session start). No Cargo.toml was edited; all cargo runs used `--locked` and succeeded |
+
+Deviations: `ensure_agent(expected_agent_path, data_dir: Option<&Path>)` returns `BootstrapError`, defined in bootstrap.rs because error.rs is outside ownership (the CLI should map all variants except Ipc to exit 15). `ensure_agent_with` and a `#[doc(hidden)]` `with_simulated_parent_env` test seam were added, because set_var needs unsafe. A timeout kills the spawned child; a non-3 early exit returns AgentExited at once; exit 3 is treated as a lost race and polling continues. Bare or relative agent paths and relative data dirs are refused. `pipe_name_for(Option<&Path>)` returns `Result<String, PlatformError>`; `root_hash` and `normalized_root` are public in ipc::paths. In the agent, config.rs keeps a `pipe_name(Option<&Path>)` wrapper and re-exports `default_data_root`; the old agent helpers were removed and their tests moved to ipc tests/paths.rs. `helper_agrees_with_the_agents_former_computation` keeps a verbatim copy of the old algorithm. `five_concurrent_bootstraps_one_agent` waits 3.5 s before shutdown (test-only leak fix). Agent discovery walks the ancestors of current_exe, so the agent must be built first.
+
+Open: the regression test was not seen failing first (see RED). The MEDIUM fix was not re-reviewed. `hex` and `sha2` in forgedm-agent/Cargo.toml are likely unused; removing them needs a Cargo.lock change, which the lock owner must make. The Cargo.lock diff predates this slice.
+
+NOT RUN (plan_tests_missing): none.
+
+### S0.9 CLI skeleton (2026-11-15)
+
+RED: with src/main.rs replaced by an empty stub (`fn main() {}`) and the other source files removed, `cargo test -p forgedm-cli --locked` gave `test result: FAILED. 0 passed; 8 failed`. All 8 tests failed: status_without_agent_exits_10_with_message, status_with_real_agent_prints_versions, list_empty_and_json_shape, unknown_subcommand_exits_2, agent_stop_shuts_agent_down, and the three extra tests.
+
+| Command | Exit | Result |
+|---|---|---|
+| `cargo fmt -p forgedm-cli -- --check` | 0 | clean |
+| `cargo clippy -p forgedm-cli --all-targets --locked -- -D warnings` | 0 | no warnings |
+| `cargo test -p forgedm-cli --locked` | 0 | 17 passed, 0 failed, 0 ignored: 8 unit, 9 integration |
+| `git diff --exit-code Cargo.lock` | 1 | Non-zero from the pre-existing 2-line diff (already modified at session start). The diff does not touch forgedm-cli; Cargo.toml and Cargo.lock were not edited |
+
+Deviations: extra tests status_does_not_start_an_agent, relative_data_dir_exits_2 and agent_stop_without_agent_exits_10, plus 3 unit tests (exit-code mapping, error text, sibling agent path); after review, 2 sanitize tests, 3 paging tests against a fake page source, and 1 process test for exit 14. A relative --data-dir is rejected by the clap value parser (exit 2), matching the agent. Busy, Timeout, I/O and other transport errors map to exit 1 (Appendix A.8 has no dedicated code). `agent stop` returns once the agent acknowledges ShutdownAgentSafely; the test waits for exit 0. `list` pages through ListDownloads at limit 500 via a private PageSource trait. The regression tests were added after the fixes and were not run red first.
+
+Open: exit 12 (protocol mismatch) has only the unit mapping test; a process-level test needs a fake server. The Cargo.lock diff is a pre-existing 2-line change from outside this slice; the coordinator should confirm it.
+
+NOT RUN (plan_tests_missing): none.
+
+### S0.10b Desktop logging and shared pipe name (W3 follow-up) (2026-11-15)
+
+RED: not recorded (red field empty). Tests were written with their fixes and were not seen failing against the old code (all findings are LOW).
+
+| Command | Exit | Result |
+|---|---|---|
+| `cargo fmt -p forgedm-desktop -- --check` | 0 | clean |
+| `cargo clippy -p forgedm-desktop --all-targets --locked -- -D warnings` | 0 | clean. The first attempt failed on print_stderr for an eprintln!, replaced with writeln! to stderr |
+| `cargo test -p forgedm-desktop --locked` | 0 | 17 passed, 0 failed, 0 ignored: lib 5, agent_client 3, config 2, logging 7 |
+| `git diff --exit-code Cargo.lock` | 1 | The diff is only the 2 coordinator-added lines (tracing-appender, tracing-subscriber). This slice did not edit Cargo.lock |
+
+Deviations: the two whoami parsing unit tests were removed with the code they tested and replaced by default_pipe_name_is_local_and_user_scoped. The four S0.10 Rust test names still exist and pass. New src/logging.rs with init, open_file_sink, subscriber_with, default_filter, log_dir_for, LoggingError and LogGuard. Logs are JSON lines in a daily rolling file (14 files kept). Fallback when the file sink fails: a stderr subscriber plus one warn!; release builds use windows_subsystem=windows, so stderr is not visible there. lib::run now takes the LogGuard as a parameter (signature change); main.rs passes it in.
+
+Open: the Tauri exit-event guard drop is not covered by an automated test (needs a running event loop). The init() fallback path is untested because it installs a global subscriber; the pieces it uses are tested. URL redaction holds by construction and is not enforced by a test. The Cargo.lock diff is the coordinator's earlier edit.
+
+NOT RUN (plan_tests_missing): none.
+
+### W4 wave gate (2026-11-15)
+
+RED: not applicable. This is the gate run over the workspace after S1.5, S1.6, S1.8, S0.9 and S0.10b; their RED lines are in the sections above.
+
+| Command | Exit | Result |
+|---|---|---|
+| `git diff Cargo.lock` (pre-gate check) | 0 | Differs from HEAD by exactly 2 added lines, tracing-appender and tracing-subscriber, inside the forgedm-desktop dependencies block; matches the expected delta |
+| `cargo fmt --all -- --check` (CARGO_TARGET_DIR unset) | 0 | no formatting differences |
+| `cargo clippy --workspace --all-targets --locked -- -D warnings` | 0 | clean; finished in 7.58 s with no warnings |
+| `cargo test --workspace --locked` | 0 | 448 passed, 0 failed, 1 ignored (sum of all test result lines). The ignored test is forgedm-platform tests/motw.rs `iae_from_sta_writes_zone_identifier` (#[ignore] by design: it uses the real shell attachment service and depends on antivirus). Memory sampled every second: no test process went above 20 MB. The one process over 1 GB was the MSVC linker link.exe (1,394 MB) during compilation; it is a build tool and was not killed. No process was killed |
+| `git diff --exit-code Cargo.lock` | 1 | Expected: only the 2 pre-existing tracing lines (numstat 2 0). Re-checked after the tests, the tauri build and cargo build: unchanged |
+| `node --version` | 0 | v26.13.1. The node26 shim runs Node 26 with the v25.5.0 pnpm.cjs and reports pnpm 10.29.2 |
+| `pnpm install --frozen-lockfile` | 0 | lockfile up to date; 2 workspace projects already up to date |
+| `pnpm -r lint` | 0 | eslint on @forgedm/desktop passed |
+| `pnpm -r typecheck` | 0 | tsc --noEmit on @forgedm/desktop passed |
+| `pnpm -r test` | 0 | vitest v5.1.0: 3 test files, 14 tests passed |
+| `pnpm audit --prod` | 0 | No known vulnerabilities found |
+| `pnpm --filter @forgedm/desktop tauri build --debug --no-bundle` | 0 | Frontend built; Rust dev profile finished in 46.10 s; built target\debug\forgedm-desktop.exe |
+| `ls -la target/debug/forgedm-desktop.exe` | 0 | Exists, 13,882,880 bytes |
+| `cargo build --workspace --bins --locked` | 0 | Dev profile finished in 30.18 s; target\debug holds forgedm.exe, forgedm-agent.exe, forgedm-desktop.exe and forgedm-fixture.exe |
+| `forgedm --data-dir <tmp> status` (before agent start) | 10 | "forgedm: the agent is not running", exit 10 as expected |
+| `forgedm-agent --data-dir <tmp>` (background) | 0 | Started as pid 45040, about 19.5 MB working set |
+| `forgedm --data-dir <tmp> status` | 0 | agent 0.1.0 (pid 45040), protocol 1.0, state ready, 0 active / 0 queued, proxy system, data dir matches the temp dir |
+| `forgedm --data-dir <tmp> list --json` | 0 | `{"items":[],"total":0}` |
+| `forgedm --data-dir <tmp> agent stop` | 0 | "agent is shutting down"; the agent then exited on its own (AGENT_EXIT=0) |
+| `Get-Process forgedm-agent` and `forgedm --data-dir <tmp> status` (post-stop) | 10 | No forgedm-agent process remained, so nothing needed killing. Status returned "the agent is not running", exit 10 as expected. Data dir holds forgedm.db, logs\agent.log.2026-11-15 and run\agent.lock |
+| `git status --short` (post-gate) | 0 | Matches the pre-gate snapshot; the gate made no edits and the tauri build changed no tracked files |
+
+Gate all_green: true. Workspace tests: 448 passed, 0 failed, 1 ignored. Fixes applied during the gate: none. Problems: none.
+
+NOT RUN (plan_tests_missing): none listed for S1.5, S1.6, S1.8, S0.9 or S0.10b (all empty). Not in the W4 gate command list, so not run: `cargo deny --locked check` and coverage (cargo-llvm-cov). The 80% coverage target is therefore not verified for this wave. The ignored real-IAE test was run in S1.6 with `--include-ignored` (21 passed) but not in this gate.
+
