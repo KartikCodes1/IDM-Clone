@@ -64,6 +64,10 @@ This log records the reviews that actually ran: the reviewer, the scope, each fi
 | 2026-11-15 | S1.7 | ecc:security-reviewer | 0 | 0 | 0 | 3 (not fixed) | 0 |
 | 2026-11-15 | S1.7 | ecc:code-reviewer | 0 | 0 | 1 (fixed) | 2 (not fixed) | 0 |
 | 2026-11-15 | S1.7 | ecc:silent-failure-hunter | 0 | 0 | 1 (fixed, fail-closed agent side) | 7 (1 fixed, 6 not fixed) | 0 |
+| 2026-11-15 | S1.9 | ecc:rust-reviewer | 0 | 0 | 0 | 2 (not fixed) | 0 |
+| 2026-11-15 | S1.9 | ecc:security-reviewer | 0 | 0 | 0 | 0 | 0 |
+| 2026-11-15 | S1.9 | ecc:code-reviewer | 0 | 0 | 0 | 2 (1 not fixed, 1 no change needed) | 0 |
+| 2026-11-15 | S1.9 | ecc:silent-failure-hunter | 0 | 0 | 1 (fixed) | 3 (1 no change needed, 2 not fixed) | 0 |
 
 Process: each Medium or higher finding went to an independent verifier asked to refute it, and was fixed only if confirmed. Low findings were passed to the fixer unverified.
 
@@ -435,6 +439,25 @@ Other LOW findings (not verified, per the process above):
 
 Verifier-rejected: none.
 Re-review: none recorded (re-review null). The MEDIUM and LOW fixes have not been re-reviewed.
+
+### S1.9 Probe, validated resume, pause/resume/cancel/remove, checkpoints (0 Critical/High; 1 Medium, fixed; 7 Low, none fixed; 4 not fixed, 3 no change needed)
+
+Confirmed (verified) findings:
+- S1.9-silent-failure-hunter-6 (MEDIUM): every open_valid_part error became a silent restart from zero. **Fixed**: `PartInvalid::keeps_progress()` added. In task.rs resume(), sharing violations, access denied, device-gone and truncate failures now stop the task (disk_io fail, or pause destination_unavailable) and keep progress and the .part. Not-found (Win32 2/3), reparse point, replaced, outside, short and not-recorded still restart from zero, as ARCHITECTURE 6.3 and PCR-02 require. The warn log now includes the source error. Tests: `only_failures_that_say_nothing_about_the_file_keep_progress`, `a_locked_part_file_is_not_a_missing_one`. The reparse-point and outside case was not changed to path_escape, since that would contradict Appendix A. A distinct event per cause was not added. Not re-reviewed.
+- S1.9-rust-reviewer-1 (LOW): the engine actor is blocked for up to SETTLE_WAIT (3 s) per pause, cancel or remove. **Not fixed** (LOW, optional).
+- S1.9-code-reviewer-3 (LOW): the first-proof resume assertion is weaker than the spec. **Not fixed**: the proposed fix is racy, as the verifier noted.
+- S1.9-silent-failure-hunter-5 (LOW): remove with delete_partial reports success when the staging file was not deleted. **No change needed**: the verifier found that the current behaviour matches the contract, and that changing it would contradict Appendix A and the planned test `remove_refuses_replaced_part_file`.
+
+Other Low findings (not verified, per the process above):
+- S1.9-rust-reviewer-2: blocking stdin read and terminal writes on an async runtime thread. **Not fixed** (LOW, optional; harmless today).
+- S1.9-code-reviewer-4: two plan test names differ from the required exact names. **No change needed**: a Rust identifier cannot start with a digit, so the `n200_`/`n416_` prefix is unavoidable. The mapping is recorded in TEST_EVIDENCE S1.9.
+- S1.9-silent-failure-hunter-7: a download that could not be settled is still reported as finished. **Not fixed** (LOW, optional). The existing test `a_failed_settle_is_retried_not_left_stale` covers retry behaviour.
+- S1.9-silent-failure-hunter-8: serialisation failure of the error detail is dropped silently. **Not fixed** (LOW, optional).
+
+Severity note: the silent-failure-hunter summary text said two MEDIUM and two LOW; the verified records list one MEDIUM (hunter-6) and three LOW (hunter-5, -7, -8). The table uses the verified records.
+
+Verifier-rejected: none.
+Re-review: none recorded (re-review null). The MEDIUM fix has not been re-reviewed.
 
 ## Not run
 

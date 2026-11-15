@@ -501,3 +501,64 @@ Problems and notes:
 - Observation, not a failure: the smoke file's Zone.Identifier ends with a 0x00 byte and has no trailing CRLF (71 bytes). The agent attributes the rewrite to IAttachmentExecute in apply_motw. ZoneId=3 and a query-free HostUrl are present. The only ignored test covering this real-shell path (`iae_from_sta_writes_zone_identifier`) was not run in this gate, so the smoke is its only live evidence here.
 - Not run: `cargo deny --locked check` and coverage (cargo-llvm-cov) are not in the gate command list. No coverage was measured for W5. The gate report's own NOT RUN list was truncated, so no further items are recorded.
 
+### S1.9 Probe, validated resume, pause/resume/cancel/remove, checkpoints: FIRST PROOF (2026-11-15)
+
+RED: compile-time RED before any implementation: `cargo test -p forgedm-core --locked --test checkpoint` gave E0432 unresolved import `forgedm_core::checkpoint`; `--test probe` gave E0432/E0433 for `forgedm_core::probe`; `--test resume` gave E0432 for `forgedm_core::engine::Control` and `ports::StoredProgress`, plus E0599 `control` not found on EngineHandle. Runtime RED: the record is cut off after `cargo test -p forgedm-cli --lo`, so the runtime RED result is not recorded here. Unit tests added to resume.rs after the fix were not red-first; no RED run was recorded for them.
+
+| Command | Exit | Result |
+|---|---|---|
+| `cargo fmt -p forgedm-core -- --check` | 0 | clean |
+| `cargo clippy -p forgedm-core --all-targets --locked -- -D warnings` | 0 | clean |
+| `cargo test -p forgedm-core --locked` | 0 | all suites ok, 0 failed (output grep-filtered) |
+| `git diff --exit-code Cargo.lock` | 0 | unchanged |
+
+Per-suite counts were not summed by the implementer. The slice's tests block shows 0 passed, 0 failed, 0 ignored only because no total was taken; those zeros are not counts. The W6 wave gate section below gives the workspace total.
+
+NOT RUN (plan_tests_missing): none reported. Not run: coverage (cargo-llvm-cov), which was not requested. Coverage was not measured for S1.9.
+
+Test names: 18 of the 20 plan test names exist with the exact name. `200_on_resume_never_written_at_offset` and `416_at_end_after_crash_is_complete` are implemented as `n200_...` and `n416_...`, because a Rust identifier cannot start with a digit. This mapping is recorded here.
+
+Deviations:
+- `416_at_end_after_crash_is_complete` works as follows: a crash left every byte committed, so the resume sends `Range: bytes=T-T` with If-Range. The fixture answers 416 (`bytes */T`), decide() returns SegmentComplete and the download goes to verifying. A matching check also asserts that no file byte was transferred (only the short 416 message body).
+- S1.7 tests were adjusted because S1.9 changes behaviour legitimately: the probe now finds range-capable fixtures resumable, and each run makes HEAD plus GET 0-0 before the transfer GET. In single_stream.rs the expected mode is SingleRanged, unknown_length uses `ranges=0&cl=0`, the redirect hop count is 3*4, identity_header_sent uses a stub that serves several connections, and the interrupted-restart test uses `ranges=0`. In agent enqueue_e2e, nonresumable_kill_restart_redownloads_from_zero uses `ranges=0` and counts transfer GETs. Assertions were rewritten for the new behaviour, not deleted.
+- TransferMode::Segmented is probed for files of 8 MiB or more, but S1.9 stores and runs it as single_ranged (one range stream). Segmenting arrives with S1.11.
+- Retry{restart_from_zero} and every restart delete the stale .part by handle (only if provably ours) and recreate it, instead of truncating it in place. Progress, validators and the part record are cleared in one storage transaction (new Downloads::reset_for_restart).
+- RangeDecision::RangeUnsupported and ::Reprobe fail with range_protocol_violation (ranges_no_longer_supported, reprobe_needed) instead of re-planning or doing one re-probe. A 403, 404 or 410 on a resume fails with http_status; needs_url_refresh is not produced (no TaskStop variant for it).
+- The client has no total timeout (ADR-007 and clippy ban RequestBuilder::timeout), so the 5 s HEAD deadline is a tokio::time::timeout around the whole HEAD in probe.rs.
+- The pause path persists `pausing` only after the transfer has quiesced and checkpointed (settle), not before the stop is requested.
+- The expected SHA-256 is now the downloads.checksum_expected column (storage insert_with_checksum). Rows written by S1.7 that only have the enqueued-event form are still read through a legacy fallback. No migration was needed.
+- The fixture gained a GET /__log JSON export (it also reports served_bytes), a verify-prefix subcommand and a verify::prefix_matches function. The fixture's slow throttle is capped at 640 KiB/s, so the proof uses slow_from near the end of the file to get a throttled tail. The kill therefore lands at the first checkpoint after 2 s, at 91-96% committed rather than just over 30%. The 30% condition is still the wait threshold.
+- The agent now advertises the resume capability in the handshake (A.2: advertised once implemented).
+- The log file name date is documented as UTC (tracing-appender rolls at 00:00 UTC) and pinned by a test, instead of switching to local time.
+- The IPC-03 seam is Server::bind_expecting (doc(hidden)); bind() is unchanged.
+- Reviewer reports were supplied with this slice. The implementer did not run those agents, and they are not coordinator runs. The reviewers did not run cargo; they read the code only.
+
+Open:
+- LOW findings not touched: S1.9-rust-reviewer-1, S1.9-rust-reviewer-2, S1.9-code-reviewer-3, S1.9-silent-failure-hunter-7 and S1.9-silent-failure-hunter-8 (not fixed). S1.9-code-reviewer-4 and S1.9-silent-failure-hunter-5 need no change (see SECURITY_REVIEW S1.9).
+- No re-review was recorded for S1.9 (re-review null). The MEDIUM fix, S1.9-silent-failure-hunter-6, has not been re-reviewed.
+
+### W6 wave gate (2026-11-15)
+
+RED: not applicable. This is the gate run over the workspace after S1.9; its RED note is in the section above.
+
+| Command | Exit | Result |
+|---|---|---|
+| `cargo fmt --all -- --check` (CARGO_TARGET_DIR unset, default repo target) | 0 | no formatting differences |
+| `cargo clippy --workspace --all-targets --locked -- -D warnings` | 0 | clean, no warnings; finished in 11.35s |
+| `cargo test --workspace --locked` | 0 | 74 test binaries including doc-tests: 592 passed, 0 failed, 1 ignored (forgedm-platform `motw::iae_from_sta_writes_zone_identifier`, a pre-existing ignore: "talks to the real shell attachment service; depends on antivirus"). W6 suites present and green: agent control_e2e 3, pipe_fatal 2, enqueue_e2e 9, process 13; cli e2e_first_proof 2, cli_basic 11, unit 26; core checkpoint 2, probe 3, recovery 4, resume 13, single_stream 17, unit 42; storage downloads 12, segments 9; ipc transport 19; fixture cli 3 |
+| `git diff --exit-code Cargo.lock` | 0 | unchanged (checked after the tests and again after all scripts) |
+| `cargo build --workspace --bins --locked` | 0 | built forgedm.exe, forgedm-agent.exe, forgedm-desktop.exe and forgedm-fixture.exe in target\debug in 12.75s; the rerun before the proof finished in 0.52s with no rebuild |
+| `powershell -NoProfile -ExecutionPolicy Bypass -File scripts\check.ps1` | 0 | 13 PASS, 0 FAIL, 0 NOT RUN: no-tls-bypass, no-assert-sql-safe, unsafe-only-in-platform (65 constructs inside platform, 0 outside), command-new-allowlist, layering (9 packages, 17 edges), no-fixture-in-shipped, no-fault-injection-in-release, no-reqwest-compression, tauri-versions-match, no-loose-versions, lockfiles-committed, manifest-asinvoker, eslint-bans |
+| `powershell -NoProfile -ExecutionPolicy Bypass -File scripts\windows-smoke.ps1` | 0 | 22 PASS, 0 FAIL, 0 NOT RUN: build-bins (its own `cargo build -p agent -p cli`, exit 0), agent-starts, agent-has-no-tcp-listener (0/0/0 rows), second-agent-same-data-dir-exits-3, agent-peak-working-set-under-1gb (30.1 MB), agent-stop-exits-0, restart-after-stop, no-leftover-processes; temp dir removed |
+| `powershell -NoProfile -ExecutionPolicy Bypass -File scripts\phase1-proof.ps1` | 0 | FIRST PROOF PASS, 15 checks PASS, 0 FAIL. Fixture file 256 MiB, seed 77, throttled from byte 255852544. `killed the agent at committed=256966656 accepted=256966656 of 268435456` (state downloading). DB committed after restart: 256966656. Resumed GET 1 `range bytes=256966656-268435455 if-range "77-268435456"` (2 transfers total; the first started at byte 0). `served 268500993, bound 274726912` and `served 268500993 of size 268435456` (65,537 bytes over size). Get-FileHash and the fixture hash are both b2130714ca01ab3f22bfa0c15fc61683674d6dded38797e711930596860b8f96; agent-recorded digest PASS. verify-prefix before and after restart: OK. Final line: `PASS  FIRST PROOF: kill, resume, identical bytes` |
+| `tasklist \| grep -i forgedm; Get-Process forgedm-agent,forgedm-fixture,forgedm` | 1 | grep exit 1 means no match: no forgedm-agent, forgedm-fixture or forgedm process left after the scripts; nothing needed killing |
+| `Get-ChildItem %TEMP% -Filter 'forgedm-*'` | 0 | empty: the proof's forgedm-phase1-proof-<guid> temp dir (about 256 MiB) and the smoke temp dir were both deleted |
+
+Gate all_green: true. Workspace tests: 592 passed, 0 failed, 1 ignored. Fixes applied during the gate: none.
+
+Problems and notes:
+- Observation, not a failure: the kill landed at 256966656 of 268435456 bytes (about 95.7%), inside the throttled 12 MiB tail. The proof requires at least 30% committed, so this passes, but the resume covered only the last 11,468,800 bytes. A run that killed earlier in the file was not exercised.
+- The proof reports 268,500,993 bytes served against a 268,435,456-byte file (65,537 bytes over). The record does not explain the excess, and it was not analysed in this gate.
+- The proof cannot detect a missing FlushFileBuffers, because TerminateProcess leaves the OS file cache intact. The script says so itself. Power-loss durability: NOT RUN.
+- windows-smoke.ps1 runs its own `cargo build --locked -p forgedm-agent -p forgedm-cli --bins` (exit 0). It ran one at a time, never alongside another build.
+- NOT RUN, as instructed: the tauri build and pnpm. Coverage (cargo-llvm-cov) was not run, as the task did not ask for it.
