@@ -1,17 +1,35 @@
 //! Tauri commands exposed to the webview. Each is ACL-gated through the app manifest in
 //! `build.rs` and granted only by `capabilities/main-window.json` (ADR-022).
 
-use forgedm_protocol::{AgentStatusInfo, ListDownloadsResult};
+use forgedm_protocol::{
+    AgentStatusInfo, DownloadDetail, EnqueueUrlResult, ListDownloadsResult, SnapshotResult,
+    StateResult,
+};
 use std::sync::Mutex;
 
 use tauri::State;
 
 use crate::agent_client::{self, AgentLocator};
 use crate::error::CommandError;
+use crate::{engine, open_folder, request};
 
 /// The registered command names; must equal the `build.rs` manifest list and the
 /// `generate_handler!` entries (checked by `manifest_matches_registered_commands`).
-pub const COMMAND_NAMES: [&str; 2] = ["agent_status", "list_downloads"];
+pub const COMMAND_NAMES: [&str; 13] = [
+    "agent_status",
+    "list_downloads",
+    "get_snapshot",
+    "get_download",
+    "enqueue_url",
+    "pause",
+    "resume",
+    "cancel",
+    "retry",
+    "remove",
+    "start_engine",
+    "stop_engine",
+    "show_in_folder",
+];
 
 /// Builds the locator; replaceable so tests can simulate a startup failure.
 pub type Resolver = fn() -> Result<AgentLocator, CommandError>;
@@ -70,6 +88,143 @@ pub async fn list_downloads(
     target: State<'_, AgentTarget>,
 ) -> Result<ListDownloadsResult, CommandError> {
     agent_client::fetch_downloads(&target.locator()?).await
+}
+
+/// Agent status and the download list in one consistent answer (polled once a second).
+///
+/// # Errors
+/// [`CommandError`] (`agent_unavailable` when the pipe is absent).
+#[tauri::command(rename_all = "snake_case")]
+pub async fn get_snapshot(target: State<'_, AgentTarget>) -> Result<SnapshotResult, CommandError> {
+    agent_client::fetch_snapshot(&target.locator()?).await
+}
+
+/// One download's detail.
+///
+/// # Errors
+/// [`CommandError`] (`invalid_request` for a malformed id, `agent_error` when unknown).
+#[tauri::command(rename_all = "snake_case")]
+pub async fn get_download(
+    target: State<'_, AgentTarget>,
+    id: String,
+) -> Result<DownloadDetail, CommandError> {
+    let body = request::get_download(&id)?;
+    agent_client::fetch_download(&target.locator()?, body).await
+}
+
+/// Adds a download. `target_dir` empty or absent means the agent's default folder.
+///
+/// # Errors
+/// [`CommandError`] with a user-facing message when the agent rejects the request.
+#[tauri::command(rename_all = "snake_case")]
+pub async fn enqueue_url(
+    target: State<'_, AgentTarget>,
+    url: String,
+    target_dir: Option<String>,
+    sha256: Option<String>,
+) -> Result<EnqueueUrlResult, CommandError> {
+    let body = request::enqueue_url(&url, target_dir.as_deref(), sha256.as_deref());
+    agent_client::enqueue(&target.locator()?, body).await
+}
+
+/// Pauses a download; `discard_progress` allows pausing a non-resumable one.
+///
+/// # Errors
+/// [`CommandError`] (`invalid_request` for a malformed id).
+#[tauri::command(rename_all = "snake_case")]
+pub async fn pause(
+    target: State<'_, AgentTarget>,
+    id: String,
+    discard_progress: Option<bool>,
+) -> Result<StateResult, CommandError> {
+    let body = request::pause(&id, discard_progress.unwrap_or(false))?;
+    agent_client::change_state(&target.locator()?, body).await
+}
+
+/// Resumes a paused or interrupted download.
+///
+/// # Errors
+/// [`CommandError`] (`invalid_request` for a malformed id).
+#[tauri::command(rename_all = "snake_case")]
+pub async fn resume(
+    target: State<'_, AgentTarget>,
+    id: String,
+) -> Result<StateResult, CommandError> {
+    agent_client::change_state(&target.locator()?, request::resume(&id)?).await
+}
+
+/// Cancels a download (the partial file is kept).
+///
+/// # Errors
+/// [`CommandError`] (`invalid_request` for a malformed id).
+#[tauri::command(rename_all = "snake_case")]
+pub async fn cancel(
+    target: State<'_, AgentTarget>,
+    id: String,
+) -> Result<StateResult, CommandError> {
+    agent_client::change_state(&target.locator()?, request::cancel(&id)?).await
+}
+
+/// Retries a failed, cancelled or blocked download.
+///
+/// # Errors
+/// [`CommandError`] (`invalid_request` for a malformed id).
+#[tauri::command(rename_all = "snake_case")]
+pub async fn retry(
+    target: State<'_, AgentTarget>,
+    id: String,
+    restart_from_zero: Option<bool>,
+) -> Result<StateResult, CommandError> {
+    let body = request::retry(&id, restart_from_zero.unwrap_or(false))?;
+    agent_client::change_state(&target.locator()?, body).await
+}
+
+/// Removes a download from the list; `delete_partial` also deletes its `.part` file.
+///
+/// # Errors
+/// [`CommandError`] (`invalid_request` for a malformed id).
+#[tauri::command(rename_all = "snake_case")]
+pub async fn remove(
+    target: State<'_, AgentTarget>,
+    id: String,
+    delete_partial: bool,
+) -> Result<(), CommandError> {
+    let body = request::remove(&id, delete_partial)?;
+    agent_client::remove(&target.locator()?, body).await
+}
+
+/// Starts the background engine when it is not running and returns its status.
+///
+/// # Errors
+/// [`CommandError`] (`agent_unavailable` when the engine is missing or does not start).
+#[tauri::command(rename_all = "snake_case")]
+pub async fn start_engine(target: State<'_, AgentTarget>) -> Result<AgentStatusInfo, CommandError> {
+    engine::start_engine(&target.locator()?, None).await
+}
+
+/// Asks the background engine to pause its downloads and exit.
+///
+/// # Errors
+/// [`CommandError`] (`agent_unavailable` when it is not running).
+#[tauri::command(rename_all = "snake_case")]
+pub async fn stop_engine(target: State<'_, AgentTarget>) -> Result<(), CommandError> {
+    engine::stop_engine(&target.locator()?).await
+}
+
+/// Reveals a completed download in Explorer. The path comes from the agent, never from
+/// the webview.
+///
+/// # Errors
+/// [`CommandError`] (`invalid_request` when the download is not completed or the file is gone).
+#[tauri::command(rename_all = "snake_case")]
+pub async fn show_in_folder(
+    target: State<'_, AgentTarget>,
+    id: String,
+) -> Result<(), CommandError> {
+    let body = request::get_download(&id)?;
+    let detail = agent_client::fetch_download(&target.locator()?, body).await?;
+    let plan = open_folder::plan_launch(&detail.summary, &open_folder::system_root()?)?;
+    open_folder::launch(&plan)
 }
 
 #[cfg(test)]

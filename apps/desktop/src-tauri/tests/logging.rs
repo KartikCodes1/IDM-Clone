@@ -116,15 +116,18 @@ fn rust_sources(dir: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
+/// The only file allowed to spawn a process: `show_in_folder` runs Explorer (S1.10+).
+const SPAWN_ALLOWED_FILE: &str = "open_folder.rs";
+
 #[test]
-fn desktop_code_spawns_no_subprocess() {
+fn desktop_code_spawns_no_subprocess_except_the_open_folder_helper() {
     let mut files = Vec::new();
     rust_sources(
         &Path::new(env!("CARGO_MANIFEST_DIR")).join("src"),
         &mut files,
     );
     assert!(!files.is_empty(), "sources found");
-    let spawn_apis = ["process::Command", "process::{", "tokio::process", "whoami"];
+    let mut spawns_in_allowed = 0;
     for path in files {
         let text = std::fs::read_to_string(&path).expect("source readable");
         // Strip comments so prose may mention the forbidden names.
@@ -136,9 +139,25 @@ fn desktop_code_spawns_no_subprocess() {
                 "
 ",
             );
-        for api in spawn_apis {
+        for api in [
+            "tokio::process",
+            "whoami",
+            "ShellExecute",
+            "cmd.exe",
+            "powershell",
+        ] {
             assert!(!code.contains(api), "{path:?} uses {api}");
         }
-        assert!(!code.contains("Command::new"), "{path:?} spawns a process");
+        let allowed = path.file_name().is_some_and(|n| n == SPAWN_ALLOWED_FILE);
+        if allowed {
+            spawns_in_allowed += code.matches("Command::new").count();
+        } else {
+            assert!(
+                !code.contains("process::Command"),
+                "{path:?} imports Command"
+            );
+            assert!(!code.contains("Command::new"), "{path:?} spawns a process");
+        }
     }
+    assert_eq!(spawns_in_allowed, 1, "exactly one spawn site: Explorer");
 }

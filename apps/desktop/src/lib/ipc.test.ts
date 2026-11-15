@@ -2,7 +2,8 @@ import { describe, expect, it } from "vitest";
 
 import downloadListGolden from "../../../../crates/forgedm-protocol/tests/golden/v1/response_ListDownloads.json";
 import statusGolden from "../../../../crates/forgedm-protocol/tests/golden/v1/response_GetAgentStatus.json";
-import { PayloadError, parseAgentStatus, parseCommandError, parseDownloadList } from "./ipc";
+import snapshotGolden from "../../../../crates/forgedm-protocol/tests/golden/v1/response_GetSnapshot.json";
+import { PayloadError, parseAgentStatus, parseCommandError, parseDownloadList, parseSnapshot } from "./ipc";
 
 describe("ipc guards", () => {
   it("parseAgentStatus_accepts_golden_rejects_malformed", () => {
@@ -60,5 +61,27 @@ describe("ipc guards", () => {
     expect(parseCommandError("boom").kind).toBe("internal");
     expect(parseCommandError({ kind: 3 }).kind).toBe("internal");
     expect(parseCommandError({ kind: "brand_new", message: "x" }).kind).toBe("internal");
+  });
+
+  it("parseSnapshot_accepts_golden_and_rejects_malformed", () => {
+    const snapshot = parseSnapshot(snapshotGolden.result);
+    expect(snapshot.seq).toBe(42);
+    expect(snapshot.agent_status.agent_pid).toBe(4321);
+    expect(snapshot.downloads[0]?.committed_bytes).toBe(1024);
+    expect(snapshot.truncated).toBe(false);
+    for (const bad of [null, {}, { ...snapshotGolden.result, truncated: "no" }, { ...snapshotGolden.result, downloads: {} }, { ...snapshotGolden.result, seq: -1 }]) {
+      expect(() => parseSnapshot(bad), JSON.stringify(bad)).toThrow(PayloadError);
+    }
+  });
+
+  it("parseDownloadSummary_reads_last_error_and_tolerates_unknown_codes", () => {
+    const row = { ...(snapshotGolden.result.downloads[0] as Record<string, unknown>), state: "failed", last_error: { code: "brand_new_code", message: "m", retryable: true } };
+    const list = parseDownloadList({ items: [row], total: 1 });
+    expect(list.items[0]?.last_error).toEqual({ code: "brand_new_code", message: "m", retryable: true });
+    expect(() => parseDownloadList({ items: [{ ...row, last_error: { code: 1 } }], total: 1 })).toThrow(PayloadError);
+  });
+
+  it("parseCommandError_knows_invalid_request", () => {
+    expect(parseCommandError({ kind: "invalid_request", message: "m" }).kind).toBe("invalid_request");
   });
 });

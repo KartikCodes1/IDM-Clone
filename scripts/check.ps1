@@ -372,17 +372,21 @@ Invoke-Check 'unsafe-only-in-platform' {
     }
 }
 
-# Inv-18: process creation only in the agent bootstrap and in tests.
+# Inv-18: process creation only in the agent bootstrap, the desktop open-folder helper, and tests.
+# apps/desktop/src-tauri/src/open_folder.rs (S1.10+) runs %SystemRoot%\explorer.exe /select,<path>
+# for "Show in folder": one fixed executable, no shell, the path comes from the agent's
+# final_path (never from the webview) and is checked to exist first. Its test pins exactly one
+# Command::new in that file (apps/desktop/src-tauri/tests/logging.rs).
 Invoke-Check 'command-new-allowlist' {
-    $allowedFile = 'crates/forgedm-ipc/src/bootstrap.rs'
+    $allowedFiles = @('crates/forgedm-ipc/src/bootstrap.rs', 'apps/desktop/src-tauri/src/open_folder.rs')
     $hits = Find-Pattern 'Command::new|ShellExecute|\bCreateProcess\w*\s*\(' @('.rs')
-    $inBootstrap = @($hits | Where-Object { $_.Path -eq $allowedFile })
-    $inTests = @($hits | Where-Object { $_.Path -ne $allowedFile -and $_.Path -match '(^|/)tests/' })
-    $bad = @($hits | Where-Object { $_.Path -ne $allowedFile -and $_.Path -notmatch '(^|/)tests/' })
+    $inAllowed = @($hits | Where-Object { $allowedFiles -contains $_.Path })
+    $inTests = @($hits | Where-Object { $allowedFiles -notcontains $_.Path -and $_.Path -match '(^|/)tests/' })
+    $bad = @($hits | Where-Object { $allowedFiles -notcontains $_.Path -and $_.Path -notmatch '(^|/)tests/' })
     if ($bad.Count -gt 0) {
-        Add-Result 'command-new-allowlist' 'FAIL' ("{0} process spawn(s) outside {1} and tests: {2}" -f $bad.Count, $allowedFile, (Format-Hits $bad))
+        Add-Result 'command-new-allowlist' 'FAIL' ("{0} process spawn(s) outside {1} and tests: {2}" -f $bad.Count, ($allowedFiles -join ', '), (Format-Hits $bad))
     } else {
-        Add-Result 'command-new-allowlist' 'PASS' ("{0} hit(s) in {1}, {2} in tests/ directories, 0 elsewhere" -f $inBootstrap.Count, $allowedFile, $inTests.Count)
+        Add-Result 'command-new-allowlist' 'PASS' ("{0} hit(s) in {1}, {2} in tests/ directories, 0 elsewhere" -f $inAllowed.Count, ($allowedFiles -join ', '), $inTests.Count)
     }
 }
 

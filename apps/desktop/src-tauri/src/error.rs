@@ -5,7 +5,7 @@
 //! Detail is emitted as `tracing` events; Phase 0 installs no subscriber for the desktop
 //! crate (no new dependency allowed), so those events are currently discarded.
 
-use forgedm_ipc::IpcError;
+use forgedm_ipc::{BootstrapError, IpcError};
 use forgedm_protocol::ErrorCode;
 use serde::Serialize;
 
@@ -21,6 +21,9 @@ pub enum CommandErrorKind {
     ProtocolMismatch,
     /// The agent answered with an error response.
     AgentError,
+    /// The webview sent something the app refuses before contacting the agent (a malformed
+    /// id, a download that is not in a state the action applies to).
+    InvalidRequest,
     /// Anything else: timeouts, transport faults, malformed answers, local faults.
     Internal,
 }
@@ -66,10 +69,9 @@ impl From<IpcError> for CommandError {
                     "The background engine uses an incompatible protocol version.",
                 )
             }
-            IpcError::Server(_) => Self::new(
-                CommandErrorKind::AgentError,
-                "The background engine could not complete the request.",
-            ),
+            IpcError::Server(body) => {
+                Self::new(CommandErrorKind::AgentError, server_message(body.code))
+            }
             IpcError::Busy => Self::new(
                 CommandErrorKind::Internal,
                 "The background engine is busy. Try again in a moment.",
@@ -78,6 +80,69 @@ impl From<IpcError> for CommandError {
                 CommandErrorKind::Internal,
                 "Communication with the background engine failed.",
             ),
+        }
+    }
+}
+
+/// Fixed, user-facing text per agent error code. The agent's own message is never relayed,
+/// so nothing a request carried can come back to the webview.
+fn server_message(code: ErrorCode) -> &'static str {
+    match code {
+        ErrorCode::NotFound => "That download no longer exists.",
+        ErrorCode::InvalidState => {
+            "That action is not available while the download is in its current state."
+        }
+        ErrorCode::NotResumable => {
+            "The server does not support resuming, so this download cannot be paused without starting over. Cancel it instead."
+        }
+        ErrorCode::InvalidUrl => {
+            "The link was rejected. Check that it is a valid http or https address."
+        }
+        ErrorCode::InvalidDestination => {
+            "That folder cannot be used. Choose an existing folder you can write to."
+        }
+        ErrorCode::InvalidFileName => "The file name was rejected.",
+        ErrorCode::InvalidChecksum => {
+            "The SHA-256 value is not valid. It must be 64 hexadecimal characters."
+        }
+        ErrorCode::LimitExceeded => {
+            "A limit was reached. Remove or finish some downloads and try again."
+        }
+        ErrorCode::Busy => "The background engine is busy. Try again in a moment.",
+        ErrorCode::ShuttingDown => "The background engine is shutting down.",
+        ErrorCode::StorageUnavailable => "The engine's download database is unavailable.",
+        ErrorCode::InvalidPayload => "The engine did not accept that request.",
+        _ => "The background engine could not complete the request.",
+    }
+}
+
+impl From<BootstrapError> for CommandError {
+    fn from(err: BootstrapError) -> Self {
+        match err {
+            BootstrapError::Ipc(inner) => Self::from(inner),
+            BootstrapError::AgentBinaryMissing(_) => {
+                tracing::warn!("agent executable missing");
+                Self::new(
+                    CommandErrorKind::AgentUnavailable,
+                    "The background engine is not installed next to the app.",
+                )
+            }
+            BootstrapError::Spawn(_)
+            | BootstrapError::AgentExited { .. }
+            | BootstrapError::Timeout => {
+                tracing::warn!(error = %err, "the agent could not be started");
+                Self::new(
+                    CommandErrorKind::AgentUnavailable,
+                    "The background engine could not be started.",
+                )
+            }
+            other => {
+                tracing::warn!(error = %other, "agent bootstrap fault");
+                Self::new(
+                    CommandErrorKind::Internal,
+                    "The background engine could not be located.",
+                )
+            }
         }
     }
 }
@@ -120,5 +185,76 @@ mod tests {
             CommandError::from(IpcError::Closed).kind,
             CommandErrorKind::Internal
         );
+    }
+
+    fn server_error(code: ErrorCode) -> CommandError {
+        CommandError::from(IpcError::Server(Box::new(
+            forgedm_protocol::ErrorBody::new(code),
+        )))
+    }
+
+    #[test]
+    fn get_download_maps_not_found() {
+        let err = server_error(ErrorCode::NotFound);
+        assert_eq!(err.kind, CommandErrorKind::AgentError);
+        assert!(err.message.contains("no longer exists"), "{}", err.message);
+    }
+
+    #[test]
+    fn every_server_code_has_a_friendly_nonempty_message() {
+        let codes = [
+            ErrorCode::InvalidState,
+            ErrorCode::NotResumable,
+            ErrorCode::InvalidUrl,
+            ErrorCode::InvalidDestination,
+            ErrorCode::InvalidFileName,
+            ErrorCode::InvalidChecksum,
+            ErrorCode::LimitExceeded,
+            ErrorCode::Busy,
+            ErrorCode::ShuttingDown,
+            ErrorCode::StorageUnavailable,
+            ErrorCode::InvalidPayload,
+            ErrorCode::Internal,
+            ErrorCode::Unknown,
+        ];
+        for code in codes {
+            let err = server_error(code);
+            assert_eq!(err.kind, CommandErrorKind::AgentError, "{code:?}");
+            assert!(err.message.ends_with('.'), "{code:?}: {}", err.message);
+            assert!(!err.message.contains('_'), "{code:?}: {}", err.message);
+        }
+        assert!(server_error(ErrorCode::InvalidUrl).message.contains("http"));
+        assert!(
+            server_error(ErrorCode::NotResumable)
+                .message
+                .contains("resum")
+        );
+    }
+
+    #[test]
+    fn bootstrap_failures_map_without_leaking_paths() {
+        use forgedm_ipc::BootstrapError;
+        let missing = CommandError::from(BootstrapError::AgentBinaryMissing(
+            r"C:\secretorgedm-agent.exe".into(),
+        ));
+        assert_eq!(missing.kind, CommandErrorKind::AgentUnavailable);
+        let relative = CommandError::from(BootstrapError::AgentPathNotAbsolute("a.exe".into()));
+        assert_eq!(relative.kind, CommandErrorKind::Internal);
+        for err in [
+            CommandError::from(BootstrapError::Timeout),
+            CommandError::from(BootstrapError::AgentExited { code: Some(2) }),
+            CommandError::from(BootstrapError::Spawn(std::io::Error::other(r"C:\secret"))),
+        ] {
+            assert_eq!(err.kind, CommandErrorKind::AgentUnavailable);
+            assert!(!err.message.contains("secret"));
+        }
+        let via_ipc = CommandError::from(BootstrapError::Ipc(IpcError::NotRunning));
+        assert_eq!(via_ipc.kind, CommandErrorKind::AgentUnavailable);
+    }
+
+    #[test]
+    fn invalid_request_kind_serializes_snake_case() {
+        let value = serde_json::to_value(CommandErrorKind::InvalidRequest).expect("serializes");
+        assert_eq!(value, "invalid_request");
     }
 }

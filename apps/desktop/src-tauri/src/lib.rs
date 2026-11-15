@@ -3,8 +3,11 @@
 
 pub mod agent_client;
 pub mod commands;
+pub mod engine;
 pub mod error;
 pub mod logging;
+pub mod open_folder;
+pub mod request;
 
 pub use commands::COMMAND_NAMES;
 
@@ -22,7 +25,18 @@ pub fn run(log_guard: logging::LogGuard) -> Result<(), tauri::Error> {
         .manage(target)
         .invoke_handler(tauri::generate_handler![
             commands::agent_status,
-            commands::list_downloads
+            commands::list_downloads,
+            commands::get_snapshot,
+            commands::get_download,
+            commands::enqueue_url,
+            commands::pause,
+            commands::resume,
+            commands::cancel,
+            commands::retry,
+            commands::remove,
+            commands::start_engine,
+            commands::stop_engine,
+            commands::show_in_folder
         ])
         .setup(|_app| {
             tracing::info!("desktop shell started");

@@ -1,13 +1,22 @@
+import { useCallback, useEffect, useRef } from "react";
+
+import mark from "./assets/forgedm-mark.svg";
+import { AddDownload } from "./components/AddDownload";
 import { DownloadList } from "./components/DownloadList";
 import { EmptyState } from "./components/EmptyState";
+import { EngineBanner } from "./components/EngineBanner";
 import { StatusStrip } from "./components/StatusStrip";
-import { useAgentSnapshot, type Snapshot } from "./hooks/useAgentSnapshot";
-import mark from "./assets/forgedm-mark.svg";
+import { StopEngine } from "./components/StopEngine";
+import { Toasts } from "./components/Toasts";
+import { messageOf, useEngine, type EngineControl } from "./hooks/useEngine";
+import { useRowRequests } from "./hooks/useRowRequests";
+import { useSnapshotPolling, type PollState } from "./hooks/useSnapshotPolling";
+import { useToasts } from "./hooks/useToasts";
 
-function pillFor(snapshot: Snapshot): { text: string; tone: string } {
-  switch (snapshot.phase) {
+function pillFor(state: PollState): { text: string; tone: string } {
+  switch (state.phase) {
     case "ready":
-      return { text: "Engine running", tone: "ok" };
+      return state.stale === undefined ? { text: "Engine running", tone: "ok" } : { text: "Engine not responding", tone: "bad" };
     case "unavailable":
       return { text: "Engine offline", tone: "off" };
     case "error":
@@ -17,42 +26,80 @@ function pillFor(snapshot: Snapshot): { text: string; tone: string } {
   }
 }
 
-function Body({ snapshot, refresh }: { snapshot: Snapshot; refresh: () => void }) {
-  const check = { label: "Check again", onClick: refresh };
-  switch (snapshot.phase) {
+interface BodyProps {
+  state: PollState;
+  engine: EngineControl;
+  refresh: () => void;
+  onAdded: (fileName: string) => void;
+  onRowError: (message: string) => void;
+}
+
+function Body({ state, engine, refresh, onAdded, onRowError }: BodyProps) {
+  const onRequest = useRowRequests(onRowError, refresh);
+  switch (state.phase) {
     case "loading":
       return <p className="muted">Connecting to the background engine…</p>;
     case "unavailable":
       return (
-        <EmptyState title="Background engine not running" action={check} tone="warning">
-          ForgeDM downloads run in a separate background engine. Start it, then check again.
-        </EmptyState>
+        <EngineBanner starting={engine.starting} error={engine.startError} onStart={() => void engine.start()} onCheck={refresh} />
       );
     case "error":
       return (
-        <EmptyState title={snapshot.title} action={check} tone="warning">
-          {snapshot.detail}
+        <EmptyState title={state.title} action={{ label: "Check again", onClick: refresh }} tone="warning">
+          {state.detail}
         </EmptyState>
       );
-    case "ready":
+    case "ready": {
+      const { agent_status: status, downloads } = state.snapshot;
       return (
         <>
-          <StatusStrip status={snapshot.status} />
-          {snapshot.downloads.items.length === 0 ? (
-            <EmptyState title="No downloads yet">
-              Downloads you add will appear here with live progress.
+          {state.stale !== undefined && (
+            <EmptyState title={state.stale.title} action={{ label: "Check again", onClick: refresh }} tone="warning">
+              {state.stale.detail} Showing the last known downloads.
             </EmptyState>
+          )}
+          <StatusStrip status={status} />
+          <AddDownload onAdded={onAdded} />
+          {downloads.length === 0 ? (
+            <EmptyState title="No downloads yet">Downloads you add will appear here with live progress.</EmptyState>
           ) : (
-            <DownloadList items={snapshot.downloads.items} />
+            <DownloadList items={downloads} onRequest={onRequest} />
           )}
         </>
       );
+    }
   }
 }
 
 export default function App() {
-  const { snapshot, refresh } = useAgentSnapshot();
-  const pill = pillFor(snapshot);
+  const { state, refresh } = useSnapshotPolling();
+  const { toasts, push, dismiss } = useToasts();
+  const engine = useEngine(refresh);
+  const autoStarted = useRef(false);
+  const { start } = engine;
+
+  // Auto-start once at launch: the first time the engine is found not running.
+  useEffect(() => {
+    if (state.phase === "unavailable" && !autoStarted.current) {
+      autoStarted.current = true;
+      void start();
+    }
+  }, [state.phase, start]);
+
+  const onAdded = useCallback(
+    (fileName: string) => {
+      push("info", `Added ${fileName}`);
+      refresh();
+    },
+    [push, refresh],
+  );
+  const onRowError = useCallback((message: string) => push("error", message), [push]);
+  const { stop } = engine;
+  const onStop = useCallback(() => {
+    stop().catch((err: unknown) => push("error", messageOf(err)));
+  }, [stop, push]);
+
+  const pill = pillFor(state);
   return (
     <div className="shell">
       <header className="topbar">
@@ -62,10 +109,12 @@ export default function App() {
           <span className="pill-dot" aria-hidden="true" />
           {pill.text}
         </span>
+        {state.phase === "ready" && <StopEngine onStop={onStop} />}
       </header>
       <main className="content">
-        <Body snapshot={snapshot} refresh={refresh} />
+        <Body state={state} engine={engine} refresh={refresh} onAdded={onAdded} onRowError={onRowError} />
       </main>
+      <Toasts toasts={toasts} onDismiss={dismiss} />
     </div>
   );
 }

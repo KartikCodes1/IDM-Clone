@@ -9,6 +9,8 @@ const htmlSinks = ["innerHTML", "outerHTML", "insertAdjacentHTML", "srcdoc"];
 
 export default tseslint.config(
   { ignores: ["dist", "src-tauri"] },
+  // Node build scripts (apps/desktop/scripts) run under Node, not in the webview.
+  { files: ["scripts/**/*.mjs"], languageOptions: { globals: globals.node } },
   js.configs.recommended,
   ...tseslint.configs.recommended,
   reactHooks.configs.flat["recommended-latest"],

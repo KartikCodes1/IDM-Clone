@@ -6,10 +6,11 @@
 
 use std::path::{Path, PathBuf};
 
-use forgedm_ipc::{Client, ClientConfig};
+use forgedm_ipc::{Client, ClientConfig, IpcError};
 use forgedm_protocol::{
-    AgentStatusInfo, ClientKind, Empty, ListDownloadsRequest, ListDownloadsResult, RequestBody,
-    ResultBody,
+    AgentStatusInfo, ClientKind, DownloadDetail, Empty, EnqueueUrlResult, ErrorCode,
+    ListDownloadsRequest, ListDownloadsResult, RequestBody, ResultBody, SnapshotResult,
+    StateResult,
 };
 
 use crate::error::{CommandError, CommandErrorKind};
@@ -35,6 +36,12 @@ impl AgentLocator {
             pipe_name: pipe_name.into(),
             expected_agent_path: expected_agent_path.into(),
         }
+    }
+
+    /// The agent image the server must be running from.
+    #[must_use]
+    pub fn expected_agent_path(&self) -> &Path {
+        &self.expected_agent_path
     }
 
     /// The production locator: the current user's default pipe and the canonical
@@ -83,7 +90,7 @@ fn default_pipe_name() -> Result<String, CommandError> {
     })
 }
 
-async fn connect(locator: &AgentLocator) -> Result<Client, CommandError> {
+pub(crate) async fn connect(locator: &AgentLocator) -> Result<Client, CommandError> {
     let config = ClientConfig::new(&locator.pipe_name, &locator.expected_agent_path);
     let mut client = Client::connect(config).await?;
     client
@@ -92,7 +99,7 @@ async fn connect(locator: &AgentLocator) -> Result<Client, CommandError> {
     Ok(client)
 }
 
-fn unexpected_result() -> CommandError {
+pub(crate) fn unexpected_result() -> CommandError {
     tracing::warn!("agent answered with a result of the wrong shape");
     CommandError::new(
         CommandErrorKind::Internal,
@@ -126,6 +133,85 @@ pub async fn fetch_downloads(locator: &AgentLocator) -> Result<ListDownloadsResu
     match client.call(RequestBody::ListDownloads(request)).await? {
         ResultBody::ListDownloads(result) => Ok(*result),
         _ => Err(unexpected_result()),
+    }
+}
+
+/// One request over a fresh connection.
+///
+/// # Errors
+/// A [`CommandError`] classified from the transport or server failure.
+pub async fn send(locator: &AgentLocator, body: RequestBody) -> Result<ResultBody, CommandError> {
+    let mut client = connect(locator).await?;
+    Ok(client.call(body).await?)
+}
+
+/// `GetSnapshot`: agent status and the download list in one consistent answer.
+///
+/// # Errors
+/// As [`send`].
+pub async fn fetch_snapshot(locator: &AgentLocator) -> Result<SnapshotResult, CommandError> {
+    match send(locator, RequestBody::GetSnapshot(Empty {})).await? {
+        ResultBody::GetSnapshot(snapshot) => Ok(*snapshot),
+        _ => Err(unexpected_result()),
+    }
+}
+
+/// `GetDownload`.
+///
+/// # Errors
+/// As [`send`].
+pub async fn fetch_download(
+    locator: &AgentLocator,
+    body: RequestBody,
+) -> Result<DownloadDetail, CommandError> {
+    match send(locator, body).await? {
+        ResultBody::GetDownload(detail) => Ok(*detail),
+        _ => Err(unexpected_result()),
+    }
+}
+
+/// `EnqueueUrl`.
+///
+/// # Errors
+/// As [`send`].
+pub async fn enqueue(
+    locator: &AgentLocator,
+    body: RequestBody,
+) -> Result<EnqueueUrlResult, CommandError> {
+    match send(locator, body).await? {
+        ResultBody::EnqueueUrl(result) => Ok(result),
+        _ => Err(unexpected_result()),
+    }
+}
+
+/// `Pause`, `Resume`, `Cancel` or `Retry`: the resulting state.
+///
+/// # Errors
+/// As [`send`].
+pub async fn change_state(
+    locator: &AgentLocator,
+    body: RequestBody,
+) -> Result<StateResult, CommandError> {
+    match send(locator, body).await? {
+        ResultBody::Pause(r)
+        | ResultBody::Resume(r)
+        | ResultBody::Cancel(r)
+        | ResultBody::Retry(r) => Ok(r),
+        _ => Err(unexpected_result()),
+    }
+}
+
+/// `Remove`. A repeated remove (`not_found`) is treated as success (PLAN A.6).
+///
+/// # Errors
+/// As [`send`], except for `not_found`.
+pub async fn remove(locator: &AgentLocator, body: RequestBody) -> Result<(), CommandError> {
+    let mut client = connect(locator).await?;
+    match client.call(body).await {
+        Ok(ResultBody::Remove(_)) => Ok(()),
+        Ok(_) => Err(unexpected_result()),
+        Err(IpcError::Server(error)) if error.code == ErrorCode::NotFound => Ok(()),
+        Err(err) => Err(err.into()),
     }
 }
 

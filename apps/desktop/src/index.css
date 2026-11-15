@@ -22,6 +22,10 @@
   --space-4: 16px;
   --space-6: 24px;
   --dur: 160ms;
+  /* Motion durations: master spec section 9.4. */
+  --dur-hover: 110ms;
+  --dur-toast: 180ms;
+  --dur-enter: 190ms;
   --font: "Segoe UI Variable", "Segoe UI", system-ui, sans-serif;
 }
 
@@ -191,12 +195,70 @@ body {
 }
 
 .row {
-  display: grid;
-  grid-template-columns: minmax(0, 2fr) 120px minmax(160px, 1fr) minmax(0, 1.2fr);
-  align-items: center;
-  gap: var(--space-4);
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
   padding: var(--space-3) var(--space-4);
   border-bottom: 1px solid var(--border);
+  transition: background-color var(--dur-hover) ease;
+}
+
+.row:hover {
+  background: rgb(255 255 255 / 0.02);
+}
+
+.row-head {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+}
+
+.row-head .row-name {
+  flex: 1;
+}
+
+.row-body {
+  display: grid;
+  grid-template-columns: minmax(160px, 1fr) minmax(0, 1.4fr);
+  align-items: center;
+  gap: var(--space-4);
+}
+
+.row-size {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-1) var(--space-3);
+}
+
+.row-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: flex-end;
+  gap: var(--space-2);
+}
+
+.row-failure {
+  margin: 0;
+  font-size: 12px;
+  color: var(--bad);
+}
+
+.chip-completed {
+  color: var(--ok);
+}
+
+.chip-failed,
+.chip-cancelled {
+  color: var(--bad);
+}
+
+.chip-paused,
+.chip-retry_waiting,
+.chip-interrupted,
+.chip-needs_credentials,
+.chip-needs_url_refresh {
+  color: var(--warn);
 }
 
 .row:last-child {
@@ -256,6 +318,169 @@ body {
     var(--surface-float) 0 8px,
     rgb(255 255 255 / 0.1) 8px 16px
   );
+}
+
+.button-quiet {
+  background: var(--surface-float);
+  border: 1px solid var(--border);
+}
+
+.button-danger {
+  background: #b3434f;
+}
+
+.button-small {
+  padding: 4px 10px;
+  font-size: 12px;
+}
+
+.button:disabled {
+  opacity: 0.55;
+  cursor: default;
+  filter: none;
+}
+
+.button-row,
+.confirm-inline {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: center;
+  gap: var(--space-2);
+}
+
+.confirm-inline {
+  font-size: 12px;
+}
+
+.add-panel {
+  padding: var(--space-4);
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+}
+
+.add-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 2fr) minmax(0, 1.3fr) minmax(0, 1.3fr) auto;
+  align-items: start;
+  gap: var(--space-3);
+}
+
+.field {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  min-width: 0;
+}
+
+.field label {
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+.field input {
+  font: inherit;
+  color: var(--text);
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 8px 10px;
+  transition: border-color var(--dur-hover) ease;
+}
+
+.field input:hover {
+  border-color: rgb(255 255 255 / 0.18);
+}
+
+.field input:focus-visible {
+  outline: 2px solid var(--accent-2);
+  outline-offset: 1px;
+}
+
+.field input[aria-invalid="true"] {
+  border-color: var(--bad);
+}
+
+.field-error {
+  margin: 0;
+  font-size: 12px;
+  color: var(--bad);
+}
+
+.add-submit {
+  align-self: end;
+}
+
+.toasts {
+  position: fixed;
+  right: var(--space-4);
+  bottom: var(--space-4);
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  max-width: 380px;
+}
+
+.toast {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  padding: var(--space-3) var(--space-4);
+  background: var(--surface-float);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  box-shadow: 0 8px 24px rgb(0 0 0 / 0.4);
+  animation: toast-in var(--dur-toast) ease-out;
+}
+
+.toast-error {
+  border-color: rgb(255 122 133 / 0.5);
+}
+
+.toast span {
+  flex: 1;
+  overflow-wrap: anywhere;
+}
+
+.toast-close {
+  font: inherit;
+  font-size: 12px;
+  color: var(--text-muted);
+  background: none;
+  border: 0;
+  cursor: pointer;
+}
+
+.toast-close:focus-visible,
+.toast-close:hover {
+  color: var(--text);
+}
+
+@keyframes toast-in {
+  from {
+    opacity: 0;
+    transform: translateY(8px);
+  }
+}
+
+.row {
+  animation: row-in var(--dur-enter) ease-out;
+}
+
+@keyframes row-in {
+  from {
+    opacity: 0;
+  }
+}
+
+@media (max-width: 1000px) {
+  .add-grid {
+    grid-template-columns: 1fr 1fr;
+  }
+  .row-body {
+    grid-template-columns: 1fr;
+  }
 }
 
 @media (prefers-reduced-motion: reduce) {

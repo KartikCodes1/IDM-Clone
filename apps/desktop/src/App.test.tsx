@@ -3,17 +3,13 @@ import { render, screen } from "@testing-library/react";
 import { describe, expect, it } from "vitest";
 
 import downloadListGolden from "../../../crates/forgedm-protocol/tests/golden/v1/response_ListDownloads.json";
-import statusGolden from "../../../crates/forgedm-protocol/tests/golden/v1/response_GetAgentStatus.json";
 import App from "./App";
+import { installFakeAgent } from "./test/fakeAgent";
 
 type Row = Record<string, unknown>;
 
 function mockAgent(items: Row[]): void {
-  mockIPC((cmd) => {
-    if (cmd === "agent_status") return statusGolden.result;
-    if (cmd === "list_downloads") return { items, total: items.length };
-    throw new Error(`unexpected command ${cmd}`);
-  });
+  installFakeAgent(items);
 }
 
 function goldenRow(): Row {
@@ -76,7 +72,7 @@ describe("App", () => {
   });
 
   it("malformed_payload_shows_an_error_not_a_crash", async () => {
-    mockIPC((cmd) => (cmd === "agent_status" ? { nonsense: true } : { items: [], total: 0 }));
+    mockIPC((cmd) => (cmd === "get_snapshot" ? { nonsense: true } : null));
     render(<App />);
     expect(await screen.findByText("Unexpected answer from the engine")).toBeInTheDocument();
   });
