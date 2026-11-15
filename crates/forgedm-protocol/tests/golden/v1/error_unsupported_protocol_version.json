@@ -1,0 +1,1 @@
+{"type":"response","request_id":1,"ok":false,"error":{"code":"unsupported_protocol_version","message":"protocol version not supported","retryable":false,"details":{"server_min":1,"server_max":1}}}

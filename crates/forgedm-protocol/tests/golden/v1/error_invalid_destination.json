@@ -1,0 +1,1 @@
+{"type":"response","request_id":9,"ok":false,"error":{"code":"invalid_destination","message":"destination rejected","retryable":false,"details":{"reason":"not_absolute"}}}

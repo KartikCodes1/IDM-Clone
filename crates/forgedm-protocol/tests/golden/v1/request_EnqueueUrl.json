@@ -1,0 +1,1 @@
+{"protocol_version":1,"request_id":9,"action":"EnqueueUrl","payload":{"url":"https://example.com/files/archive.zip","target_dir":"C:\\Users\\me\\Downloads","file_name":"archive.zip","expected_sha256":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef","max_connections":8,"rate_limit_bps":null,"priority":"high","start_paused":false}}

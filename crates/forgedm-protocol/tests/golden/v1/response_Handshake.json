@@ -1,0 +1,1 @@
+{"type":"response","request_id":1,"ok":true,"result":{"protocol_version":1,"protocol_minor":0,"agent_version":"0.1.0","agent_pid":4321,"agent_instance_id":"018f2c3e-0000-7000-8000-00000000a001","capabilities":["resume","segmented"],"limits":{"max_frame_bytes":1048576,"max_list_page":500}}}

@@ -1,0 +1,1 @@
+{"type":"response","request_id":3,"ok":true,"result":{"agent_version":"0.1.0","agent_pid":4321,"agent_instance_id":"018f2c3e-0000-7000-8000-00000000a001","state":"ready","uptime_ms":60000,"active":1,"queued":2,"total_speed_bps":1048576,"proxy_source":"none","data_dir":"C:\\Users\\me\\AppData\\Local\\ForgeDM"}}

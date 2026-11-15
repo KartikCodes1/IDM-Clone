@@ -1,0 +1,1 @@
+{"protocol_version":1,"request_id":7,"action":"ListDownloads","payload":{"states":["queued","downloading"],"limit":100,"offset":0}}

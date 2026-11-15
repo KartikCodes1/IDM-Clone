@@ -1,0 +1,1 @@
+{"type":"event","seq":105,"event":"DownloadFailed","data":{"id":"018f2c3e-5a10-7b2d-9c4e-0123456789ab","error":{"code":"rate_limited","message":"server asked to slow down","retryable":true,"details":{"retry_at_ms":1700000060000}}}}

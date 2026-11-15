@@ -1,0 +1,1 @@
+{"type":"event","seq":103,"event":"ProgressSnapshot","data":{"items":[{"id":"018f2c3e-5a10-7b2d-9c4e-0123456789ab","accepted_bytes":2048,"committed_bytes":1024,"total_bytes":4096,"speed_bps":512,"eta_ms":4000,"active_connections":4}]}}

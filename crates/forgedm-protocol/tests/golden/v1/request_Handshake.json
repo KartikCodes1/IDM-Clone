@@ -1,0 +1,1 @@
+{"protocol_version":1,"request_id":1,"action":"Handshake","payload":{"client_kind":"cli","client_name":"forgedm","client_version":"0.1.0","min_protocol":1,"max_protocol":1}}

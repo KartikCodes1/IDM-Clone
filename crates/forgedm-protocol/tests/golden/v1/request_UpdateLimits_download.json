@@ -1,0 +1,1 @@
+{"protocol_version":1,"request_id":20,"action":"UpdateLimits","payload":{"scope":{"download_id":"018f2c3e-5a10-7b2d-9c4e-0123456789ab"},"max_connections":2,"rate_limit_bps":65536}}
