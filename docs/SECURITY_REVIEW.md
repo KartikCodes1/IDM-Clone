@@ -68,6 +68,14 @@ This log records the reviews that actually ran: the reviewer, the scope, each fi
 | 2026-11-15 | S1.9 | ecc:security-reviewer | 0 | 0 | 0 | 0 | 0 |
 | 2026-11-15 | S1.9 | ecc:code-reviewer | 0 | 0 | 0 | 2 (1 not fixed, 1 no change needed) | 0 |
 | 2026-11-15 | S1.9 | ecc:silent-failure-hunter | 0 | 0 | 1 (fixed) | 3 (1 no change needed, 2 not fixed) | 0 |
+| 2026-11-15 | S1.10+ | ecc:typescript-reviewer | 0 | 0 | 0 | 4 (3 fixed, 1 not fixed) | 0 |
+| 2026-11-15 | S1.10+ | ecc:react-reviewer | 0 | 0 | 2 (both fixed) | 3 (1 fixed, 2 not fixed) | 0 |
+| 2026-11-15 | S1.10+ | ecc:security-reviewer | 0 | 0 | 0 | 2 (1 no change needed, 1 not fixed) | 0 |
+| 2026-11-15 | S1.10+ | ecc:rust-reviewer | 0 | 0 | 0 | 3 (2 no change needed, 1 not fixed) | 0 |
+| 2026-11-15 | S1.10+ | ecc:code-reviewer | 0 | 0 | 0 | 1 (not fixed) | 0 |
+| 2026-11-15 | S1.11 | ecc:rust-reviewer | 0 | 0 | 1 (fixed) | 1 (fixed) | 0 |
+| 2026-11-15 | S1.11 | ecc:security-reviewer | 0 | 0 | 0 | 0 | 0 |
+| 2026-11-15 | S1.11 | ecc:code-reviewer | 0 | 0 | 0 | 6 (2 fixed, 4 no change needed) | 0 |
 
 Process: each Medium or higher finding went to an independent verifier asked to refute it, and was fixed only if confirmed. Low findings were passed to the fixer unverified.
 
@@ -457,6 +465,49 @@ Other Low findings (not verified, per the process above):
 Severity note: the silent-failure-hunter summary text said two MEDIUM and two LOW; the verified records list one MEDIUM (hunter-6) and three LOW (hunter-5, -7, -8). The table uses the verified records.
 
 Verifier-rejected: none.
+Re-review: none recorded (re-review null). The MEDIUM fix has not been re-reviewed.
+
+### S1.10+ (0 Critical/High; 2 Medium, both fixed; 13 Low: 4 fixed, 3 no change needed, 6 not fixed)
+
+Confirmed (verified) findings:
+- S1.10+-react-reviewer-5 (Medium): a single failed poll unmounted the whole ready UI and discarded local state. **Fixed**: a failed poll after a snapshot keeps the last snapshot with a stale notice (a banner with a Check again button; the pill reads Engine not responding). The form and list stay mounted. Regression test a_failed_poll_keeps_the_form_and_list_and_shows_a_banner.
+- S1.10+-react-reviewer-6 (Medium): focus was lost when the remove confirmation swapped the action buttons. **Fixed**: focus moves to the first confirm button when a confirmation opens and returns to the trigger when it closes (DownloadRow and StopEngine). Tests remove_confirmation_moves_focus_and_restores_it and stop_engine_confirmation_moves_focus_and_restores_it.
+- S1.10+-typescript-reviewer-1 (LOW, confirmed): snapshot polling can stall, and refresh requests are silently dropped. **Fixed in part by the outcome**: the verifier refuted the stall-forever claim, so no timeout was added. A refresh requested while a poll is in flight now runs one more poll when it settles (a pending-refresh flag). No dedicated test for the flag.
+
+Other Low findings:
+- S1.10+-typescript-reviewer-2: enqueue result parser threw a plain Error and used `as` casts. **Fixed**: parseEnqueueResult uses the shared asObject and str guards and throws PayloadError.
+- S1.10+-typescript-reviewer-3: row action buttons stay enabled while the command is in flight. **Not fixed** (optional).
+- S1.10+-typescript-reviewer-4: an engine-supplied state string built a CSS class name. **Fixed**: the chip uses the state class only when stateLabel recognises it; otherwise chip-unknown.
+- S1.10+-react-reviewer-7: no per-row in-flight guard on row commands (same issue as typescript-reviewer-3). **Not fixed** (optional).
+- S1.10+-react-reviewer-8: nested live regions announced toasts twice. **Fixed**: aria-live removed from the toast container; each toast keeps its role.
+- S1.10+-react-reviewer-9: every row re-renders on every 1 s poll. **Not fixed** (optional).
+- S1.10+-security-reviewer-10: show_in_folder has a check-then-use gap and trusts the path reported by the agent. **No change needed**: same-user race with no code-execution path; accepted.
+- S1.10+-security-reviewer-11: no length bound on the webview-supplied URL, target_dir and sha256 in the desktop layer. **Not fixed** (optional). The CSP, the per-command ACL and the IPC frame cap already limit the webview.
+- S1.10+-rust-reviewer-12: test string has a lost escape, and the kind-serialization test omits InvalidRequest. **Not fixed** (optional). A grep for the mangled path literal found nothing, so no change was made.
+- S1.10+-rust-reviewer-13: TOCTOU between the file check and the Explorer launch, with no test for the launch step. **No change needed**: the reviewer says it is acceptable as is.
+- S1.10+-rust-reviewer-14: build-script output errors were silently discarded with `let _ =`. **No change needed**: build.rs files were frozen for this slice; the manifest check script catches a missing manifest.
+- S1.10+-code-reviewer-15: get_download_maps_not_found covers only the error mapper, not the get_download command. **Not fixed** (optional).
+
+Verifier-rejected: none.
+Reviewer reports were read-only. The typescript, security and rust reviewers stated that they ran no commands.
+Re-review: none recorded (re-review null). The two MEDIUM fixes have not been re-reviewed.
+
+### S1.11 (0 Critical/High; 1 Medium, fixed; 7 Low: 3 fixed, 4 no change needed)
+
+Confirmed (verified) findings:
+- S1.11-rust-reviewer-1 (MEDIUM): the per-download connection cap was lost on agent restart, and UpdateLimits was not persisted. **Fixed**: StoredJob.max_connections was added and mapped in store_adapter::job_from; enqueue sets it, and spawn_task seeds the cap from it. Regression test restart_keeps_the_stored_connection_cap failed with 8 requests before the fix and passes now. Live UpdateLimits changes remain session-only (open; persisting them needs a forgedm-storage method).
+
+Other Low findings:
+- S1.11-rust-reviewer-2: ConnectionCaps entries were never released for finished downloads. **Fixed**: the doc comment is corrected (entries are bounded by known downloads, one is dropped on remove, and live changes last for the session only). Entries are not forgotten on task finish, because a pause also ends the task and forgetting would lose a live cap on resume.
+- S1.11-code-reviewer-3: dead public method is_fully_sent. **Fixed**: deleted.
+- S1.11-code-reviewer-4: logged_ranges_disjoint_and_cover only checked disjointness conditionally. **No change needed**: byte-level disjointness stays covered by the table property tests.
+- S1.11-code-reviewer-5: NTFS-dependent tests returned early and reported PASS when the volume was not NTFS. **No change needed**: both NTFS tests ran for real on this volume (sparse_set_then_cleared passed in the segmented run).
+- S1.11-code-reviewer-6: DownloadTask::resume grew to 66 lines. **No change needed**: only slightly over the 50-line target; not refactored.
+- S1.11-code-reviewer-7: connection bounds were duplicated. **Fixed**: ConnectionCap uses forgedm_protocol::{MIN_CONNECTIONS, MAX_CONNECTIONS}, and the local copies are removed. The copy in forgedm-storage is outside ownership.
+- S1.11-code-reviewer-8: set_max_connections created a cap entry for finished downloads. **No change needed**: the doc comment is accurate, and the entry is tiny and cleared on remove.
+
+Verifier-rejected: none.
+Reviewer reports were read-only. The rust, security and code reviewers stated that they did not run cargo or the tests.
 Re-review: none recorded (re-review null). The MEDIUM fix has not been re-reviewed.
 
 ## Not run

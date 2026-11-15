@@ -562,3 +562,105 @@ Problems and notes:
 - The proof cannot detect a missing FlushFileBuffers, because TerminateProcess leaves the OS file cache intact. The script says so itself. Power-loss durability: NOT RUN.
 - windows-smoke.ps1 runs its own `cargo build --locked -p forgedm-agent -p forgedm-cli --bins` (exit 0). It ran one at a time, never alongside another build.
 - NOT RUN, as instructed: the tauri build and pnpm. Coverage (cargo-llvm-cov) was not run, as the task did not ask for it.
+
+### S1.10+ Usable desktop MVP and per-user NSIS installer (2026-11-15)
+
+RED: Rust: `cargo test -p forgedm-desktop --locked --no-run` exited 101 with `could not compile forgedm-desktop (lib test) due to 7 previous errors`. The new tests referenced modules and variants that did not exist yet (request, open_folder, engine, CommandErrorKind::InvalidRequest). TS: `pnpm test` with all new test files and no implementation gave `Test Files 9 failed (9), Tests 38 failed | 9 passed (47)` (exit code not recorded). Before the fixes, `pnpm vitest run src/App.resilience.test.tsx` exited 1 with 3 of 3 new tests failing.
+
+| Command | Exit | Result |
+|---|---|---|
+| `pnpm vitest run src/App.resilience.test.tsx` (RED, before the fixes) | 1 | 3 of 3 new tests failed |
+| `pnpm test` | 0 | 10 files, 72 tests passed |
+| `pnpm typecheck` | 0 | tsc --noEmit clean |
+| `pnpm lint` | 0 | eslint clean. The first run had a react-hooks/immutability error, fixed by making the recursive refresh a named function expression |
+| `cargo fmt -p forgedm-desktop -- --check` | 0 | clean |
+| `cargo clippy -p forgedm-desktop --all-targets --locked -- -D warnings` | 0 | clean |
+| `cargo test -p forgedm-desktop --locked` | 0 | all test binaries ok, 0 failed. The Rust code was not changed this round. Rust test counts were not tallied; the 72 above is the vitest count |
+| `git diff --exit-code Cargo.lock` | 0 | unchanged |
+
+Deviations:
+- The sidecars (externalBin) and the installer settings are in a separate overlay, `src-tauri/tauri.bundle.conf.json`, not in tauri.conf.json. tauri-build checks externalBin files at compile time, so the base config would break cargo test, clippy and tauri build on a clean checkout. The overlay holds externalBin [forgedm-agent, forgedm], the nsis currentUser install mode and `beforeBuildCommand` `pnpm run prepare-sidecars && pnpm run build`. The installer is built with `pnpm run package`. The base config keeps targets [nsis], the CSP, freezePrototype, withGlobalTauri false and useHttpsScheme false.
+- The sidecar step is in beforeBuildCommand, not beforeBundleCommand, because tauri-build needs the files before cargo compiles the desktop crate.
+- Added a get_snapshot command for the plan's 1 Hz polling (in COMMAND_NAMES, build.rs, the capability and the permission files). list_downloads and agent_status are kept. The existing App.test.tsx mocks answer get_snapshot now; assertions and test names are unchanged.
+- Added CommandErrorKind::InvalidRequest (snake_case `invalid_request`) for a malformed id, or a show_in_folder target that is not completed or is missing. Server error messages are fixed per error code and the agent's own text is never relayed.
+- The logging.rs test is renamed desktop_code_spawns_no_subprocess_except_the_open_folder_helper. It still forbids whoami, tokio::process, ShellExecute, cmd.exe and powershell; it allows Command::new only in open_folder.rs, exactly once.
+- The desktop build.rs sets an explicit asInvoker manifest: Tauri's default (Common Controls v6) plus requestedExecutionLevel asInvoker with uiAccess false.
+- Tauri command arguments use snake_case (target_dir, discard_progress, restart_from_zero, delete_partial).
+- The validate test case `http:///x` was removed, because WHATWG parsing accepts it with host x. The engine remains the authority on URLs.
+- The Tauri uninstaller's app-data deletion applies to the identifier directory (dev.forgedm.desktop) only. Agent data in %LOCALAPPDATA%\ForgeDM is left alone. This rests on documented Tauri behaviour and is not tested. The note is in config.rs because JSON has no comments.
+- A stopped engine (agent_unavailable) still replaces the view with the Start banner, because nothing can be done until it starts.
+
+Open:
+- NOT RUN: the NSIS per-user installer. The bundle step was not run; no `*-setup.exe` exists (see the W7 wave gate).
+- LOW findings not fixed: typescript-reviewer-3, react-reviewer-7, react-reviewer-9, security-reviewer-11, rust-reviewer-12, code-reviewer-15. The pending-refresh flag has no dedicated test.
+- No re-review is recorded for the two MEDIUM fixes (react-reviewer-5 and -6).
+
+NOT RUN (plan_tests_missing): none reported.
+
+### S1.11 Segmented transfer with work-splitting (2026-11-15)
+
+RED: the implementation was written before the tests, so the TDD order was not followed and most of the slice has no RED run. The one RED run captured: `cargo test -p forgedm-core --locked --test segmented restart_keeps` with the fix temporarily reverted exited 101 (`a cap of 2 must survive the restart, but 8 requests were made`). The fix was then restored.
+
+| Command | Exit | Result |
+|---|---|---|
+| `cargo test -p forgedm-core --locked --test segmented restart_keeps` (fix temporarily reverted) | 101 | RED: `a cap of 2 must survive the restart, but 8 requests were made`. Fix restored afterwards |
+| `cargo fmt -p forgedm-core -- --check` | 0 | clean |
+| `cargo clippy -p forgedm-core -p forgedm-agent --all-targets --locked -- -D warnings` | 0 | clean |
+| `cargo test -p forgedm-core --locked` | 0 | 241 passed, 0 failed, 1 ignored (the 5 GiB test). The segmented suite has 15 tests, including the new regression test restart_keeps_the_stored_connection_cap |
+| `git diff --exit-code Cargo.lock` | 0 | unchanged |
+
+Deviations:
+- Edits outside the owned path list, all additive and needed to persist and resume segment tables: core ports.rs (checkpoint_segments defaults to refusing; load_segments defaults to empty); core testing.rs (MemoryStore stores segments); agent store_adapter.rs (implements both over the segment save and load, and maps record.max_connections into the new field); agent engine_host.rs (EngineControl::set_max_connections, default not_implemented, plus the EngineHost impl). StoredJob gained max_connections in ports.rs and in every constructor (engine/cleanup.rs, testing.rs, a resume.rs unit test, tests/resume.rs). forgedm-storage, Cargo.toml and Cargo.lock were not changed.
+- forgedm-cli/tests/e2e_first_proof.rs (the S1.9 first proof, outside the owned paths) was adapted minimally. It verifies each committed range against the generator, splits requests at the kill, and requires each resumed GET to start at or after its own segment's committed offset. The kill, hash and served-bytes bound assertions are unchanged.
+- core tests/single_stream.rs single_stream_matches_generator: the expected mode for sizes of 8 MiB or more changed from SingleRanged to Segmented (the 10 MiB+3 case). This is the plan's behaviour change.
+- New transfer/prealloc.rs (sparse, FAT32 limit, part reopen without truncation) and engine/task/segmented.rs for the task glue.
+- open_part_for_segments repeats the ~20 lines of file checks from resume::open_valid_part instead of editing resume.rs, which is not owned. It does not truncate, because other segments live beyond the first gap.
+- UpdateLimits is implemented only for download scope with max_connections. Global scope, rate_limit_bps and max_active_downloads answer Unsupported/not_implemented (S1.13). A queued download starts with the new cap. The stored cap now survives an agent restart (rust-reviewer-1 fix); the earlier default of 8 for recovered jobs no longer applies.
+- Cap entries live in an in-memory map for the process lifetime (bounded by the queue cap) and are dropped on remove.
+- logged_ranges_disjoint_and_cover checks requested ranges: no gaps, no duplicate starts, full cover to T, and an exact tiling only when no split happened. File content is proven by the sha and file_matches checks.
+
+Open:
+- Live UpdateLimits max_connections changes are session-only. Persisting them needs a forgedm-storage update method, which is outside the S1.11 ownership.
+- `cargo test -p forgedm-cli` was not rerun this round. The only agent and CLI facing change is the StoredJob field; forgedm-agent passes clippy --all-targets.
+- The unthrottled segmented proof run exited 1 on its 8-connection check (see the W7 wave gate). The throttled run passed.
+- NTFS-dependent tests ran for real on this volume (sparse_set_then_cleared passed).
+
+NOT RUN (plan_tests_missing): none reported.
+
+### W7 wave gate (2026-11-15)
+
+RED: not applicable. This is the gate run over the workspace after S1.10+ and S1.11; their RED lines are in the sections above.
+
+| Command | Exit | Result |
+|---|---|---|
+| `cargo fmt --all -- --check` (CARGO_TARGET_DIR unset, shared default target dir; cargo and rustc 1.100.0) | 0 | no formatting differences |
+| `cargo clippy --workspace --all-targets --locked -- -D warnings` | 0 | clean, no warnings |
+| `cargo test --workspace --locked` (CARGO_BUILD_JOBS=6, RUST_TEST_THREADS=6) | 0 | 80 suites including doc-tests: 652 passed, 0 failed, 2 ignored (full_5gib_segmented_exact_size_stream_compare, which writes 5 GiB, and iae_from_sta_writes_zone_identifier). New W7 suites ran: segmented 15, segment_table_props, large_offsets, and the desktop engine, open_folder and requests suites |
+| `git diff --exit-code Cargo.lock` | 0 | unchanged, checked at the end too. pnpm-lock.yaml, root package.json and root Cargo.toml also unchanged |
+| `node --version` (PATH set to the node26 shim and nvm v26.13.1) | 0 | v26.13.1; pnpm resolves to the node26 shim wrapper, version 10.29.2 |
+| `pnpm install --frozen-lockfile` | 0 | lockfile up to date |
+| `pnpm -r lint` | 0 | no errors |
+| `pnpm -r typecheck` | 0 | tsc --noEmit clean |
+| `pnpm -r test` | 0 | 10 test files, 72 tests passed |
+| `pnpm audit --prod` | 0 | no known vulnerabilities found |
+| `pnpm --filter @forgedm/desktop tauri build --config src-tauri/tauri.bundle.conf.json --no-bundle` | 0 | release build. The overlay beforeBuildCommand ran prepare-sidecars: `cargo build --release --locked -p forgedm-agent -p forgedm-cli` (1m24s), staging both sidecars under apps\desktop\src-tauri\binaries. The desktop release build finished in 2m09s. The NSIS bundle step was deliberately not run |
+| `ls target\release` | 0 | forgedm-desktop.exe 11,243,520 bytes; forgedm-agent.exe 10,458,112 bytes; forgedm.exe 2,157,568 bytes |
+| `mt.exe -nologo -inputresource:<exe>;#1 -out:<file>` for each release exe, then grep for requireAdministrator or highestAvailable | 0 | each embedded manifest has requestedExecutionLevel level="asInvoker" uiAccess="false"; the desktop manifest also carries Common-Controls v6; no requireAdministrator or highestAvailable. The record also says the overall shell exit was 1, caused by `grep -c` returning 1 on zero matches, not by a failed check |
+| `cargo build --workspace --bins --locked` | 0 | dev profile finished in 11.41s; target\debug holds forgedm.exe, forgedm-agent.exe, forgedm-desktop.exe and forgedm-fixture.exe |
+| `powershell -NoProfile -ExecutionPolicy Bypass -File scripts\check.ps1` | 0 | 13 PASS, 0 FAIL, 0 NOT RUN. command-new-allowlist has 2 hits (bootstrap.rs and open_folder.rs). manifest-asinvoker PASS for debug and release forgedm.exe, forgedm-agent.exe and forgedm-desktop.exe, and for debug forgedm-fixture.exe (no manifest string) |
+| `powershell -NoProfile -ExecutionPolicy Bypass -File scripts\windows-smoke.ps1` | 0 | 22 PASS, 0 FAIL, 0 NOT RUN |
+| Segmented proof run A (ad hoc script in the session scratchpad, not in the repo): unthrottled 64 MiB fixture, `forgedm add --connections 8`; run 4 times | 1 | Bytes correct: length 67121209, SHA-256 equal to the fixture hash and the agent digest, no .part left, transfer_mode segmented. Four range GETs (0-16777215, 16777216-33554431, 33554432-50331647, 50331648-67121208) are disjoint and cover the file, but all used conn_id 0: one connection, nothing in parallel. At most one agent-to-fixture TCP connection was sampled. The script's "8 distinct connections" check failed, which is the cause of exit 1. Agent log: worker 1 took all 4 segments; workers 2-8 ended NoWork. agent stop exited 0 |
+| Segmented proof run B (same file, `-ExtraQuery 'slow=4000000'`, 4 MB/s per response) | 0 | PASS. 8 distinct conn_ids (0-7) carried range GETs and 8 agent-to-fixture TCP connections were sampled established at once. 4 initial ranges plus 4 work-steal splits; the effective ranges tile [0, 67121209) with no gaps, and every overlap is a full nesting. served_bytes 67383354 (size + 262145). SHA-256 matched. agent stop exited 0 |
+| `tasklist \| grep -i forgedm` | 1 | no forgedm process left (grep no match) |
+
+Gate all_green: false, as recorded by the gate run. Workspace tests: 652 passed, 0 failed, 2 ignored. Fixes applied during the gate: none.
+
+Problems and notes:
+- Segmented proof run A exited 1 (see the row above). Run B passed. The unthrottled download used one connection, so the parallel-connection behaviour is shown only by the throttled run B.
+- The NSIS per-user installer was NOT built. This machine has no NSIS toolchain (%LOCALAPPDATA%\tauri does not exist and there is no makensis). The Tauri 2.12.4 bundler would download the NSIS zip and nsis_tauri_utils.dll from GitHub into %LOCALAPPDATA%\tauri\NSIS. These were not downloaded: installing tooling needs the user's permission, and the rules forbid installs.
+- The problems text in the record was cut off after the NSIS point, so any further problems are not recorded here.
+
+NOT RUN:
+- The NSIS installer (the tauri bundle step; no `*-setup.exe` was produced).
+- Not in the W7 gate command list, so not run: `cargo deny --locked check` and coverage (cargo-llvm-cov). The 80% coverage target is therefore not verified for this wave.
+- plan_tests_missing: none for S1.10+ or S1.11.
