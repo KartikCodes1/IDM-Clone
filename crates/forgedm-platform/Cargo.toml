@@ -12,8 +12,14 @@ workspace = true
 
 [dependencies]
 thiserror.workspace = true
+# Coordinator decision 2026-11-15 (W1 finding S0.4-code-reviewer-8): the pipe
+# primitive returns a tokio NamedPipeServer built with
+# ServerOptions::create_with_security_attributes_raw, so the only unsafe
+# adoption stays in this crate (PLAN S0.4, ARCHITECTURE 3.3).
+tokio = { workspace = true, features = ["net"] }
 tracing.workspace = true
 windows.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+tokio = { workspace = true, features = ["net", "rt", "macros", "time"] }
