@@ -1,0 +1,33 @@
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true
+
+# Security and durability guard rails (PHASE_0_1_PLAN S0.1, ADR-007).
+# Every path was checked against reqwest 0.13.5 sources and the chosen features.
+disallowed-methods = [
+    # TLS verification bypass (old and new reqwest names).
+    { path = "reqwest::ClientBuilder::danger_accept_invalid_certs", reason = "TLS verification must never be disabled" },
+    { path = "reqwest::ClientBuilder::danger_accept_invalid_hostnames", reason = "TLS verification must never be disabled" },
+    { path = "reqwest::ClientBuilder::tls_danger_accept_invalid_certs", reason = "TLS verification must never be disabled" },
+    { path = "reqwest::ClientBuilder::tls_danger_accept_invalid_hostnames", reason = "TLS verification must never be disabled" },
+    # Custom trust roots, preconfigured TLS, key logging, early data.
+    { path = "reqwest::ClientBuilder::add_root_certificate", reason = "custom roots are not allowed" },
+    { path = "reqwest::ClientBuilder::tls_certs_merge", reason = "custom roots are not allowed" },
+    { path = "reqwest::ClientBuilder::tls_certs_only", reason = "custom roots are not allowed" },
+    { path = "reqwest::ClientBuilder::tls_backend_preconfigured", reason = "preconfigured TLS bypasses the pinned provider" },
+    { path = "reqwest::ClientBuilder::use_preconfigured_tls", reason = "preconfigured TLS bypasses the pinned provider" },
+    { path = "reqwest::ClientBuilder::tls_sslkeylogfile", reason = "key logging leaks session secrets" },
+    # tls_early_data exists only under reqwest feature `http3` (cfg-gated, verified in
+    # reqwest 0.13.5 client.rs), which ForgeDM never enables, so the path cannot resolve:
+    # allow-invalid keeps the guard in place if the feature is ever turned on.
+    { path = "reqwest::ClientBuilder::tls_early_data", reason = "0-RTT replay risk", allow-invalid = true },
+    # Total deadlines would kill large downloads: use connect_timeout and read_timeout.
+    { path = "reqwest::ClientBuilder::timeout", reason = "a total timeout kills long downloads; use connect_timeout and read_timeout" },
+    { path = "reqwest::RequestBuilder::timeout", reason = "a total timeout kills long downloads" },
+    { path = "reqwest::Client::new", reason = "build the client through the configured builder" },
+    { path = "reqwest::get", reason = "builds a default client; use the configured client" },
+    # Durability: never replace an existing file; never append to the part file.
+    { path = "std::fs::rename", reason = "use the platform no-replace move" },
+    { path = "tokio::fs::rename", reason = "use the platform no-replace move" },
+    { path = "std::fs::OpenOptions::append", reason = "part files use positional writes" },
+    { path = "tokio::fs::OpenOptions::append", reason = "part files use positional writes" },
+]

@@ -1,0 +1,4 @@
+[env]
+# D1: use the prebuilt NASM objects shipped inside aws-lc-sys (pinned by the
+# Cargo.lock checksum) so no NASM install is needed on MSVC. See THREAT_MODEL SUP-01.
+AWS_LC_SYS_PREBUILT_NASM = "1"

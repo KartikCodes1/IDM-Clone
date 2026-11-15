@@ -1,0 +1,1 @@
+//! DPAPI protect and unprotect.

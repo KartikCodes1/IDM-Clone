@@ -1,0 +1,125 @@
+[workspace]
+resolver = "3"
+# Explicit list: a stray directory must not auto-enroll without inheriting lints.
+members = [
+    "crates/forgedm-protocol",
+    "crates/forgedm-platform",
+    "crates/forgedm-core",
+    "crates/forgedm-storage",
+    "crates/forgedm-ipc",
+    "crates/forgedm-agent",
+    "crates/forgedm-cli",
+    "tests/fixtures",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.94"
+license = "UNLICENSED"
+publish = false
+
+[workspace.dependencies]
+# Internal crates
+forgedm-protocol = { path = "crates/forgedm-protocol" }
+forgedm-platform = { path = "crates/forgedm-platform" }
+forgedm-core = { path = "crates/forgedm-core" }
+forgedm-storage = { path = "crates/forgedm-storage" }
+forgedm-ipc = { path = "crates/forgedm-ipc" }
+forgedm-fixture = { path = "tests/fixtures" }
+
+# Async runtime (features are chosen per crate)
+tokio = "1.54.1"
+tokio-util = { version = "0.7.20", features = ["rt"] }
+
+# HTTP client: rustls + aws-lc-rs, no http2, no compression, no stream (ADR-007)
+reqwest = { version = "0.13.5", default-features = false, features = ["rustls", "system-proxy"] }
+
+# Storage
+sqlx = { version = "0.9.0", default-features = false, features = ["runtime-tokio", "sqlite-bundled", "macros", "migrate"] }
+
+# Serialisation, errors, logging, CLI
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+thiserror = "2.0.21"
+anyhow = "1.0.104"
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt", "json"] }
+tracing-appender = "0.2.5"
+clap = { version = "4.6.7", features = ["derive"] }
+
+# Utilities
+sha2 = "0.11.1"
+hex = "0.4.3"
+uuid = { version = "1.29.2", features = ["v7", "serde"] }
+url = "2.5.8"
+httpdate = "1.0.3"
+bytes = "1.12.1"
+
+# Win32 FFI (platform only). Pinned exactly: see ARCHITECTURE 1.5.
+# Never add windows-core or windows-sys directly.
+windows = { version = "=0.62.2", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Security_Cryptography",
+    "Win32_System_Pipes",
+    "Win32_System_Threading",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+    "Win32_System_Ioctl",
+    "Win32_System_Com",
+    "Win32_UI_Shell",
+] }
+
+# Fixture server (dev only)
+axum = { version = "0.8.9", default-features = false, features = ["http1", "tokio"] }
+hyper = { version = "1.12.0", features = ["server", "http1"] }
+hyper-util = { version = "0.1.21", features = ["tokio", "server", "http1", "service"] }
+http-body-util = "0.1.5"
+http = "1.5.0"
+futures-util = "0.3.34"
+
+# Test-only
+tempfile = "3.27.0"
+proptest = "1.12.0"
+rcgen = { version = "0.14.10", default-features = false, features = ["crypto", "pem", "aws_lc_rs"] }
+tokio-rustls = "0.26.6"
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+unsafe_op_in_unsafe_fn = "deny"
+
+[workspace.lints.cargo]
+# S0.1 pre-declares every Phase 0/1 dependency so Cargo.lock stays frozen (PHASE_0_1_PLAN
+# section 0, rule 2). Slices implement against them over time; remove this allow at the
+# Phase 1 gate to find dependencies that were never used.
+unused_dependencies = "allow"
+
+[workspace.lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+todo = "deny"
+unimplemented = "deny"
+dbg_macro = "deny"
+print_stdout = "deny"
+print_stderr = "deny"
+await_holding_lock = "deny"
+undocumented_unsafe_blocks = "deny"
+cast_possible_truncation = "deny"
+cast_sign_loss = "deny"
+cast_possible_wrap = "deny"
+
+[profile.dev.package."*"]
+opt-level = 2
+
+[profile.dev.package.sha2]
+opt-level = 3
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+panic = "unwind"
+overflow-checks = true
+debug = "line-tables-only"
