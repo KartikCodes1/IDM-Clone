@@ -206,3 +206,109 @@ RED: not applicable. This is the gate run over the workspace after S0.4b, S0.6, 
 Gate all_green: true. Fixes applied during the gate: none. Problems: none.
 
 NOT RUN (plan_tests_missing): none reported. Not in the W2 gate command list, so not run: `cargo deny --locked check` and coverage (cargo-llvm-cov). The 80% coverage target is therefore not verified for this wave.
+
+### S0.8 Agent skeleton (2026-11-15)
+
+RED: not recorded in the slice results (red field empty).
+
+| Command | Exit | Result |
+|---|---|---|
+| `cargo fmt -p forgedm-agent -- --check` | 0 | clean |
+| `cargo clippy -p forgedm-agent --all-targets --locked -- -D warnings` | 0 | clean. An earlier run failed with exit 101 after dependencies were removed, which needed a Cargo.lock change; that change was reverted |
+| `cargo test -p forgedm-agent --locked` | 0 | 68 passed, 0 failed, 0 ignored: 53 unit, 2 hub (tests/hub.rs), 13 process (tests/process.rs) |
+| `git diff --exit-code Cargo.lock` | 0 | unchanged |
+
+NOT RUN (plan_tests_missing): none reported. Not run by the slice: `cargo build --release` (windows_subsystem = windows); only the debug profile was built and tested.
+
+Deviations: the two plan tests in tests/hub.rs (no_event_lost_between_snapshot_and_subscribe and subscribe_after_evicted_seq_requires_resync) run in-process and change state through the public HubHandle::publish. The other 11 plan tests run the real forgedm-agent.exe through CARGO_BIN_EXE_forgedm-agent. No test-only hook was added to the binary. The argument parser is hand-written instead of clap, because clap would change Cargo.lock. StateHub keeps every stored download (loaded up to the 10,000 queue cap); ListDownloads.total is exact, and GetSnapshot returns only the newest 1000 and sets truncated. A Subscribe whose replay would exceed the 256-frame outbound queue returns resync_required with reason lagged, and the subscriber is not registered. AgentStatus events are emitted only on lifecycle changes (starting to ready, then shutting_down); the 1 s periodic status belongs to S1.7. ProxySource::Environment is reported when --proxy system and any of HTTP_PROXY, HTTPS_PROXY or ALL_PROXY (either case) is non-empty; otherwise system. The `[features] fault-injection = []` declaration present at HEAD was removed from crates/forgedm-agent/Cargo.toml; S1.14 must re-add it, because PHASE_0_1_PLAN, DEVELOPMENT.md and the check.ps1 no-fault-injection-in-release check (Inv-24) rely on it. Extra tests beyond the plan list include bad_arguments_exit_2 and data_dir_with_reparse_point_exits_6 (it ran, it was not skipped), plus unit tests for config, data_dir, error mapping, sealer, reconcile, summary, hub and handler (including handler_timeout_maps_to_busy with paused time). The two LOW regression tests (set_state_to_the_current_state_is_a_no_op and closed_subscribers_are_pruned_on_the_next_record) are unit tests in events_hub.rs; no separate RED run was captured for them.
+
+Open: anyhow and serde are unused dependencies that could not be removed without a Cargo.lock change, so the lock owner must act. The DACL check on an explicit --data-dir and the log-filter scoping are not fixed. Failures before logging starts (exit codes 2, 3, 6) leave no diagnostic in release builds; only a comment in main.rs documents this.
+
+### S1.4 Fixture adversarial scenarios (2026-11-15)
+
+RED: scenarios test binary before implementation: `test result: FAILED. 2 passed; 16 failed` (bad_cr_variants_emitted, short206_*, stall_after_*, mutable_etag_*, lm_eq_date_*, status_codes_*, fail_first_*, max_conns_*, multipart_*, range_200_after_*, slow_from_*, redirect_* x4 and auth_basic_* all FAILED). Raw test binary: compile error E0599 `no method named max_concurrency found for struct RequestLog`.
+
+| Command | Exit | Result |
+|---|---|---|
+| scenarios test binary with `--test-threads=4`, working set polled by tasklist every 0.2 s, killed if over 300 MB | 0 | 21 passed, 0 failed, 1.0 s. Peak working set 7972 KB (about 8 MB). The reported 6.9 GB growth could not be reproduced on the current tree |
+| `cargo test -p forgedm-fixture --locked --test memory -- --nocapture` | 0 | 1 passed. The first attempt failed with "cannot update the lock file", apparently transient from another slice's Cargo.toml edit mid-run; a retry about 20 s later passed. Cargo.lock unchanged |
+| `cargo fmt -p forgedm-fixture -- --check` | 0 | clean |
+| `cargo clippy -p forgedm-fixture --all-targets --locked -- -D warnings` | 0 | no fixture warnings. The 2 pre-existing unreachable-path warnings from the root clippy.toml (tokio::fs entries) are still reported; that file is outside the slice |
+| `cargo test -p forgedm-fixture --locked` | 0 | 63 passed, 0 failed, 0 ignored: 12 unit, 2 cli, 3 content, 1 memory, 13 raw, 21 scenarios, 11 server |
+| `git diff --exit-code Cargo.lock` | 0 | unchanged |
+
+NOT RUN (plan_tests_missing): optional TLS mode (D9) is not implemented and is deferred to S1.12. Adding rcgen or tokio-rustls to forgedm-fixture would change Cargo.lock, which this wave forbids. The `downgrade` redirect is only a Location string until TLS exists.
+
+Deviations: raw flag spellings chosen where the plan was open are `raw=dup_cl|cl_and_te|bad_status|huge_headers|crlf_location`. `lie_cl` is also served on the raw socket path, so it only applies to the first request on a connection; a raw or lie_cl flag on a reused keep-alive connection gets 400. Raw detection peeks at the first request line of each new connection, and raw responses always close the connection. Concurrency means in-flight requests: a slot is held until the response body is finished or dropped. `max_conns=N` returns 503 when N slots are held, and that 503 neither takes a slot nor raises the high-water mark. `short206=N` returns a consistent but shorter 206 (Content-Range and Content-Length both cover N fewer bytes, keeping at least 1 byte). `slow_from` is an absolute content offset; `stall_after` and `drop_after` count from the start of the served body. `slow_from` needs `slow`, `retry_after` and `fail_first` need `status`, and `mutate_after` needs `etag=mutable`; otherwise the request gets 400. With `etag=mutable&mutate_after=K` the count covers every request to the same `t` key and path; from request K the seed and the ETag change. `multipart=1` answers any valid range request (including a single range) as multipart/byteranges, built in memory, so bodies over 8 MiB fall back to normal behaviour. `redirect=signed_expiring` issues a new `signed=sN` token on each redirect; a token works `ttl_requests` times (default 1), then returns 403. The `status` flag accepts only 401, 403, 404, 410, 416, 429, 500 and 503, and Retry-After is sent verbatim on the forced response. The regression test uses a separate fixture process sampled with tasklist, not a counting global allocator, because the workspace lints forbid unsafe. There is no RED run for the memory test: making the overflow guard fail would allocate gigabytes, which the 300 MB resource rule forbids. The test asserts that the sampler read a non-zero working set, so it cannot pass vacuously. The interrupted run had already applied the fixes for review findings 1, 2, 4, 5, 6 and 7 and the loosened timing in 3; these were verified in the current tree, and only the log cap, the multipart part cap and the memory test were added.
+
+Open: the 6.9 GB growth was not reproduced. The current code streams every body in 64 KiB chunks, and the multipart sum is a saturating fold checked against an 8 MiB cap before anything is assembled. The most likely cause was the overlapping-range sum overflowing in the half-edited state; this is an inference from reading the code, not an observation. Two hardening limits were added: the request log is capped at 50,000 entries (oldest dropped, seq keeps counting), and multipart is capped at 256 parts, falling back to the plain response. The 2 root clippy.toml warnings remain unresolved.
+
+### S1.3 Retry policy, token bucket, estimator (2026-11-15)
+
+RED: `cargo test -p forgedm-core --locked` exited 101 when run with the new progress test, before the progress.rs fix landed: regressed_counter_does_not_double_count_recovered_bytes failed (72.29 > 0). This is the RED for review finding 3. The first edit script missed progress.rs (CRLF line endings), so only the retry.rs clamp had applied at that point. No RED run was recorded for finding 1 (the on_throttled panic); the reviewer's verifier reproduced that panic with a standalone rustc program.
+
+| Command | Exit | Result |
+|---|---|---|
+| `cargo test -p forgedm-core --locked` (with the new progress test, before the progress.rs fix landed) | 101 | RED, as above |
+| `cargo fmt -p forgedm-core -- --check` | 0 | clean |
+| `cargo clippy -p forgedm-core --all-targets --locked -- -D warnings` | 0 | clean |
+| `cargo test -p forgedm-core --locked` | 0 | 127 passed, 0 failed, 0 ignored across the crate; progress 10, retry 12 |
+| `git diff --exit-code Cargo.lock` | 0 | unchanged |
+
+NOT RUN (plan_tests_missing): none reported.
+
+Deviations: test `stall_decays_to_zero` was corrected; the implementation was not changed for this. The test first asserted eta()==None after a 60 s stall, which was wrong: the ETA speed is double-smoothed (tau 12 s) and is still about 42 KiB/s then, so the ETA is legitimately still shown under the 1 KiB/s gate. The test now checks that display speed is below 1 B/s at 60 s, then that ETA speed is below 1 KiB/s and eta()==None after a further 180 s of stall. Disposition::WaitUntil{at} uses tokio::time::Instant (monotonic), so a caller that needs retry_at_ms must convert. parse_retry_after takes response_date: Option<SystemTime>; an HTTP-date Retry-After with no response Date returns None (ignored), and a caller may pass local now as a fallback; an overflowing delta-seconds saturates to Duration::MAX, which classifies as Fatal(RateLimited). The budget counts the failure that reaches the limit as exhausting it: 8 consecutive failures per segment and 20 per download, with the first 7 and 19 returning Ok(attempt). TransferErrorKind::MalformedFraming maps to Fatal(range_protocol_violation), since Appendix A.7 has no closer code. TokenBucket takes an optional parent (with_parent) for hierarchical acquire instead of a free function; pieces are at most 64 KiB and are charged to the child, then the parent; set_rate wakes waiters through a Notify. Extra public API with tests: Ewma<N>, SpeedMeter (per-worker tau 2.5 s), ReresolveLimiter (3 per hour), sleep_or_cancel, BoxFuture, TokioClock, TokioSleeper and burst_for. Extra tests: transfer_error_classification_table, reresolve_limited_to_three_per_hour, burst_is_max_of_250ms_and_64kib, tick_is_250ms, worker_speed_tau_2_5s, eta_uses_min_of_speed_and_rate_limit, zero_dt_and_regressing_counters_are_safe, and a unit test in clock.rs.
+
+Open: S1.3-rust-reviewer-2 (LOW) was left as is. on_refused_at_open does not set a cooldown, which differs from the ARCHITECTURE 4.11 wording; either the docs or the code should be aligned in a follow-up.
+
+### S0.10 Desktop minimal shell (2026-11-15)
+
+RED: Rust: `cargo test -p forgedm-desktop --locked` failed to compile with `error[E0433]: cannot find type CommandErrorKind in this scope` (apps\desktop\src-tauri\src\error.rs:9 and 16-20), 7 errors, exit 101. TS: `vitest run` failed with `Failed to resolve import ./ipc from src/lib/ipc.test.ts`; Test Files 3 failed (3), no tests run. The slice's RED note also mentions a test-side bug found during GREEN, but the note is cut off after the words "heredoc strip", so that detail is not recorded here. The test-side fix that was made is listed in the deviations below.
+
+| Command | Exit | Result |
+|---|---|---|
+| `cargo fmt -p forgedm-desktop -- --check` | 0 | clean |
+| `cargo clippy -p forgedm-desktop --all-targets --locked -- -D warnings` | 0 | no warnings |
+| `cargo test -p forgedm-desktop --locked` | 0 | 6 unit + 3 + 2 integration passed, 0 failed (11 Rust tests) |
+| `pnpm exec vitest run` | 0 | 3 files, 14 tests passed |
+| `pnpm exec tsc --noEmit` | 0 | clean |
+| `pnpm exec eslint .` | 0 | no output (clean) |
+| `git diff --exit-code Cargo.lock` | 1 | Non-zero because Cargo.lock still carries the uncommitted tauri and tauri-build additions from the original S0.10 round (and other slices' edits). This round did not touch Cargo.lock; `cargo --locked` succeeded, so it was not modified |
+
+NOT RUN (plan_tests_missing): none reported.
+
+Deviations: forgedm-desktop may depend only on forgedm-ipc and forgedm-protocol, so it cannot call platform's Sid API. The current user's SID is read from System32\whoami.exe /user (CREATE_NO_WINDOW, SID strictly validated). Trust is unaffected, because Client::connect verifies the server's SID and image path. Recommended: ipc (S1.8 bootstrap) exports a default_pipe_name() so the desktop can drop the subprocess. Extra tests beyond the plan list: command-error mapping without leaking detail, whoami parsing, sibling agent path, non-local pipe rejection, list_downloads with an absent pipe, known_size percentage, malformed_payload error, unknown_state label, format tests, and parseCommandError. Test fix: in malicious_name_renders_as_text, querySelector('img') was wrong because the brand mark is an img; it now asserts no img[src='x'] and exactly one img. The injection assertions were not weakened. tauri.conf.json sets build.devUrl (http://localhost:5173), so plain cargo build, clippy and test compile without a built dist/ (verified); tauri build uses frontendDist and embeds dist (verified). beforeDevCommand is unset. Tauri default features are kept (wry, compression, common-controls-v6) and no plugins are used. The workspace features array is empty, no onlyBuiltDependencies exceptions were needed, and no .npmrc was needed. Polling is every 2 s in Phase 0; the plan's 1 Hz polling is Phase 1. Cargo.lock came from one non-locked cargo fetch after the root manifest entries were added: 251 additions and 0 existing (name, version) pairs changed. Cargo re-rendered the dependency lists of existing packages (for example "thiserror" became "thiserror 2.0.21"), which inflates the textual diff. The LOW fixes have no separate RED run; the new Rust test locator_failure_is_not_cached_and_success_is was written together with its fix and was not seen failing against the old code.
+
+Open: tracing events go nowhere (MEDIUM, open): the desktop crate has no tracing subscriber or log sink. Installing one needs tracing-subscriber or tracing-appender as a forgedm-desktop dependency, which changes Cargo.lock and breaks the no-new-dependency rule, so a coordinator dependency request is needed. The comments in error.rs now say the events are currently discarded. Startup errors in main.rs are still dropped for the same reason. whoami.exe still runs synchronously and its path is built from SystemRoot; it now runs lazily on the first command rather than at startup. The proper fix is the token SID via forgedm-platform.
+
+### W3 wave gate (2026-11-15)
+
+RED: not applicable. This is the gate run over the workspace after S0.8, S1.4, S1.3 and S0.10; their RED lines are in the sections above (none is recorded for S0.8).
+
+| Command | Exit | Result |
+|---|---|---|
+| `unset CARGO_TARGET_DIR; cargo fmt --all -- --check` | 0 | no formatting differences in the workspace; cargo and rustc 1.100.0, shared default target dir |
+| `cargo clippy --workspace --all-targets --locked -- -D warnings` | 0 | clean for all crates, including forgedm-desktop (apps/desktop/src-tauri), forgedm-agent, forgedm-core and forgedm-fixture; finished in 1m 18s |
+| `cargo test --workspace --locked` | 0 | 368 passed, 0 failed, 0 ignored across 58 test-result blocks (unit, integration and doc-tests). Per crate: agent 68 (53 lib, 2 hub, 13 process); core 127; desktop 11 (6 lib, 3, 2); fixture 63; ipc 28; platform 25; protocol 21; storage 25. No compiler warnings in the log |
+| background memory monitor during `cargo test` (500 ms Get-Process sampling of processes under target\, auto-kill above 1 GB) | 0 | No process went over 1 GB, so nothing was killed. Highest sampled working set 22.1 MB (hub test binary); forgedm-agent children peaked at 18.8 MB. 10 processes sampled; shorter-lived test binaries finished between samples. No leftover target processes |
+| `git diff --exit-code Cargo.lock` | 1 | Non-blocking, see problems below. 251 packages added; 0 existing (name, version) pairs changed or removed (334 at HEAD, 585 now). Diff +3027/-115 lines, mostly Cargo's version-qualified renames in dependency lists. Lock sha256 b547cb40798f5908c34c1191c86d3814b0a939a9371ed2fc135385f0421ced39, unchanged across the test and tauri build steps |
+| `node --version` (PATH set to the nvm v26.13.1 directory first) | 0 | v26.13.1; `pnpm --version` gives 10.29.2 |
+| `pnpm install --frozen-lockfile` | 0 | lockfile up to date, resolution skipped; 2 workspace projects already up to date |
+| `pnpm -r lint` | 0 | eslint in @forgedm/desktop: no errors or warnings |
+| `pnpm -r typecheck` | 0 | tsc --noEmit in @forgedm/desktop: clean |
+| `pnpm -r test` | 0 | vitest 5.1.0: 3 test files, 14 tests passed, 0 failed |
+| `pnpm audit --prod` | 0 | No known vulnerabilities found |
+| `pnpm --filter @forgedm/desktop tauri build --debug --no-bundle` | 0 | beforeBuildCommand `pnpm run build` (tsc --noEmit and vite build) succeeded; JS bundle 227.26 kB. Cargo dev profile finished in 53.39s and reported the built application at target\debug\forgedm-desktop.exe. No warnings in the log |
+| `test -f target/debug/forgedm-desktop.exe` | 0 | exists: 11,763,200 bytes, mtime 2026-11-15 23:21:01 (rebuilt by the tauri build) |
+
+Gate all_green: true. Workspace tests: 368 passed, 0 failed, 0 ignored. Fixes applied during the gate: none.
+
+Problems (all non-blocking):
+- `git diff --exit-code Cargo.lock` exits 1 against HEAD because of S0.10's permitted tauri and tauri-build additions. all_green is true only because that delta is the permitted one; a reader who treats any non-zero exit as failure should read this step as passing for that reason.
+- PATH: the global pnpm shim (C:\nvm4w\nodejs\pnpm.cmd, which runs Node v25.5.0) comes before Node 26 on PATH, and tauri's beforeBuildCommand starts a child cmd process that cannot see a bash function. Session-local wrappers that run v26.13.1 with the same pnpm.cjs were placed first on PATH in the session scratchpad; `where pnpm` and `pnpm exec node --version` confirmed v26.13.1. Nothing was installed and no global setting was changed. A later wave that runs tauri build with only the bash function would run pnpm under Node 25.
+- `tauri build` calls cargo without --locked. The Cargo.lock hash was unchanged afterwards.
+- S0.8 removed the `fault-injection` feature declaration from crates/forgedm-agent/Cargo.toml (present at HEAD). PHASE_0_1_PLAN S1.14, DEVELOPMENT.md and the check.ps1 no-fault-injection-in-release check (Inv-24) rely on it, and S1.14 must re-add it. This does not affect W3 gate results.
+- The memory monitor sampled every 500 ms, so only 10 target processes were caught; the rest exited within half a second. Every sampled peak was at or under 22.1 MB.
+
+NOT RUN: not in the W3 gate command list, so not run: `cargo deny --locked check` and coverage (cargo-llvm-cov). The 80% coverage target is therefore not verified for this wave. Plan item not run: S1.4 optional TLS mode (D9), deferred to S1.12.
+

@@ -32,6 +32,19 @@ This log records the reviews that actually ran: the reviewer, the scope, each fi
 | 2026-11-15 | S1.2 | ecc:rust-reviewer | 0 | 0 | 0 | 2 | 0 |
 | 2026-11-15 | S1.2 | ecc:security-reviewer | 0 | 0 | 0 | 0 | 0 |
 | 2026-11-15 | S1.2 | ecc:code-reviewer | 0 | 0 | 0 | 0 | 0 |
+| 2026-11-15 | S0.8 | ecc:rust-reviewer | 0 | 0 | 0 | 5 | 0 |
+| 2026-11-15 | S0.8 | ecc:security-reviewer | 0 | 0 | 0 | 2 | 0 |
+| 2026-11-15 | S0.8 | ecc:code-reviewer | 0 | 0 | 0 | 2 | 0 |
+| 2026-11-15 | S0.8 | ecc:silent-failure-hunter | 0 | 0 | 0 (2 Medium rejected by verifier) | 5 | 0 |
+| 2026-11-15 | S1.4 | ecc:rust-reviewer | 0 | 0 | 0 | 5 | 0 |
+| 2026-11-15 | S1.4 | ecc:code-reviewer | 0 | 0 | 0 | 2 | 0 |
+| 2026-11-15 | S1.3 | ecc:rust-reviewer | 0 | 0 | 1 (fixed) | 2 | 0 |
+| 2026-11-15 | S1.3 | ecc:code-reviewer | 0 | 0 | 0 | 0 | 0 |
+| 2026-11-15 | S0.10 | ecc:typescript-reviewer | 0 | 0 | 0 | 1 | 0 |
+| 2026-11-15 | S0.10 | ecc:react-reviewer | 0 | 0 | 0 | 4 | 0 |
+| 2026-11-15 | S0.10 | ecc:security-reviewer | 0 | 0 | 0 | 0 | 0 |
+| 2026-11-15 | S0.10 | ecc:rust-reviewer | 0 | 0 | 1 (not fixed, open) | 5 | 0 |
+| 2026-11-15 | S0.10 | ecc:code-reviewer | 0 | 0 | 0 | 0 | 0 |
 
 Process: each Medium or higher finding went to an independent verifier asked to refute it, and was fixed only if confirmed. Low findings were passed to the fixer unverified.
 
@@ -212,6 +225,82 @@ The ecc:security-reviewer and ecc:code-reviewer reported no findings.
 
 Verifier-rejected: none.
 Re-review: none recorded.
+
+### S0.8 Agent skeleton (0 Critical/High/Medium after verification; 14 Low)
+
+Confirmed (verified) findings:
+- S0.8-rust-reviewer-1 (Low): cancelling the token directly never moved the hub to ShuttingDown. **Fixed**: removed the is_cancelled early return from request_shutdown; SetState is a no-op when the state is unchanged, so duplicate shutting_down events are avoided too. Regression test set_state_to_the_current_state_is_a_no_op.
+- S0.8-silent-failure-hunter-12 (Low): failures before logging init are invisible in release builds. **No change needed**: the pre-log startup order is required by ARCHITECTURE 2.3; main.rs documents that these failures are reported by exit code only.
+
+Other Low findings:
+- S0.8-rust-reviewer-2: storage not closed on startup errors after it was opened. **Fixed**: start() closes storage when start_hub, the handler install or set_state(Ready) fails.
+- S0.8-rust-reviewer-3: subscribe reply timeout can leave a live sink registered in the hub. **Fixed**: record() prunes closed sinks on every event; regression test closed_subscribers_are_pruned_on_the_next_record.
+- S0.8-rust-reviewer-4: Ctrl+C handler failure is silent. **Fixed**: the Err branch logs a warning.
+- S0.8-rust-reviewer-5: wildcard match on the DownloadState business enum. **Fixed**: Interrupted and Paused are matched explicitly; any other target state returns StorageError::InvalidValue and logs an error.
+- S0.8-security-reviewer-6: explicit --data-dir is not checked for a user-only ACL (SEC-01 and DB-04 assume one). **Not fixed**: needs a Windows DACL helper in the platform crate or a THREAT_MODEL update, both outside the slice. Open.
+- S0.8-security-reviewer-7: unrestricted --log-level can enable dependency debug/trace logging that bypasses the SEC-01 call-site redaction discipline. **Not fixed**: scoping the filter changes the CLI contract; left for S1.14 secret_canary_absent or a decision. Open.
+- S0.8-code-reviewer-8: unused anyhow and serde dependencies and an unused feature flag. **Not fixed**: removing the dependencies makes --locked fail (Cargo.lock would change), so that edit was reverted. The fault-injection feature was removed from Cargo.toml, which does not touch the lock. Open for the lock owner.
+- S0.8-code-reviewer-9: failures before logging starts are never recorded in release builds. **No change needed**: same as silent-failure-hunter-12; by design per ARCHITECTURE 2.3, documented in main.rs.
+- S0.8-silent-failure-hunter-13: ctrl_c() registration error silently ignored. **Fixed**: same change as rust-reviewer-4.
+- S0.8-silent-failure-hunter-14: event-sink drops and publish drops are not logged. **Fixed**: dropped subscribers are logged at debug level with a count; the lost-Subscribe-reply case is covered by pruning of closed sinks.
+- S0.8-silent-failure-hunter-15: unknown stored error code and negative timestamps silently coerced. **Fixed**: warnings added for both; the fallbacks are kept.
+- S0.8-silent-failure-hunter-16: drain timeout and capped loading degrade without a count. **Fixed**: the drain warning now includes the timeout. Not added: an open-connection count, and a truncated flag for the load cap.
+
+Verifier-rejected:
+- S0.8-silent-failure-hunter-10 (reported Medium): shutdown settle failure is only logged; the agent still exits 0.
+- S0.8-silent-failure-hunter-11 (reported Medium): pipe squatting (exit 4) is not logged as a forgedm::security event.
+
+Re-review: none recorded.
+
+### S1.4 Fixture adversarial scenarios (0 Critical/High/Medium after verification; 7 Low)
+
+Confirmed (verified) findings:
+- S1.4-rust-reviewer-1 (Low): unchecked u64 arithmetic panics on request input (bad_cr). **Fixed**: content_range in response.rs uses saturating arithmetic; test bad_cr_with_huge_size_does_not_panic covers u64::MAX with every bad_cr variant and asserts a 206.
+- S1.4-rust-reviewer-2 (Low): overflow in the multipart total length (and in assemble). **Fixed**: the total is a saturating fold checked against MAX_BODY_BYTES before assemble, and parts are capped at 256; tests multipart_overlapping_ranges_on_huge_size_do_not_panic and tests/memory.rs.
+
+Other Low findings:
+- S1.4-rust-reviewer-3: fixed 300 ms sleep, then an exact assertion that slots are released. **Fixed**: log_tracks_max_concurrency polls current_concurrency() against a 5 s deadline; the slow_from assertion is loosened to a 3 s prefix bound.
+- S1.4-rust-reviewer-4: raw lie_cl path silently ignored other flags and bypassed route() rules. **Fixed**: lie_cl rejects slow, drop_after, stall_after, max_conns, status, redirect, signed, auth and multipart with 400, and HEAD follows the head flag; tests lie_cl_rejects_flags_it_cannot_honour and lie_cl_head_honours_head_flag; limits documented in the raw.rs module doc.
+- S1.4-rust-reviewer-5: malformed or unparsable request on the raw path was dropped without any response. **Fixed**: a 400 is sent before the socket closes; test raw_malformed_request_gets_400.
+- S1.4-code-reviewer-6: if_range_matches was about 54 lines. **Fixed**: split into strong_etag_matches and last_modified_matches.
+- S1.4-code-reviewer-7: ttl_requests accepted without redirect=signed_expiring or signed, and ttl_requests=0 allowed. **Fixed by documenting the behaviour**: ttl_requests=0 forces an immediately expired signed link, locked in by ttl_requests_zero_forces_an_expired_signed_link (expects 403).
+
+Verifier-rejected: none.
+Re-review: none recorded.
+
+### S1.3 Retry policy, token bucket, estimator (0 Critical/High; 1 Medium; 2 Low)
+
+Confirmed (verified) findings:
+- S1.3-rust-reviewer-1 (Medium): HostState::on_throttled panicked on an oversized cooldown. **Fixed**: the cooldown is clamped to RETRY_AFTER_WAIT_MAX (3600 s) before it is added to the Instant; regression test on_throttled_with_oversized_cooldown_does_not_panic calls it with Duration::MAX and Duration::from_secs(u64::MAX).
+
+Other Low findings:
+- S1.3-rust-reviewer-2: refused-at-open does not set cooldown_until, unlike ARCHITECTURE 4.11. **No change needed**: Appendix A.9 only requires halving the limit, and the existing test encodes the no-cooldown reading. Recorded as an open issue in TEST_EVIDENCE for a docs alignment.
+- S1.3-rust-reviewer-3: a regressed byte counter lowers the baseline and double-counts later bytes. **Fixed**: Sampler::advance and Estimator::sample keep the highest byte count seen; regression test regressed_counter_does_not_double_count_recovered_bytes (failed before the fix at 72.29 > 0, passes now).
+
+Verifier-rejected: none.
+Re-review: none recorded.
+
+### S0.10 Desktop minimal shell (0 Critical/High; 1 Medium, open; 10 Low)
+
+Confirmed (verified) findings:
+- S0.10-react-reviewer-2 (Low): every row's progressbar had the same accessible name. **Fixed**: each has aria-label "Progress of <display_name>" (or "... unknown").
+- S0.10-rust-reviewer-6 (Low): the agent locator was resolved once at startup and a failure was cached permanently. **Fixed**: AgentTarget resolves the locator lazily behind a Mutex and caches only Ok values; regression test commands::tests::locator_failure_is_not_cached_and_success_is.
+- S0.10-rust-reviewer-7 (Medium): tracing events go nowhere because no subscriber is installed. **Not fixed, open**: a subscriber needs a new dependency, which the plan rules forbid. The misleading comments in error.rs were corrected and the missing sink is recorded as an open issue.
+
+Other Low findings:
+- S0.10-typescript-reviewer-1: a transient poll failure replaces the ready snapshot with an error, and the in-flight result is not cancelled on unmount. **Fixed in part**: an active ref guards setSnapshot after unmount; keeping the last good snapshot was not done.
+- S0.10-react-reviewer-3: aria-live on a region that is mounted with its content. **Not fixed** (LOW, optional).
+- S0.10-react-reviewer-4: rows are not memoized, so every 2 s poll re-renders the whole list. **Not fixed** (LOW, optional).
+- S0.10-react-reviewer-5: one transient poll failure replaces the ready view with an error or offline screen. **Fixed in part**: only the unmount guard was added; the flicker remains.
+- S0.10-rust-reviewer-8: startup error is discarded. **Not fixed**: needs a log sink (open issue).
+- S0.10-rust-reviewer-9: wildcard arm on IpcError hides new variants. **Not fixed**.
+- S0.10-rust-reviewer-10: blocking subprocess and SystemRoot environment trust. **Not fixed**: the SID lookup now runs lazily on the first command, but it is still a blocking call.
+- S0.10-rust-reviewer-11: handler and manifest checks parse source text with string splitting. **Not fixed**.
+
+Verifier-rejected: none.
+Re-review: none recorded.
+
+## Not run
 
 ## Not run
 
