@@ -664,3 +664,13 @@ NOT RUN:
 - The NSIS installer (the tauri bundle step; no `*-setup.exe` was produced).
 - Not in the W7 gate command list, so not run: `cargo deny --locked check` and coverage (cargo-llvm-cov). The 80% coverage target is therefore not verified for this wave.
 - plan_tests_missing: none for S1.10+ or S1.11.
+
+### W7 installer build (2026-11-16, coordinator, after user approval of the NSIS download)
+
+| Command | Exit | Result |
+|---|---|---|
+| `pnpm --filter @forgedm/desktop run package` (= `tauri build --config src-tauri/tauri.bundle.conf.json`; Node 26.13.1, pnpm 10.29.2, CARGO_BUILD_JOBS=6) | 0 | Sidecars built by the release build. Tauri downloaded nsis-3.13.zip and nsis_tauri_utils.dll v0.5.3 and validated both hashes. makensis produced `target\release\bundle\nsis\ForgeDM_0.1.0_x64-setup.exe` (6,384,821 bytes). |
+| `sha256sum ForgeDM_0.1.0_x64-setup.exe` | 0 | 951c5b5d07c7ef692662bd866cd93ce48601c0feeef13ed2fc109bb7329f18d1 |
+| `git diff --stat Cargo.lock pnpm-lock.yaml` | 0 | no changes |
+
+NOT RUN: installing the setup exe on this machine, and the manual run of the installed app. Both are left to the user. The installer is unsigned, so SmartScreen will warn.

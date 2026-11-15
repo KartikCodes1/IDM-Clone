@@ -33,7 +33,18 @@ Updated 2026-11-15.
      - S1.15 removes unused deps (anyhow, serde in agent; others found by `unused_dependencies`).
      - Agent `--data-dir` user-only ACL check and log-filter scoping (S0.8 security Lows) are deferred to S1.14 / Phase 2.
 5. **W4 is running** (serial: S1.5 -> S1.6 -> S1.8 -> {S0.9 CLI, S0.10b desktop logging + shared pipe name}). The coordinator committed nothing new before W4. Cargo.lock differs from HEAD only by 2 desktop edges (tracing-subscriber, tracing-appender).
-6. **Re-sequenced for "usable ASAP"** (PLAN section 6, 2026-11-16):
+6. **Progress as of 2026-11-16:**
+   - W4, the Phase 0 gate (`2a7f70d`), W5 (`91d0d71`), W6 first proof (`f52b0ae`) and W7 (`6f97697`, `6172cb6`) are committed.
+   - W7 is Partial in two ways:
+     - The NSIS bundle is building now, after user approval of the NSIS download (2026-11-16).
+     - Segmented parallelism is proven only under fixture throttling: over loopback, one connection finishes before the stagger.
+   - Package command: `pnpm --filter @forgedm/desktop run package` (Node 26 shim on PATH). The bundle lands in `target\release\bundle\nsis\`.
+   - **W8 (S1.12) carries the W7 follow-ups:**
+     - Completion currently waits for staggered workers (about 1 s at 8 connections).
+     - `SegmentInfo.active` reports every segment as active.
+     - UpdateLimits max_connections is not persisted (needs a storage method).
+     - The S1.9 deviations: 403/404/410 resolve to `needs_url_refresh`, and RangeUnsupported/Reprobe should trigger a re-probe and re-plan instead of failing.
+7. **Re-sequenced for "usable ASAP"** (PLAN section 6, 2026-11-16):
    - W5: S0.11 in parallel with S1.7
    - W6: S1.9
    - W7: S1.10+ (desktop add-URL, controls, live progress, per-user NSIS setup exe) in parallel with S1.11
