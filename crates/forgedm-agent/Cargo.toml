@@ -19,7 +19,8 @@ name = "forgedm-agent"
 path = "src/main.rs"
 
 [features]
-# Never enabled in release builds.
+# Never enabled in release builds. Used by S1.14 crash-matrix tests (PLAN S1.14,
+# check.ps1 no-fault-injection-in-release / Inv-24).
 fault-injection = []
 
 [dependencies]
