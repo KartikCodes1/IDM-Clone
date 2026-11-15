@@ -24,6 +24,18 @@ enum Command {
         #[arg(long, default_value_t = 0)]
         port: u16,
     },
+    /// Check that the first LEN bytes of FILE match the seeded stream (prints `OK`).
+    VerifyPrefix {
+        /// File to check.
+        #[arg(long)]
+        file: std::path::PathBuf,
+        /// Content seed.
+        #[arg(long)]
+        seed: u64,
+        /// Number of leading bytes to compare.
+        #[arg(long)]
+        len: u64,
+    },
     /// Print the SHA-256 (hex) of the first SIZE bytes of the seeded stream.
     Hash {
         /// Content seed.
@@ -67,6 +79,18 @@ async fn main() -> ExitCode {
         Command::Hash { seed, size } => {
             out(&hex::encode(content::sha256(seed, size)));
             ExitCode::SUCCESS
+        }
+        Command::VerifyPrefix { file, seed, len } => {
+            match forgedm_fixture::verify::prefix_matches(&file, seed, len) {
+                Ok(()) => {
+                    out("OK");
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    err(&format!("forgedm-fixture: {e}"));
+                    ExitCode::FAILURE
+                }
+            }
         }
         Command::Serve { port } => match serve(port).await {
             Ok(()) => ExitCode::SUCCESS,

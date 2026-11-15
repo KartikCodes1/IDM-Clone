@@ -107,6 +107,14 @@ impl AgentProc {
     pub fn pid(&self) -> u32 {
         self.child.as_ref().expect("child present").id()
     }
+
+    /// Kills the agent at once (TerminateProcess) and reaps it: a crash, not a shutdown.
+    pub fn kill(&mut self) {
+        if let Some(mut child) = self.child.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
 }
 
 impl Drop for AgentProc {

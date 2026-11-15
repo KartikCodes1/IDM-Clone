@@ -99,6 +99,15 @@ pub enum AgentError {
     /// The queue holds the maximum number of downloads.
     #[error("the download queue is full")]
     LimitExceeded,
+    /// No such download.
+    #[error("download not found")]
+    NotFound,
+    /// The command is not allowed in the download's current state.
+    #[error("command not allowed while the download is {}", .0.as_str())]
+    InvalidState(forgedm_protocol::DownloadState),
+    /// Pause of an active non-resumable download without `discard_progress`.
+    #[error("the download cannot resume")]
+    NotResumable,
     /// The URL was rejected.
     #[error("url rejected: {}", .0.as_str())]
     InvalidUrl(InvalidUrlReason),
@@ -137,6 +146,9 @@ impl From<EngineError> for AgentError {
             EngineError::Busy => Self::Busy,
             EngineError::ShuttingDown => Self::ShuttingDown,
             EngineError::LimitExceeded => Self::LimitExceeded,
+            EngineError::NotFound => Self::NotFound,
+            EngineError::InvalidState(state) => Self::InvalidState(state),
+            EngineError::NotResumable => Self::NotResumable,
             EngineError::Store(store) => Self::Engine(store),
         }
     }
@@ -152,6 +164,9 @@ impl AgentError {
             Self::ShuttingDown => ErrorBody::new(ErrorCode::ShuttingDown),
             Self::Busy => ErrorBody::new(ErrorCode::Busy),
             Self::LimitExceeded => ErrorBody::new(ErrorCode::LimitExceeded),
+            Self::NotFound => ErrorBody::new(ErrorCode::NotFound),
+            Self::InvalidState(state) => ErrorBody::invalid_state(*state),
+            Self::NotResumable => ErrorBody::new(ErrorCode::NotResumable),
             Self::InvalidUrl(reason) => ErrorBody::invalid_url(*reason),
             Self::InvalidDestination(reason) => ErrorBody::invalid_destination(*reason),
             Self::InvalidFileName => ErrorBody::new(ErrorCode::InvalidFileName),
@@ -265,6 +280,21 @@ mod tests {
             assert_eq!(wire.code, code, "{error}");
             assert_eq!(wire.retryable, retryable, "{error}");
         }
+    }
+
+    #[test]
+    fn control_errors_map_to_their_wire_codes() {
+        use forgedm_protocol::DownloadState;
+        assert_eq!(AgentError::NotFound.to_wire().code, ErrorCode::NotFound);
+        let wire = AgentError::InvalidState(DownloadState::Completed).to_wire();
+        assert_eq!(wire.code, ErrorCode::InvalidState);
+        assert_eq!(
+            wire.details.unwrap().current_state,
+            Some(DownloadState::Completed)
+        );
+        let refused = AgentError::NotResumable.to_wire();
+        assert_eq!(refused.code, ErrorCode::NotResumable);
+        assert!(!refused.retryable);
     }
 
     #[test]

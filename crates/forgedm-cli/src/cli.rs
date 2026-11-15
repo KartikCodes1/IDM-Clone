@@ -36,6 +36,52 @@ pub enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Show one download in detail (state, true bytes, resume support, segments).
+    #[command(visible_alias = "show")]
+    Get {
+        /// The download id.
+        id: Uuid,
+        /// Print the detail as one JSON object.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Pause a download. It checkpoints first; `resume` continues from the committed bytes.
+    Pause {
+        /// The download id.
+        id: Uuid,
+        /// Allow pausing a download that cannot resume, throwing its progress away.
+        #[arg(long)]
+        discard_progress: bool,
+    },
+    /// Resume a paused or interrupted download.
+    Resume {
+        /// The download id.
+        id: Uuid,
+    },
+    /// Cancel a download; its partial file is kept.
+    Cancel {
+        /// The download id.
+        id: Uuid,
+    },
+    /// Retry a failed or cancelled download.
+    Retry {
+        /// The download id.
+        id: Uuid,
+        /// Forget progress and the remote file's identity and start over.
+        #[arg(long)]
+        restart_from_zero: bool,
+    },
+    /// Remove a download from the list (a completed file is never deleted).
+    Remove {
+        /// The download id.
+        id: Uuid,
+        /// Also delete the partial file ForgeDM created for it.
+        #[arg(long)]
+        delete_partial: bool,
+        /// Confirm deleting the partial file without asking.
+        #[arg(long)]
+        yes: bool,
+    },
     /// Control the background agent.
     #[command(subcommand)]
     Agent(AgentCommand),
@@ -132,6 +178,46 @@ mod tests {
         assert_eq!(args.url, "-");
         assert!(args.watch && args.no_start);
         assert_eq!(args.file_name.as_deref(), Some("a.bin"));
+    }
+
+    #[test]
+    fn control_commands_parse_their_flags() {
+        let id = Uuid::nil().to_string();
+        let cli =
+            Cli::try_parse_from(["forgedm", "remove", &id, "--delete-partial", "--yes"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Remove {
+                delete_partial: true,
+                yes: true,
+                ..
+            }
+        ));
+        let cli = Cli::try_parse_from(["forgedm", "pause", &id, "--discard-progress"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Pause {
+                discard_progress: true,
+                ..
+            }
+        ));
+        let cli = Cli::try_parse_from(["forgedm", "retry", &id, "--restart-from-zero"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Retry {
+                restart_from_zero: true,
+                ..
+            }
+        ));
+        let cli = Cli::try_parse_from(["forgedm", "show", &id, "--json"]).unwrap();
+        assert!(
+            matches!(cli.command, Command::Get { json: true, .. }),
+            "show is an alias of get"
+        );
+        assert!(
+            Cli::try_parse_from(["forgedm", "cancel"]).is_err(),
+            "the id is required"
+        );
     }
 
     #[test]

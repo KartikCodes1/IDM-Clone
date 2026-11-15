@@ -148,3 +148,67 @@ fn cli_not_next_to_the_real_agent_exits_14() {
         "no data may be accepted from the peer"
     );
 }
+
+// ---- output errors (PHASE_0_REPORT 9a: CLI output write errors) -------------------------
+
+#[test]
+fn output_to_a_closed_pipe_is_a_quiet_success() {
+    use std::process::{Command, Stdio};
+    let dir = tempfile::tempdir().unwrap();
+    let agent = AgentProc::start(dir.path());
+    agent.wait_ready();
+
+    let mut child = Command::new(support::cli_exe())
+        .arg("--data-dir")
+        .arg(dir.path())
+        .arg("status")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    // The reader goes away before the CLI has anything to say (like `forgedm status | head -0`).
+    drop(child.stdout.take());
+    let out = child.wait_with_output().unwrap();
+
+    assert_eq!(code(&out), 0, "a closed pipe is not an error");
+    assert!(
+        out.stderr.is_empty(),
+        "and it is quiet: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn output_write_failure_other_than_a_closed_pipe_exits_1() {
+    use std::process::{Command, Stdio};
+    let dir = tempfile::tempdir().unwrap();
+    let agent = AgentProc::start(dir.path());
+    agent.wait_ready();
+    // A file opened for reading only: every write to it fails with "access denied".
+    let read_only = dir.path().join("read-only.txt");
+    std::fs::write(&read_only, b"x").unwrap();
+    let stdout = std::fs::File::open(&read_only).unwrap();
+
+    let out = Command::new(support::cli_exe())
+        .arg("--data-dir")
+        .arg(dir.path())
+        .arg("status")
+        .stdin(Stdio::null())
+        .stdout(stdout)
+        .stderr(Stdio::piped())
+        .output()
+        .unwrap();
+
+    assert_eq!(
+        code(&out),
+        1,
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("cannot write to standard output"),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}

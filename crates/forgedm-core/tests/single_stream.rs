@@ -145,10 +145,12 @@ async fn single_stream_matches_generator() {
         assert!(length_verified, "size {size}");
         assert_eq!(h.store.state(id), Some(DownloadState::Completed));
         let row = h.store.row(id).unwrap();
+        // S1.9: the probe finds the fixture range-capable, so a non-empty file is a ranged
+        // single stream (the plain non-resumable path is covered with `ranges=0` below).
         let expected_mode = if size == 0 {
             TransferMode::ZeroLength
         } else {
-            TransferMode::SingleNonresumable
+            TransferMode::SingleRanged
         };
         assert_eq!(row.probe, Some((expected_mode, Some(size))));
         assert!(
@@ -172,7 +174,9 @@ async fn single_stream_matches_generator() {
 async fn unknown_length_completes_length_unverified() {
     let h = Harness::new().await;
 
-    let (id, event) = h.run(&h.url("/f/21/300000?cl=0")).await;
+    // `ranges=0`: with ranges a 206 `Content-Range` would reveal the total even without a
+    // Content-Length, which (correctly, since S1.9) makes the length verifiable.
+    let (id, event) = h.run(&h.url("/f/21/300000?cl=0&ranges=0")).await;
 
     let EngineEvent::Completed {
         length_verified,
@@ -234,42 +238,70 @@ async fn identity_header_sent() {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    let captured = tokio::spawn(async move {
-        let (mut stream, _) = listener.accept().await.unwrap();
-        let mut head = Vec::new();
-        let mut buf = [0u8; 1024];
-        while !head.windows(4).any(|w| w == b"\r\n\r\n") {
-            let n = stream.read(&mut buf).await.unwrap();
-            assert!(n > 0, "client closed before sending a request");
-            head.extend_from_slice(&buf[..n]);
+    // A server that ignores ranges: it answers the HEAD with headers only and every GET
+    // with the whole 2-byte body, and records each request head it sees.
+    let heads = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let seen = Arc::clone(&heads);
+    tokio::spawn(async move {
+        loop {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let seen = Arc::clone(&seen);
+            tokio::spawn(async move {
+                let mut head = Vec::new();
+                let mut buf = [0u8; 1024];
+                while !head.windows(4).any(|w| w == b"\r\n\r\n") {
+                    let n = stream.read(&mut buf).await.unwrap_or(0);
+                    if n == 0 {
+                        return;
+                    }
+                    head.extend_from_slice(&buf[..n]);
+                }
+                let text = String::from_utf8_lossy(&head).to_ascii_lowercase();
+                let body = if text.starts_with("head ") { "" } else { "hi" };
+                let reply = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{body}"
+                );
+                seen.lock().unwrap().push(text);
+                let _ = stream.write_all(reply.as_bytes()).await;
+            });
         }
-        stream
-            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nhi")
-            .await
-            .unwrap();
-        String::from_utf8_lossy(&head).to_ascii_lowercase()
     });
     let h = Harness::new().await;
 
     let (_id, event) = h.run(&format!("http://{addr}/x.bin")).await;
 
-    assert!(matches!(event, EngineEvent::Completed { .. }), "{event:?}");
-    let head = captured.await.unwrap();
-    assert!(head.starts_with("get /x.bin http/1.1"), "{head}");
-    assert!(head.contains("accept-encoding: identity\r\n"), "{head}");
-    assert!(head.contains("accept: */*\r\n"), "{head}");
+    let heads = heads.lock().unwrap().clone();
     assert!(
-        head.contains(&format!(
-            "user-agent: forgedm/{}\r\n",
-            env!("CARGO_PKG_VERSION")
-        )),
-        "{head}"
+        matches!(event, EngineEvent::Completed { .. }),
+        "{event:?} after {heads:?}"
     );
     assert!(
-        !head.contains("\r\nrange:"),
-        "no Range on a plain GET: {head}"
+        heads.len() >= 3,
+        "HEAD, probe GET and transfer GET: {heads:?}"
     );
-    assert!(!head.contains("\r\nreferer:"), "{head}");
+    assert!(heads[0].starts_with("head /x.bin http/1.1"), "{}", heads[0]);
+    for head in &heads {
+        assert!(head.contains("accept-encoding: identity\r\n"), "{head}");
+        assert!(head.contains("accept: */*\r\n"), "{head}");
+        assert!(
+            head.contains(&format!(
+                "user-agent: forgedm/{}\r\n",
+                env!("CARGO_PKG_VERSION")
+            )),
+            "{head}"
+        );
+        assert!(!head.contains("\r\nreferer:"), "{head}");
+    }
+    assert!(
+        heads[1].contains("\r\nrange: bytes=0-0\r\n"),
+        "the probe asks for the first byte: {}",
+        heads[1]
+    );
+    let transfer = heads.last().unwrap();
+    assert!(
+        !transfer.contains("\r\nrange:"),
+        "no Range on the plain GET of a server that ignores ranges: {transfer}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -281,7 +313,12 @@ async fn redirect_chain_followed_with_pure_policy() {
     let path = completed_path(&event);
     verify::file_matches(&path, 24, 70_000).unwrap();
     let hops = h.server.log().for_test("chain").len();
-    assert_eq!(hops, 4, "three redirects then the content");
+    // The HEAD, the probe's GET and the transfer's GET each follow the three redirects.
+    assert_eq!(
+        hops,
+        3 * 4,
+        "three redirects then the content, for each of three requests"
+    );
 
     let (_id, looped) = h.run(&h.url("/f/24/70000?redirect=loop")).await;
     assert_eq!(failed_code(&looped), DownloadErrorCode::RedirectLoop);
@@ -620,7 +657,11 @@ async fn recover_restarts_an_interrupted_download_from_zero() {
     let h = Harness::new().await;
     // A previous run staged a partial file, then the agent was killed.
     let first = h
-        .enqueue(&h.url("/f/91/5000000?slow=300000"), Some("big.bin"), None)
+        .enqueue(
+            &h.url("/f/91/5000000?slow=300000&ranges=0"),
+            Some("big.bin"),
+            None,
+        )
         .await;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     while h.engine.live(first).is_none_or(|p| p.accepted == 0) {

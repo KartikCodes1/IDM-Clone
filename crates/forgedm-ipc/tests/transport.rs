@@ -18,6 +18,7 @@ use forgedm_ipc::{
     Timeouts, serve_connection,
 };
 use forgedm_platform::pipe::{PipeError, PipeSecurity, create_pipe_instance};
+use forgedm_platform::sid::Sid;
 use forgedm_protocol::{
     ClientKind, Empty, ErrorCode, FRAME_BODY_TIMEOUT, HANDSHAKE_TIMEOUT, IDLE_TIMEOUT, MAX_FRAME,
     RequestBody, Response, ResultBody, ServerMessage, encode_frame,
@@ -571,4 +572,35 @@ async fn client_request_times_out_after_10s() {
         "got {:?}",
         again.err()
     );
+}
+
+/// IPC-03: the server checks the caller's SID itself, in addition to the pipe's DACL. A server
+/// that expects another user closes the connection before reading a single frame.
+#[tokio::test]
+async fn server_rejects_a_caller_whose_sid_is_not_the_expected_one() {
+    let name = unique_pipe_name("wrong-sid");
+    let handler = Arc::new(TestHandler::default());
+    // Administrators: the current test user is not that SID (and a SID is not a group check).
+    let other = Sid::parse("S-1-5-32-544").expect("a well-formed SID");
+    let server = Server::bind_expecting(&name, handler.clone(), ServerOptions::default(), other)
+        .expect("bind");
+    let shutdown = CancellationToken::new();
+    let task = tokio::spawn(server.serve(shutdown.clone()));
+
+    let mut client = Client::connect(client_config(&name))
+        .await
+        .expect("the pipe opens: the DACL admits the current user");
+    let hello = client.handshake(ClientKind::Cli, "wrong-sid", "0").await;
+
+    assert!(
+        hello.is_err(),
+        "the server closed the connection: {hello:?}"
+    );
+    assert_eq!(
+        handler.handled.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "no request reached the handler"
+    );
+    shutdown.cancel();
+    task.await.expect("server task").expect("clean stop");
 }

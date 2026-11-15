@@ -165,10 +165,43 @@ impl ResumeIdentity {
         }
     }
 
+    /// Rebuilds the identity from what the store kept: the validators as received and the
+    /// strengths computed at probe time (the `Date` header is not stored). A present
+    /// `ETag` decides; `Last-Modified` only counts when there is no `ETag`.
+    #[must_use]
+    pub fn from_stored(
+        total: Option<u64>,
+        etag: Option<&str>,
+        etag_strong: Option<bool>,
+        last_modified: Option<&str>,
+        last_modified_strong: Option<bool>,
+    ) -> Self {
+        let validator = match etag {
+            Some(raw) => EntityTag::parse(raw)
+                .ok()
+                .filter(|tag| !tag.is_weak() && etag_strong == Some(true))
+                .map(StrongValidator::Etag),
+            None => last_modified
+                .filter(|_| last_modified_strong == Some(true))
+                .map(|lm| StrongValidator::LastModified(lm.trim().to_owned())),
+        };
+        Self { total, validator }
+    }
+
     /// Whether a strong validator is stored.
     #[must_use]
     pub const fn has_strong_validator(&self) -> bool {
         self.validator.is_some()
+    }
+
+    /// The `If-Range` value for the stored strong validator, byte-identical to what the
+    /// server sent; `None` when there is none.
+    #[must_use]
+    pub fn if_range(&self) -> Option<String> {
+        self.validator.as_ref().map(|v| match v {
+            StrongValidator::Etag(tag) => format!("\"{}\"", tag.opaque()),
+            StrongValidator::LastModified(lm) => lm.clone(),
+        })
     }
 
     /// Compares a response's validators with the stored identity.

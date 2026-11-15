@@ -246,9 +246,27 @@ fn has_basic_auth<B>(req: &Request<B>) -> bool {
 
 /// Logs the request and produces its response.
 fn respond<B>(req: &Request<B>, conn: Conn, shared: &Shared) -> Response<FixtureBody> {
+    if req.uri().path() == LOG_EXPORT_PATH {
+        return export_log(shared);
+    }
     let pairs = flags::parse_query(req.uri().query().unwrap_or(""));
     log_request(req, conn, shared, &pairs);
     route(req, &pairs, shared).unwrap_or_else(Rejection::into_response)
+}
+
+/// Path of the request-log export (not itself logged).
+pub const LOG_EXPORT_PATH: &str = "/__log";
+
+/// `GET /__log`: the request log and the served byte total as JSON.
+fn export_log(shared: &Shared) -> Response<FixtureBody> {
+    let mut resp = Response::new(FixtureBody::from_bytes(bytes::Bytes::from(
+        shared.log.to_json(),
+    )));
+    resp.headers_mut().insert(
+        header::CONTENT_TYPE,
+        http::HeaderValue::from_static("application/json"),
+    );
+    resp
 }
 
 fn route<B>(
@@ -289,11 +307,14 @@ fn route<B>(
         );
         response::build(&flags, &resolved.target(is_head, seed, size))
     });
-    Ok(attach(resp, slot))
+    Ok(attach(resp, slot, shared))
 }
 
 /// Keeps `slot` held until the response body is finished or dropped.
-fn attach(resp: Response<FixtureBody>, slot: InFlight) -> Response<FixtureBody> {
+fn attach(resp: Response<FixtureBody>, slot: InFlight, shared: &Shared) -> Response<FixtureBody> {
     let (parts, body) = resp.into_parts();
-    Response::from_parts(parts, body.with_guard(slot))
+    let body = body
+        .with_guard(slot)
+        .with_served(shared.log.served_counter());
+    Response::from_parts(parts, body)
 }

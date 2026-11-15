@@ -1,9 +1,9 @@
 //! The agent's request handler (PHASE_0_1_PLAN S0.8).
 //!
 //! Served here: Handshake, Ping, GetAgentStatus, GetSnapshot, Subscribe, Unsubscribe,
-//! ListDownloads, ShutdownAgentSafely, and (S1.7) EnqueueUrl and GetDownload through an
-//! injected [`EngineControl`]. Without an engine they answer `not_implemented`, as do the
-//! control actions ([`control`]) and the limits actions ([`limits`]) until S1.9 and S1.13.
+//! ListDownloads, ShutdownAgentSafely, (S1.7) EnqueueUrl and GetDownload and (S1.9) Pause,
+//! Resume, Cancel, Retry and Remove through an injected [`EngineControl`]. Without an engine
+//! they answer `not_implemented`, as do the limits actions ([`limits`]) until S1.13.
 //!
 //! The IPC server does not cancel handlers (S0.7), so every call is bounded here by
 //! `ENGINE_REPLY_TIMEOUT` (5 s); a timeout maps to the retryable `busy` error (PCR-05).
@@ -103,11 +103,11 @@ impl AgentHandler {
             B::Unsubscribe(_) => query::unsubscribe(conn),
             B::EnqueueUrl(request) => enqueue::enqueue_url(self, conn, request).await,
             B::GetDownload(request) => query::get_download(self, request).await,
-            B::Pause(request) => control::pause(&request),
-            B::Resume(request) => control::resume(&request),
-            B::Cancel(request) => control::cancel(&request),
-            B::Retry(request) => control::retry(&request),
-            B::Remove(request) => control::remove(&request),
+            B::Pause(request) => control::pause(self, request).await,
+            B::Resume(request) => control::resume(self, request).await,
+            B::Cancel(request) => control::cancel(self, request).await,
+            B::Retry(request) => control::retry(self, request).await,
+            B::Remove(request) => control::remove(self, request).await,
             B::PauseAll(request) => limits::pause_all(&request),
             B::ResumeAll(request) => limits::resume_all(&request),
             B::UpdateLimits(request) => limits::update_limits(&request),
@@ -270,7 +270,10 @@ mod tests {
         .unwrap() else {
             unreachable!("not a handshake result");
         };
-        assert_eq!(result.capabilities, ["subscribe_replay", "checksum_sha256"]);
+        assert_eq!(
+            result.capabilities,
+            ["subscribe_replay", "checksum_sha256", "resume"]
+        );
         assert_eq!(result.agent_instance_id, handler.hub.instance_id());
         assert_eq!(result.agent_pid, std::process::id());
         assert_eq!((result.protocol_version, result.protocol_minor), (1, 0));

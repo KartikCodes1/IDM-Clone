@@ -21,6 +21,14 @@ pub struct Downloads {
     storage: Storage,
 }
 
+/// Whether `text` is 64 lowercase hex characters.
+fn is_lower_hex_sha256(text: &str) -> bool {
+    text.len() == 64
+        && text
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
 fn reject_unknown(state: DownloadState) -> Result<(), StorageError> {
     if state == DownloadState::Unknown {
         return Err(StorageError::InvalidValue { field: "state" });
@@ -59,6 +67,26 @@ impl Downloads {
     /// # Errors
     /// [`StorageError::Crypto`], [`StorageError::InvalidValue`] or a database error.
     pub async fn insert(&self, new: &NewDownload) -> Result<(), StorageError> {
+        self.insert_with_checksum(new, None).await
+    }
+
+    /// [`insert`](Self::insert) that also records the expected SHA-256 (64 lowercase hex
+    /// characters) in the `checksum_expected` column, in the same transaction, so the
+    /// expectation can never be lost or pruned.
+    ///
+    /// # Errors
+    /// [`StorageError::InvalidValue`] when `expected_sha256` is not 64 lowercase hex
+    /// characters, plus the errors of [`insert`](Self::insert).
+    pub async fn insert_with_checksum(
+        &self,
+        new: &NewDownload,
+        expected_sha256: Option<&str>,
+    ) -> Result<(), StorageError> {
+        if expected_sha256.is_some_and(|sha| !is_lower_hex_sha256(sha)) {
+            return Err(StorageError::InvalidValue {
+                field: "checksum_expected",
+            });
+        }
         if !(MIN_CONNECTIONS..=MAX_CONNECTIONS).contains(&new.max_connections) {
             return Err(StorageError::InvalidValue {
                 field: "max_connections",
@@ -70,8 +98,9 @@ impl Downloads {
         sqlx::query(
             "INSERT INTO downloads (id, state, source, priority, queue_position, \
              original_url_sealed, url_display, target_dir, requested_name, display_name, \
-             collision_policy, max_connections, created_at_ms, updated_at_ms) \
-             VALUES (?1, 'queued', ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?12)",
+             collision_policy, max_connections, created_at_ms, updated_at_ms, \
+             checksum_expected) \
+             VALUES (?1, 'queued', ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?12, ?13)",
         )
         .bind(&id)
         .bind(new.source.as_str())
@@ -85,8 +114,40 @@ impl Downloads {
         .bind(&new.collision_policy)
         .bind(i64::from(new.max_connections))
         .bind(new.created_at_ms)
+        .bind(expected_sha256)
         .execute(&mut *tx)
         .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Forget all progress and the remote identity in one transaction: the segments are
+    /// deleted, `bytes_committed` becomes 0, and the validators, total, staging path and
+    /// staging file id are cleared, so the next probe starts from nothing (restart from
+    /// zero). The state and the expected checksum are kept.
+    ///
+    /// # Errors
+    /// [`StorageError::NotFound`] or a database error. On error nothing changes.
+    pub async fn reset_for_restart(&self, id: Uuid, at_ms: i64) -> Result<(), StorageError> {
+        let text = id_text(id);
+        let mut tx = self.storage.begin_write().await?;
+        let changed = sqlx::query(
+            "UPDATE downloads SET bytes_committed = 0, total_size = NULL, etag = NULL, \
+             etag_strong = NULL, last_modified = NULL, last_modified_strong = NULL, \
+             part_path = NULL, part_file_id = NULL, updated_at_ms = ?2 WHERE id = ?1",
+        )
+        .bind(&text)
+        .bind(at_ms)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+        if changed != 1 {
+            return Err(StorageError::NotFound { id });
+        }
+        sqlx::query("DELETE FROM segments WHERE download_id = ?1")
+            .bind(&text)
+            .execute(&mut *tx)
+            .await?;
         tx.commit().await?;
         Ok(())
     }
@@ -194,11 +255,7 @@ impl Downloads {
         length_verified: bool,
         at_ms: i64,
     ) -> Result<(), StorageError> {
-        let is_sha256_hex = sha256_hex.len() == 64
-            && sha256_hex
-                .bytes()
-                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
-        if !is_sha256_hex {
+        if !is_lower_hex_sha256(sha256_hex) {
             return Err(StorageError::InvalidValue {
                 field: "checksum_actual",
             });

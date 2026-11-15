@@ -16,9 +16,8 @@ use forgedm_ipc::IpcError;
 use forgedm_platform::instance_lock::InstanceLock;
 use forgedm_platform::pipe::{PipeSecurity, create_pipe_instance};
 use forgedm_protocol::{
-    AgentState, DownloadIdRequest, Empty, ErrorCode, LimitScope, ListDownloadsRequest,
-    PauseAllRequest, PauseRequest, Priority, ProxySource, RemoveRequest, RequestBody, ResultBody,
-    RetryRequest, UpdateLimitsRequest, UpdatePriorityRequest,
+    AgentState, Empty, ErrorCode, LimitScope, ListDownloadsRequest, PauseAllRequest, Priority,
+    ProxySource, RequestBody, ResultBody, UpdateLimitsRequest, UpdatePriorityRequest,
 };
 use support::{AgentProc, WAIT, log_files};
 use tempfile::TempDir;
@@ -249,22 +248,9 @@ async fn unimplemented_actions_return_not_implemented() {
     let agent = AgentProc::start(dir.path(), &[]);
     let (mut client, _) = agent.connect().await;
     let id = Uuid::nil();
-    // EnqueueUrl and GetDownload are served since S1.7 (see tests/enqueue_e2e.rs).
+    // EnqueueUrl and GetDownload are served since S1.7 (tests/enqueue_e2e.rs) and the five
+    // control actions since S1.9 (tests/control_e2e.rs).
     let requests = vec![
-        RequestBody::Pause(PauseRequest {
-            download_id: id,
-            discard_progress: false,
-        }),
-        RequestBody::Resume(DownloadIdRequest { download_id: id }),
-        RequestBody::Cancel(DownloadIdRequest { download_id: id }),
-        RequestBody::Retry(RetryRequest {
-            download_id: id,
-            restart_from_zero: false,
-        }),
-        RequestBody::Remove(RemoveRequest {
-            download_id: id,
-            delete_partial_file: false,
-        }),
         RequestBody::PauseAll(PauseAllRequest {
             discard_progress: false,
         }),
@@ -323,9 +309,34 @@ fn bad_arguments_exit_2() {
     }
 }
 
+/// Today's date in UTC as `YYYY-MM-DD` (civil-from-days, no date crate needed).
+fn utc_date_today() -> String {
+    let days = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("after 1970")
+        .as_secs()
+        / 86_400;
+    let z = i64::try_from(days).expect("days fit") + 719_468;
+    let era = z.div_euclid(146_097);
+    let day_of_era = z.rem_euclid(146_097);
+    let year_of_era =
+        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let shifted_month = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * shifted_month + 2) / 5 + 1;
+    let month = if shifted_month < 10 {
+        shifted_month + 3
+    } else {
+        shifted_month - 9
+    };
+    let year = year_of_era + era * 400 + i64::from(month <= 2);
+    format!("{year:04}-{month:02}-{day:02}")
+}
+
 #[tokio::test]
 async fn logs_written_under_data_dir() {
     let dir = TempDir::new().unwrap();
+    let utc_before = utc_date_today();
     let mut agent = AgentProc::start(dir.path(), &[]);
     let (mut client, _) = agent.connect().await;
     client
@@ -333,8 +344,15 @@ async fn logs_written_under_data_dir() {
         .await
         .unwrap();
     assert_eq!(exit_code(agent.wait_exit(WAIT)), 0);
+    let utc_after = utc_date_today();
 
     let logs = log_files(dir.path());
+    let names: Vec<&str> = logs.iter().map(|(name, _)| name.as_str()).collect();
+    assert!(
+        names.contains(&format!("agent.log.{utc_before}").as_str())
+            || names.contains(&format!("agent.log.{utc_after}").as_str()),
+        "the log file name carries the UTC date ({utc_before}): {names:?}"
+    );
 
     assert!(!logs.is_empty(), "a log file exists under <data-dir>\\logs");
     assert!(
@@ -351,12 +369,25 @@ async fn logs_written_under_data_dir() {
 fn data_dir_with_reparse_point_exits_6() {
     let dir = TempDir::new().unwrap();
     let elsewhere = TempDir::new().unwrap();
-    if let Err(err) = std::os::windows::fs::symlink_dir(elsewhere.path(), dir.path().join("logs")) {
-        eprintln!(
-            "SKIPPED data_dir_with_reparse_point_exits_6: cannot create a symlink here: {err}"
-        );
-        return;
-    }
+    // A junction needs no privilege (a symlink would, and the test would then pass vacuously
+    // by skipping). If the junction cannot be made, the test FAILS rather than passing.
+    let link = dir.path().join("logs");
+    let made = std::process::Command::new("cmd")
+        .args(["/C", "mklink", "/J"])
+        .arg(&link)
+        .arg(elsewhere.path())
+        .output()
+        .expect("run cmd /C mklink");
+    assert!(
+        made.status.success(),
+        "mklink /J failed, so this test cannot check anything: {}{}",
+        String::from_utf8_lossy(&made.stdout),
+        String::from_utf8_lossy(&made.stderr)
+    );
+    assert!(
+        std::fs::symlink_metadata(&link).is_ok() && std::fs::read_dir(&link).is_ok(),
+        "the junction exists and resolves"
+    );
 
     let mut agent = AgentProc::start(dir.path(), &[]);
 

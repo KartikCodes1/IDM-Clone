@@ -9,13 +9,14 @@ use std::io;
 use std::time::Duration;
 
 use reqwest::header::{
-    ACCEPT, ACCEPT_ENCODING, CONTENT_ENCODING, HeaderMap, HeaderValue, LOCATION,
+    ACCEPT, ACCEPT_ENCODING, CONTENT_ENCODING, HeaderMap, HeaderValue, IF_RANGE, LOCATION, RANGE,
 };
-use reqwest::{Client, Response, redirect};
+use reqwest::{Client, Method, Response, redirect};
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
 use url::Url;
 
+use crate::http::content_range::RangeRequest;
 use crate::http::range_decision::ResponseMeta;
 use crate::http::redirect::{HopDecision, RedirectError, RedirectState, next_hop};
 use crate::retry::TransferErrorKind;
@@ -61,6 +62,50 @@ pub enum ClientError {
     /// The caller's token was cancelled.
     #[error("request cancelled")]
     Cancelled,
+}
+
+/// What to send: the method plus the optional `Range` and `If-Range`.
+#[derive(Debug, Clone)]
+pub struct FetchSpec {
+    /// `GET` or `HEAD`.
+    pub method: Method,
+    /// The window to ask for, as `Range: bytes=start-last`.
+    pub range: Option<RangeRequest>,
+    /// The `If-Range` validator, sent byte-identical.
+    pub if_range: Option<String>,
+}
+
+impl FetchSpec {
+    /// A plain GET.
+    #[must_use]
+    pub const fn get() -> Self {
+        Self {
+            method: Method::GET,
+            range: None,
+            if_range: None,
+        }
+    }
+
+    /// A HEAD. It has no body; callers bound it with their own deadline (the client has no
+    /// total timeout: a total deadline would kill long downloads).
+    #[must_use]
+    pub const fn head() -> Self {
+        Self {
+            method: Method::HEAD,
+            range: None,
+            if_range: None,
+        }
+    }
+
+    /// A GET of `range`, with `If-Range` when a strong validator is known.
+    #[must_use]
+    pub const fn ranged(range: RangeRequest, if_range: Option<String>) -> Self {
+        Self {
+            method: Method::GET,
+            range: Some(range),
+            if_range,
+        }
+    }
 }
 
 /// A response after redirects.
@@ -129,13 +174,27 @@ impl HttpClient {
         start: &Url,
         cancel: &CancellationToken,
     ) -> Result<Fetched, ClientError> {
+        self.fetch(start, &FetchSpec::get(), cancel).await
+    }
+
+    /// Sends `spec` to `start`, following redirects through the pure policy (the same
+    /// headers go to every hop) until a final response.
+    ///
+    /// # Errors
+    /// As [`get`](Self::get).
+    pub async fn fetch(
+        &self,
+        start: &Url,
+        spec: &FetchSpec,
+        cancel: &CancellationToken,
+    ) -> Result<Fetched, ClientError> {
         let mut state = RedirectState::new(start);
         loop {
             let url = state.current().clone();
             let response = tokio::select! {
                 biased;
                 () = cancel.cancelled() => return Err(ClientError::Cancelled),
-                sent = self.inner.get(url.clone()).send() => {
+                sent = self.request(url.clone(), spec).send() => {
                     sent.map_err(|e| ClientError::Transport(classify_reqwest(&e)))?
                 }
             };
@@ -156,6 +215,19 @@ impl HttpClient {
                 HopDecision::Reject(error) => return Err(error.into()),
             }
         }
+    }
+}
+
+impl HttpClient {
+    fn request(&self, url: Url, spec: &FetchSpec) -> reqwest::RequestBuilder {
+        let mut builder = self.inner.request(spec.method.clone(), url);
+        if let Some(value) = spec.range.and_then(|r| r.header_value()) {
+            builder = builder.header(RANGE, value);
+        }
+        if let Some(value) = &spec.if_range {
+            builder = builder.header(IF_RANGE, value);
+        }
+        builder
     }
 }
 

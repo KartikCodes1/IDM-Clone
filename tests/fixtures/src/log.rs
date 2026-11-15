@@ -1,6 +1,7 @@
 //! Request log shared between the server and tests, plus the concurrency counter.
 
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 /// The log keeps at most this many entries; the oldest are discarded first, so a long-running
@@ -46,6 +47,7 @@ struct Inner {
 #[derive(Debug, Clone, Default)]
 pub struct RequestLog {
     inner: Arc<Mutex<Inner>>,
+    served: Arc<AtomicU64>,
 }
 
 /// Holds one concurrency slot; the slot is released when this is dropped.
@@ -106,6 +108,47 @@ impl RequestLog {
         self.guard().entries.is_empty()
     }
 
+    /// The counter that body streams add the bytes they hand to the connection to.
+    #[must_use]
+    pub fn served_counter(&self) -> Arc<AtomicU64> {
+        Arc::clone(&self.served)
+    }
+
+    /// Body bytes handed to connections since the server started (never reset by
+    /// [`clear`](Self::clear)). Includes bytes the peer never read, so it is an upper bound
+    /// of what was received.
+    #[must_use]
+    pub fn served_bytes(&self) -> u64 {
+        self.served.load(Ordering::Acquire)
+    }
+
+    /// The log as one JSON object: `{"served_bytes": N, "requests": [...]}`. Only the method,
+    /// target, `Range` and `If-Range` of each request are included.
+    #[must_use]
+    pub fn to_json(&self) -> String {
+        let text = |value: Option<&str>| value.map_or_else(|| "null".to_owned(), json_text);
+        let rows: Vec<String> = self
+            .entries()
+            .iter()
+            .map(|e| {
+                format!(
+                    "{{\"seq\":{},\"method\":{},\"target\":{},\"range\":{},\"if_range\":{},\"conn_id\":{}}}",
+                    e.seq,
+                    json_text(&e.method),
+                    json_text(&e.target),
+                    text(e.range.as_deref()),
+                    text(e.if_range.as_deref()),
+                    e.conn_id
+                )
+            })
+            .collect();
+        format!(
+            "{{\"served_bytes\":{},\"requests\":[{}]}}",
+            self.served_bytes(),
+            rows.join(",")
+        )
+    }
+
     /// Discards all entries (the concurrency high-water mark is kept).
     pub fn clear(&self) {
         self.guard().entries.clear();
@@ -141,9 +184,42 @@ impl RequestLog {
     }
 }
 
+/// A JSON string literal for `text`.
+fn json_text(text: &str) -> String {
+    use std::fmt::Write;
+    let mut out = String::with_capacity(text.len() + 2);
+    out.push('"');
+    for c in text.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            c if u32::from(c) < 0x20 => {
+                let _ = write!(out, "\\u{:04x}", u32::from(c));
+            }
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::{LoggedRequest, MAX_LOG_ENTRIES, RequestLog};
+
+    #[test]
+    fn json_export_lists_requests_and_served_bytes() {
+        let log = RequestLog::default();
+        let mut e = entry();
+        e.range = Some("bytes=5-9".to_owned());
+        log.record(e);
+        log.served_counter()
+            .fetch_add(42, std::sync::atomic::Ordering::AcqRel);
+        let json = log.to_json();
+        assert!(json.starts_with("{\"served_bytes\":42,"), "{json}");
+        assert!(json.contains("\"range\":\"bytes=5-9\""), "{json}");
+        assert!(json.contains("\"if_range\":null"), "{json}");
+    }
 
     fn entry() -> LoggedRequest {
         LoggedRequest {

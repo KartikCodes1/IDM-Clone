@@ -61,6 +61,24 @@ impl std::fmt::Debug for NewJob {
     }
 }
 
+/// What a download had durably achieved when it was loaded: the remote identity learned by
+/// the probe and the bytes committed to disk. All defaults mean "nothing yet".
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct StoredProgress {
+    /// Complete length, when the probe learned it.
+    pub total: Option<u64>,
+    /// Bytes durably on disk and in the checkpoint.
+    pub committed: u64,
+    /// `ETag` as received.
+    pub etag: Option<String>,
+    /// Whether the `ETag` is strong.
+    pub etag_strong: Option<bool>,
+    /// `Last-Modified` as received.
+    pub last_modified: Option<String>,
+    /// Whether `Last-Modified` is strong.
+    pub last_modified_strong: Option<bool>,
+}
+
 /// A stored download as the task needs it, with the URL already unsealed.
 #[derive(Clone)]
 pub struct StoredJob {
@@ -88,6 +106,8 @@ pub struct StoredJob {
     pub part_file_id: Option<Vec<u8>>,
     /// Transfer mode, once known.
     pub transfer_mode: Option<TransferMode>,
+    /// Identity and committed bytes from earlier runs.
+    pub progress: StoredProgress,
 }
 
 impl std::fmt::Debug for StoredJob {
@@ -189,11 +209,14 @@ pub trait DownloadStore: Send + Sync + 'static {
     ) -> StoreFuture<'_, ()>;
     /// Persists the first response's facts and the staging file.
     fn save_probe(&self, id: Uuid, facts: ProbeFacts) -> StoreFuture<'_, ()>;
-    /// Persists committed progress: one segment `[0, total)` (or open-ended) with
-    /// `committed` bytes durable on disk.
+    /// Persists committed progress in one commit: one segment `[0, total)` (or open-ended)
+    /// with `committed` bytes durable on disk. Callers flush the file to disk first.
     fn checkpoint(&self, id: Uuid, committed: u64, total: Option<u64>) -> StoreFuture<'_, ()>;
-    /// Forgets all progress (restart from zero).
+    /// Forgets all progress and the remote identity (validators, total, staging file) in one
+    /// transaction: restart from zero.
     fn reset_progress(&self, id: Uuid) -> StoreFuture<'_, ()>;
+    /// Deletes the download (its segments and events go with it).
+    fn remove(&self, id: Uuid) -> StoreFuture<'_, ()>;
     /// Persists the rename candidate about to be tried (durable before the attempt).
     fn set_finalize_target(&self, id: Uuid, target: &Path) -> StoreFuture<'_, ()>;
     /// Moves `finalizing` to `completed` and records the result.
@@ -260,6 +283,11 @@ pub enum EngineEvent {
         id: Uuid,
         /// Why.
         error: DownloadError,
+    },
+    /// The download was deleted (after the delete committed).
+    Removed {
+        /// Download id.
+        id: Uuid,
     },
 }
 

@@ -1,10 +1,9 @@
-//! The single-stream transfer (PLAN S1.7): one plain GET, no `Range`, body streamed through
-//! the writer thread into a staged `.part` file.
+//! The single-stream transfer (PLAN S1.7, S1.9): one response body streamed through the writer
+//! thread into a staged `.part` file, from byte 0 (a plain GET) or from a resume offset (a
+//! validated 206).
 //!
-//! Nothing is written before the response passes [`plan_response`]. Resume, ranges and
-//! segments are out of scope here: every download this module handles is
-//! `single_nonresumable`, `single_unknown_length` or `zero_length`, and an interrupted one
-//! restarts from zero.
+//! Nothing is written before the response passes [`plan_response`] (plain GET) or
+//! `http::range_decision::decide` (ranged request). Segments are out of scope here.
 
 use std::fs::File;
 use std::path::{Path, PathBuf};
@@ -19,6 +18,7 @@ use reqwest::Response;
 use url::Url;
 use uuid::Uuid;
 
+use crate::checkpoint::flush_then_commit;
 use crate::client::classify_reqwest;
 use crate::engine::{LiveDownload, StopSignal};
 use crate::error::{Failure, TaskStop, failure_from_transfer, stop_from_class, stop_from_platform};
@@ -145,7 +145,7 @@ pub struct PartFile {
     pub file: File,
     /// Its path.
     pub path: PathBuf,
-    /// Its file id, when the file system supports one.
+    /// Its file id; always `Some` for a file [`create_part`] returns.
     pub file_id: Option<Vec<u8>>,
 }
 
@@ -198,14 +198,19 @@ fn verify_placement(file: File, path: PathBuf, dir: &Path) -> Result<PartFile, T
         }
         return Err(stop_from_platform(&err));
     }
-    let file_id = file_id(&file)
-        .map(|id| encode_file_id(&id))
-        .map_err(|err| tracing::warn!(error = %err, "file id unavailable for the staging file"))
-        .ok();
+    // Without a recorded file id the file could never be proven ours again (resume and safe
+    // cleanup both depend on it), so a file whose id cannot be read is not kept.
+    let Ok(id) = file_id(&file).map(|id| encode_file_id(&id)) else {
+        tracing::error!("file id unavailable for the staging file; refusing to keep it");
+        if let Err(err) = delete_by_handle(&file) {
+            tracing::warn!(error = %err, "could not delete a staging file without an id");
+        }
+        return Err(Failure::new(DownloadErrorCode::DiskIo).into());
+    };
     Ok(PartFile {
         file,
         path,
-        file_id,
+        file_id: Some(id),
     })
 }
 
@@ -246,8 +251,11 @@ pub struct Stream<'a> {
     pub stop: &'a StopSignal,
     /// Directory of the staging file (for the free-space re-check).
     pub dir: &'a Path,
-    /// Declared total, when known.
-    pub total: Option<u64>,
+    /// Absolute offset of the first body byte (0 for a plain GET, the resume offset for a 206).
+    pub start: u64,
+    /// Absolute offset at which the body must end (the declared total for a plain GET, the
+    /// end of the accepted range for a 206), when known.
+    pub limit: Option<u64>,
 }
 
 /// Periodic work the stream loop asks its caller to do.
@@ -257,8 +265,9 @@ pub trait Checkpointer: Send + Sync {
 }
 
 /// Streams `response` into `writer`: accepted bytes are counted as they arrive, a flush and
-/// checkpoint run every [`CHECKPOINT_INTERVAL`], and the loop stops promptly on a stop
-/// request. Returns the number of bytes received.
+/// checkpoint (see [`flush_then_commit`]) run every [`CHECKPOINT_INTERVAL`], and the loop
+/// stops promptly on a stop request. Returns the absolute offset reached (`start` plus the
+/// bytes received).
 ///
 /// # Errors
 /// A network failure classified through the retry rules, a writer failure, a pause for a
@@ -270,9 +279,9 @@ pub async fn stream_body(
     env: &Stream<'_>,
     checkpointer: &dyn Checkpointer,
 ) -> Result<u64, TaskStop> {
-    let mut offset = 0u64;
+    let mut offset = env.start;
     let mut last_checkpoint = Instant::now();
-    let mut next_space_check = FREE_SPACE_RECHECK;
+    let mut next_space_check = env.start.saturating_add(FREE_SPACE_RECHECK);
     loop {
         let chunk = tokio::select! {
             biased;
@@ -290,18 +299,16 @@ pub async fn stream_body(
             .map_err(|e| writer_stop(&e))?;
         offset += bytes.len() as u64;
         env.live.set_accepted(offset);
-        if env.total.is_some_and(|t| offset > t) {
+        if env.limit.is_some_and(|t| offset > t) {
             return Err(Failure::new(DownloadErrorCode::SizeMismatch).into());
         }
         if offset >= next_space_check {
             next_space_check = next_space_check.saturating_add(FREE_SPACE_RECHECK);
-            let remaining = env.total.map_or(0, |t| t.saturating_sub(offset));
+            let remaining = env.limit.map_or(0, |t| t.saturating_sub(offset));
             ensure_free_space(env.dir, remaining)?;
         }
         if last_checkpoint.elapsed() >= CHECKPOINT_INTERVAL {
-            let frontier = writer.flush().await.map_err(|e| writer_stop(&e))?;
-            env.live.set_committed(frontier);
-            checkpointer.checkpoint(frontier).await?;
+            flush_then_commit(writer, checkpointer, env.live).await?;
             last_checkpoint = Instant::now();
         }
     }
@@ -369,6 +376,17 @@ mod tests {
             plan_response(&meta(503)),
             Err(TaskStop::Fail(Failure::http_status(503)))
         );
+    }
+
+    #[test]
+    fn a_staging_file_always_carries_its_file_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let canonical = std::fs::canonicalize(dir.path()).unwrap();
+
+        let part = create_part(&canonical, "id.bin", Uuid::now_v7()).unwrap();
+
+        let id = part.file_id.expect("a recorded file id");
+        assert_eq!(id.len(), 24, "volume serial plus 128-bit id");
     }
 
     #[test]

@@ -1,12 +1,11 @@
 //! The core `DownloadStore` port over `forgedm-storage` (ARCHITECTURE 4.1).
 //!
-//! Two facts have no column writer in the storage crate yet, so they travel in
-//! `download_events` rows and are read back from there:
-//! - the expected SHA-256, as `detail_json = {"expected_sha256": ...}` of the `enqueued`
-//!   event (recorded in the same call as the insert; a failure removes the row again, so a
-//!   download never exists without its checksum);
-//! - the last failure, as the serialised `DownloadError` in the `detail_json` of the
-//!   `failed`, `needs_credentials` and `paused` events.
+//! The expected SHA-256 lives in the `downloads.checksum_expected` column, written in the same
+//! transaction as the insert, so the 200-event retention can never prune it. (S1.7 kept it in
+//! the `enqueued` event; rows written that way are still read, as a fallback.)
+//!
+//! The last failure travels as the serialised `DownloadError` in the `detail_json` of the
+//! `failed`, `needs_credentials` and `paused` events and is read back from there.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -14,7 +13,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use forgedm_core::error::StoreError;
 use forgedm_core::ports::{
-    DownloadStore, NewJob, ProbeFacts, StoreEvent, StoreFuture, StoredJob, unix_ms,
+    DownloadStore, NewJob, ProbeFacts, StoreEvent, StoreFuture, StoredJob, StoredProgress, unix_ms,
 };
 use forgedm_core::url_policy::{SecretUrl, validate_user_url};
 use forgedm_protocol::{DownloadError, DownloadState};
@@ -58,7 +57,8 @@ fn path_text(path: &Path) -> String {
     path.to_string_lossy().into_owned()
 }
 
-/// The expected checksum recorded with the `enqueued` event.
+/// The expected checksum recorded with the `enqueued` event (the S1.7 location; only read
+/// as a fallback for rows that predate the column).
 #[must_use]
 pub fn expected_sha_from_events(events: &[EventRecord]) -> Option<String> {
     events
@@ -74,19 +74,24 @@ pub fn expected_sha_from_events(events: &[EventRecord]) -> Option<String> {
         })
 }
 
-/// The expected checksum, failing closed: a missing `enqueued` event or an unreadable
-/// detail is an error, never "no checksum requested".
+/// The expected checksum of a stored download: the column when set, else (rows written
+/// before the column was used) the `enqueued` event, failing closed on an unreadable detail.
 ///
 /// # Errors
-/// [`StoreError::Unavailable`] when the checksum expectation cannot be established.
-pub fn require_expected_sha(events: &[EventRecord]) -> Result<Option<String>, StoreError> {
-    let Some(event) = events.iter().find(|e| e.kind == ENQUEUED_EVENT) else {
-        tracing::error!("the enqueued event is missing; refusing to drop the checksum check");
-        return Err(StoreError::Unavailable(
-            "the checksum expectation is not recorded".to_owned(),
-        ));
-    };
-    let Some(json) = event.detail_json.as_deref() else {
+/// [`StoreError::Unavailable`] when the column is empty and the legacy event detail exists
+/// but cannot be read.
+pub fn expected_sha_of(
+    column: Option<&str>,
+    events: &[EventRecord],
+) -> Result<Option<String>, StoreError> {
+    if let Some(sha) = column {
+        return Ok(Some(sha.to_owned()));
+    }
+    let Some(json) = events
+        .iter()
+        .find(|e| e.kind == ENQUEUED_EVENT)
+        .and_then(|e| e.detail_json.as_deref())
+    else {
         return Ok(None);
     };
     let value: serde_json::Value = serde_json::from_str(json).map_err(|_| {
@@ -147,7 +152,19 @@ impl StorageStore {
             .map_err(map_error)?;
         let url: SecretUrl =
             validate_user_url(sealed.expose()).map_err(|_| StoreError::SecretsUnavailable)?;
-        let expected_sha256 = require_expected_sha(&self.events_of(id).await?)?;
+        // The column is authoritative; the event log is only consulted for legacy rows.
+        let expected_sha256 = match record.checksum_expected.as_deref() {
+            Some(sha) => Some(sha.to_owned()),
+            None => expected_sha_of(None, &self.events_of(id).await?)?,
+        };
+        let progress = StoredProgress {
+            total: record.total_size,
+            committed: record.bytes_committed,
+            etag: record.etag.clone(),
+            etag_strong: record.etag_strong,
+            last_modified: record.last_modified.clone(),
+            last_modified_strong: record.last_modified_strong,
+        };
         Ok(StoredJob {
             id,
             state: record.state,
@@ -161,6 +178,7 @@ impl StorageStore {
             part_path: record.part_path.map(PathBuf::from),
             part_file_id: record.part_file_id,
             transfer_mode: record.transfer_mode,
+            progress,
         })
     }
 
@@ -181,20 +199,13 @@ impl StorageStore {
         };
         self.storage
             .downloads()
-            .insert(&row)
+            .insert_with_checksum(&row, new.expected_sha256.as_deref())
             .await
             .map_err(map_error)?;
-        let mut event = NewEvent::new(new.created_at_ms, ENQUEUED_EVENT);
-        event.detail_json = new
-            .expected_sha256
-            .as_ref()
-            .map(|sha| serde_json::json!({ "expected_sha256": sha }).to_string());
+        // History only: the checksum itself is already in its column.
+        let event = NewEvent::new(new.created_at_ms, ENQUEUED_EVENT);
         if let Err(err) = self.storage.events().append(new.id, &event).await {
-            // Never leave a download whose checksum expectation was lost.
-            if let Err(cleanup) = self.storage.downloads().delete(new.id).await {
-                tracing::error!(error = %cleanup, "could not remove a half-created download");
-            }
-            return Err(map_error(err));
+            tracing::warn!(error = %err, "could not record the enqueued event");
         }
         Ok(())
     }
@@ -321,10 +332,38 @@ impl DownloadStore for StorageStore {
     fn reset_progress(&self, id: Uuid) -> StoreFuture<'_, ()> {
         Box::pin(async move {
             self.storage
-                .segments()
-                .reset(id, unix_ms())
+                .downloads()
+                .reset_for_restart(id, unix_ms())
                 .await
                 .map_err(map_error)
+        })
+    }
+
+    fn remove(&self, id: Uuid) -> StoreFuture<'_, ()> {
+        Box::pin(async move {
+            let existed = self
+                .storage
+                .downloads()
+                .delete(id)
+                .await
+                .map_err(map_error)?;
+            if !existed {
+                return Err(StoreError::NotFound);
+            }
+            // Saturating: the counter only gates the queue cap.
+            let mut current = self.count.load(Ordering::Acquire);
+            while current > 0 {
+                match self.count.compare_exchange_weak(
+                    current,
+                    current - 1,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                ) {
+                    Ok(_) => break,
+                    Err(actual) => current = actual,
+                }
+            }
+            Ok(())
         })
     }
 
@@ -399,20 +438,24 @@ mod tests {
     }
 
     #[test]
-    fn the_checksum_expectation_fails_closed() {
-        let sha = "b".repeat(64);
-        let detail = format!(r#"{{"expected_sha256":"{sha}"}}"#);
+    fn the_column_wins_and_the_event_is_only_a_legacy_fallback() {
+        let column = "b".repeat(64);
+        let legacy = "c".repeat(64);
+        let detail = format!(r#"{{"expected_sha256":"{legacy}"}}"#);
+        let events = [event(ENQUEUED_EVENT, Some(&detail))];
+
         assert_eq!(
-            require_expected_sha(&[event(ENQUEUED_EVENT, Some(&detail))]).unwrap(),
-            Some(sha)
+            expected_sha_of(Some(&column), &events).unwrap(),
+            Some(column),
+            "the column is authoritative"
         );
+        assert_eq!(expected_sha_of(None, &events).unwrap(), Some(legacy));
         assert_eq!(
-            require_expected_sha(&[event(ENQUEUED_EVENT, None)]).unwrap(),
-            None
+            expected_sha_of(None, &[]).unwrap(),
+            None,
+            "pruned: no event, no checksum"
         );
-        assert!(require_expected_sha(&[]).is_err());
-        assert!(require_expected_sha(&[event("state", None)]).is_err());
-        assert!(require_expected_sha(&[event(ENQUEUED_EVENT, Some("not json"))]).is_err());
+        assert!(expected_sha_of(None, &[event(ENQUEUED_EVENT, Some("not json"))]).is_err());
     }
 
     #[test]

@@ -506,3 +506,111 @@ async fn complete_set_finalize_target_and_delete() {
     );
     assert!(db.storage.downloads().get(id).await.unwrap().is_none());
 }
+
+#[tokio::test]
+async fn expected_checksum_is_a_column_that_survives_event_pruning() {
+    let db = open_temp().await;
+    let id = new_id();
+    let sha = "ab".repeat(32);
+    db.storage
+        .downloads()
+        .insert_with_checksum(&new_download(id, URL), Some(&sha))
+        .await
+        .unwrap();
+    for n in 0..300 {
+        db.storage
+            .events()
+            .append(id, &NewEvent::new(n, "noise"))
+            .await
+            .unwrap();
+    }
+
+    // A checkpoint prunes the event log to its retention limit.
+    let segment = forgedm_storage::SegmentRecord {
+        seg_no: 0,
+        start: 0,
+        end: None,
+        committed: 10,
+        retry_count: 0,
+        updated_at_ms: 1,
+    };
+    db.storage
+        .segments()
+        .save_checkpoint(id, 10, &[segment])
+        .await
+        .unwrap();
+
+    let events = db.storage.events().list(id, 500).await.unwrap();
+    assert!(events.len() <= 200, "events were pruned: {}", events.len());
+    let record = db.storage.downloads().get(id).await.unwrap().unwrap();
+    assert_eq!(record.checksum_expected.as_deref(), Some(sha.as_str()));
+}
+
+#[tokio::test]
+async fn a_malformed_expected_checksum_inserts_nothing() {
+    let db = open_temp().await;
+    let id = new_id();
+
+    for bad in ["abc", &"AB".repeat(32), &"zz".repeat(32)] {
+        let result = db
+            .storage
+            .downloads()
+            .insert_with_checksum(&new_download(id, URL), Some(bad))
+            .await;
+        assert!(
+            matches!(result, Err(StorageError::InvalidValue { .. })),
+            "{bad}"
+        );
+    }
+    assert!(db.storage.downloads().get(id).await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn reset_for_restart_clears_progress_and_identity_but_keeps_state_and_checksum() {
+    let db = open_temp().await;
+    let id = new_id();
+    let sha = "cd".repeat(32);
+    let downloads = db.storage.downloads();
+    downloads
+        .insert_with_checksum(&new_download(id, URL), Some(&sha))
+        .await
+        .unwrap();
+    let probe = ProbeResult {
+        transfer_mode: Some(TransferMode::SingleRanged),
+        total_size: Some(100),
+        part_path: Some(r"C:\d\a.part".to_owned()),
+        part_file_id: Some(vec![1, 2, 3]),
+        etag: Some("\"v1\"".to_owned()),
+        etag_strong: Some(true),
+        ..ProbeResult::default()
+    };
+    downloads.save_probe(id, &probe, 5).await.unwrap();
+    let segment = forgedm_storage::SegmentRecord {
+        seg_no: 0,
+        start: 0,
+        end: Some(100),
+        committed: 40,
+        retry_count: 0,
+        updated_at_ms: 6,
+    };
+    db.storage
+        .segments()
+        .save_checkpoint(id, 40, &[segment])
+        .await
+        .unwrap();
+
+    downloads.reset_for_restart(id, 9).await.unwrap();
+
+    let record = downloads.get(id).await.unwrap().unwrap();
+    assert_eq!(record.bytes_committed, 0);
+    assert_eq!(record.total_size, None);
+    assert_eq!(record.etag, None);
+    assert_eq!(record.etag_strong, None);
+    assert_eq!(record.part_path, None);
+    assert_eq!(record.part_file_id, None);
+    assert_eq!(record.state, DownloadState::Queued);
+    assert_eq!(record.checksum_expected.as_deref(), Some(sha.as_str()));
+    assert!(db.storage.segments().load(id).await.unwrap().is_empty());
+    let missing = downloads.reset_for_restart(new_id(), 9).await;
+    assert!(matches!(missing, Err(StorageError::NotFound { .. })));
+}

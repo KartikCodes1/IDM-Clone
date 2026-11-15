@@ -10,13 +10,14 @@ use std::sync::{Arc, OnceLock};
 
 use forgedm_core::client::{HttpClient, ProxyMode as CoreProxyMode};
 use forgedm_core::clock::BoxFuture;
-use forgedm_core::engine::{self, EngineConfig, EngineDeps, EngineHandle};
+use forgedm_core::engine::{self, Control, EngineConfig, EngineDeps, EngineHandle};
 use forgedm_core::ports::{EngineEvent, EngineEventSink, NewJob, ProgressSample, unix_ms};
 use forgedm_core::url_policy::SecretUrl;
 use forgedm_platform::motw::MotwService;
 use forgedm_protocol::{
-    ClientKind, DownloadCompletedData, DownloadDetail, DownloadFailedData, DownloadSummary,
-    EnqueueUrlResult, EventBody, Priority, ProgressItem, ProgressSnapshotData,
+    ClientKind, DownloadCompletedData, DownloadDetail, DownloadFailedData, DownloadRemovedData,
+    DownloadState, DownloadSummary, EnqueueUrlResult, EventBody, Priority, ProgressItem,
+    ProgressSnapshotData,
 };
 use forgedm_storage::Storage;
 use uuid::Uuid;
@@ -52,6 +53,18 @@ pub trait EngineControl: Send + Sync + 'static {
     fn enqueue(&self, spec: EnqueueSpec) -> BoxFuture<'_, Result<EnqueueUrlResult, AgentError>>;
     /// The full view of a download.
     fn detail(&self, id: Uuid) -> BoxFuture<'_, Result<DownloadDetail, AgentError>>;
+    /// Pause, resume, cancel or retry; returns the resulting state.
+    fn control(
+        &self,
+        _id: Uuid,
+        _control: Control,
+    ) -> BoxFuture<'_, Result<DownloadState, AgentError>> {
+        Box::pin(async { Err(AgentError::NotImplemented) })
+    }
+    /// Removes a download (and, on request, its recorded `.part`).
+    fn remove(&self, _id: Uuid, _delete_partial: bool) -> BoxFuture<'_, Result<(), AgentError>> {
+        Box::pin(async { Err(AgentError::NotImplemented) })
+    }
 }
 
 /// Why the engine could not start.
@@ -151,6 +164,10 @@ impl EngineEventSink for HubSink {
                     self.publish(EventBody::DownloadFailed(DownloadFailedData { id, error }))
                         .await;
                 }
+                EngineEvent::Removed { id } => {
+                    self.publish(EventBody::DownloadRemoved(DownloadRemovedData { id }))
+                        .await;
+                }
             }
         })
     }
@@ -216,7 +233,8 @@ impl EngineHost {
         Ok(Self { engine, storage })
     }
 
-    /// Resumes stored work (queued downloads; interrupted ones restart from zero).
+    /// Resumes stored work: queued downloads run, interrupted ones auto-resume from their
+    /// committed bytes when they can, and restart from zero when they cannot.
     pub async fn recover(&self) {
         match self.engine.recover().await {
             Ok(count) => tracing::info!(count, "resumed stored downloads"),
@@ -263,6 +281,18 @@ impl EngineControl for EngineHost {
             let live = self.engine.live(id);
             build_detail(&self.storage, id, live.as_ref()).await
         })
+    }
+
+    fn control(
+        &self,
+        id: Uuid,
+        control: Control,
+    ) -> BoxFuture<'_, Result<DownloadState, AgentError>> {
+        Box::pin(async move { Ok(self.engine.control(id, control).await?) })
+    }
+
+    fn remove(&self, id: Uuid, delete_partial: bool) -> BoxFuture<'_, Result<(), AgentError>> {
+        Box::pin(async move { Ok(self.engine.remove(id, delete_partial).await?) })
     }
 }
 

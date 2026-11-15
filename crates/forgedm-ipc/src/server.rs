@@ -204,8 +204,27 @@ impl Server {
         handler: Arc<dyn RequestHandler>,
         options: ServerOptions,
     ) -> Result<Self, IpcError> {
+        Self::bind_expecting(name, handler, options, Sid::current_user()?)
+    }
+
+    /// [`bind`](Self::bind) that admits only callers running as `expected_sid` instead of the
+    /// current user.
+    ///
+    /// This is the documented test seam for IPC-03 (server-side caller rejection): production
+    /// code always uses [`bind`](Self::bind), whose expected SID is the current user. A test
+    /// binds with a SID the test process does not run as and checks that the connection is
+    /// closed before any frame is read. The pipe's DACL still admits only the current user.
+    ///
+    /// # Errors
+    /// As [`bind`](Self::bind).
+    #[doc(hidden)]
+    pub fn bind_expecting(
+        name: &str,
+        handler: Arc<dyn RequestHandler>,
+        options: ServerOptions,
+        expected_sid: Sid,
+    ) -> Result<Self, IpcError> {
         let security = PipeSecurity::for_current_user()?;
-        let expected_sid = Sid::current_user()?;
         let listener = match create_pipe_instance(name, true, &security) {
             Ok(listener) => listener,
             Err(PipeError::NameInUse) => {

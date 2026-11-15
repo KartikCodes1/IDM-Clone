@@ -18,6 +18,7 @@ use tokio_util::task::TaskTracker;
 use uuid::Uuid;
 
 mod cleanup;
+mod control;
 mod live;
 mod task;
 
@@ -25,9 +26,10 @@ pub use cleanup::{Cleanup, delete_stale_part};
 pub use live::{LiveDownload, Registry, StopReason, StopSignal};
 
 use crate::client::HttpClient;
-use crate::error::{EngineError, StoreError};
+use crate::error::EngineError;
 use crate::ports::{
     DownloadStore, EngineEvent, EngineEventSink, NewJob, ProgressSample, StoreEvent, StoredJob,
+    StoredProgress,
 };
 use crate::progress::TICK;
 use crate::state::{Command, transition};
@@ -43,8 +45,27 @@ pub const DEFAULT_MAX_ACTIVE: usize = 3;
 pub const QUEUE_MAX: usize = 10_000;
 /// How long shutdown waits for running downloads to settle (ARCHITECTURE 2.6).
 pub const SHUTDOWN_WAIT: Duration = Duration::from_secs(15);
-/// `state_reason` of a download restarted from zero after an interruption.
+/// `state_reason` of a download restarted from zero instead of resumed.
 pub const REASON_RESTART_FROM_ZERO: &str = "restart_from_zero";
+
+/// A user command on one download (PLAN A.6 command semantics).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Control {
+    /// Pause. An active non-resumable download needs `discard_progress`.
+    Pause {
+        /// Accept losing the progress of a download that cannot resume.
+        discard_progress: bool,
+    },
+    /// Resume a paused or interrupted download (retry now from `retry_waiting`).
+    Resume,
+    /// Cancel; the `.part` is kept.
+    Cancel,
+    /// Retry a failed or cancelled download.
+    Retry {
+        /// Forget progress and validators and start over.
+        restart_from_zero: bool,
+    },
+}
 
 /// Engine tunables.
 #[derive(Debug, Clone, Copy)]
@@ -98,6 +119,16 @@ enum Cmd {
     Recover {
         reply: oneshot::Sender<Result<usize, EngineError>>,
     },
+    Control {
+        id: Uuid,
+        control: Control,
+        reply: oneshot::Sender<Result<DownloadState, EngineError>>,
+    },
+    Remove {
+        id: Uuid,
+        delete_partial: bool,
+        reply: oneshot::Sender<Result<(), EngineError>>,
+    },
     Shutdown {
         reply: oneshot::Sender<()>,
     },
@@ -145,8 +176,41 @@ impl EngineHandle {
         self.call(Cmd::Recover { reply }, answer).await?
     }
 
+    /// Applies a user command and returns the resulting state. Commands are serialized by
+    /// the engine and every state change is a compare-and-set, so a repeated or racing
+    /// command is a no-op that reports the unchanged state. Pause and cancel of a running
+    /// download wait (a few seconds at most) for it to settle and report the settled state.
+    ///
+    /// # Errors
+    /// [`EngineError::NotFound`], [`EngineError::InvalidState`] when A.6 has no such edge,
+    /// [`EngineError::NotResumable`] for a pause of a non-resumable download without
+    /// `discard_progress`, plus the errors of [`enqueue`](Self::enqueue).
+    pub async fn control(&self, id: Uuid, control: Control) -> Result<DownloadState, EngineError> {
+        let (reply, answer) = oneshot::channel();
+        self.call(Cmd::Control { id, control, reply }, answer)
+            .await?
+    }
+
+    /// Cancels a running download if needed, then deletes it. With `delete_partial_file`
+    /// the recorded `.part` goes too, but only when it is provably the file we created.
+    /// Completed files are never deleted.
+    ///
+    /// # Errors
+    /// [`EngineError::NotFound`] (a repeated remove), [`EngineError::Busy`] when the
+    /// download does not settle in time, plus the errors of [`enqueue`](Self::enqueue).
+    pub async fn remove(&self, id: Uuid, delete_partial_file: bool) -> Result<(), EngineError> {
+        let (reply, answer) = oneshot::channel();
+        let cmd = Cmd::Remove {
+            id,
+            delete_partial: delete_partial_file,
+            reply,
+        };
+        self.call(cmd, answer).await?
+    }
+
     /// Asks a running download to stop and become `cancelled` (the `.part` is kept).
-    /// Returns whether `id` was running. The user-facing `Cancel` action is S1.9.
+    /// Returns whether `id` was running. [`control`](Self::control) is the checked,
+    /// serialized form.
     #[must_use]
     pub fn cancel(&self, id: Uuid) -> bool {
         self.registry.get(id).is_some_and(|live| {
@@ -281,6 +345,18 @@ impl Actor {
                 let _ = reply.send(self.recover().await);
                 false
             }
+            Cmd::Control { id, control, reply } => {
+                let _ = reply.send(self.control(id, control).await);
+                false
+            }
+            Cmd::Remove {
+                id,
+                delete_partial,
+                reply,
+            } => {
+                let _ = reply.send(self.remove(id, delete_partial).await);
+                false
+            }
             Cmd::Shutdown { reply } => {
                 self.shutdown().await;
                 let _ = reply.send(());
@@ -309,6 +385,7 @@ impl Actor {
             part_path: None,
             part_file_id: None,
             transfer_mode: None,
+            progress: StoredProgress::default(),
         };
         let enqueued = Enqueued {
             id: new.id,
@@ -325,6 +402,9 @@ impl Actor {
         Ok(enqueued)
     }
 
+    /// Requeues the work a previous agent left: `queued` downloads are admitted and
+    /// `interrupted` ones auto-resume (each task decides whether it can continue from its
+    /// committed bytes or must restart from zero).
     async fn recover(&mut self) -> Result<usize, EngineError> {
         let work = self.deps.store.startup_work().await?;
         let mut queued = 0;
@@ -332,7 +412,7 @@ impl Actor {
             match job.state {
                 DownloadState::Queued => self.queue.push_back(job),
                 DownloadState::Interrupted => {
-                    if let Some(requeued) = self.restart_from_zero(job).await {
+                    if let Some(requeued) = self.auto_resume(job).await {
                         self.queue.push_back(requeued);
                     } else {
                         continue;
@@ -346,37 +426,21 @@ impl Actor {
         Ok(queued)
     }
 
-    /// Resets an interrupted download and queues it again, saying so (ARCHITECTURE 6.3).
-    /// Everything S1.7 downloads is non-resumable, so nothing is kept.
-    async fn restart_from_zero(&self, mut job: StoredJob) -> Option<StoredJob> {
-        let store = &self.deps.store;
-        let probe = job.clone();
-        if let Err(err) = tokio::task::spawn_blocking(move || delete_stale_part(&probe)).await {
-            tracing::warn!(error = %err, "stale staging file cleanup did not run");
-        }
+    /// `interrupted -> queued`, recorded and announced.
+    async fn auto_resume(&self, mut job: StoredJob) -> Option<StoredJob> {
         let step = transition(job.state, Command::AutoResume).ok()?;
-        let event = StoreEvent::now("restart_from_zero").with_code("interrupted");
-        let outcome: Result<(), StoreError> = async {
-            store.reset_progress(job.id).await?;
-            store
-                .transition(
-                    job.id,
-                    job.state,
-                    step.to,
-                    Some(REASON_RESTART_FROM_ZERO.to_owned()),
-                    event,
-                )
-                .await
-        }
-        .await;
-        if let Err(err) = outcome {
+        let event = StoreEvent::now("auto_resume").with_code("interrupted");
+        let moved = self
+            .deps
+            .store
+            .transition(job.id, job.state, step.to, None, event)
+            .await;
+        if let Err(err) = moved {
             tracing::error!(error = %err, "could not requeue an interrupted download");
             return None;
         }
         job.state = step.to;
-        job.state_reason = Some(REASON_RESTART_FROM_ZERO.to_owned());
-        job.part_path = None;
-        job.part_file_id = None;
+        job.state_reason = None;
         self.deps
             .sink
             .emit(EngineEvent::Changed { id: job.id })
@@ -404,13 +468,14 @@ impl Actor {
             sink: Arc::clone(&self.deps.sink),
             client: self.deps.client.clone(),
             motw: Arc::clone(&self.deps.motw),
-            live,
+            live: Arc::clone(&live),
         };
         let supervisor = Supervisor {
             store: Arc::clone(&self.deps.store),
             sink: Arc::clone(&self.deps.sink),
             registry: Arc::clone(&self.registry),
             finished: self.finished_tx.clone(),
+            live: Arc::clone(&live),
         };
         let inner = tokio::spawn(DownloadTask::new(job, ctx).run());
         self.tracker.spawn(supervisor.watch(id, inner));
@@ -427,50 +492,95 @@ impl Actor {
     }
 }
 
-/// Watches one task: a panic surfaces as `failed(internal)` and the agent keeps running
-/// (ARCHITECTURE 4.13).
+/// Watches one task. Whatever way the task ends, the stored state is not left active: a
+/// panic surfaces as `failed(internal)` (or `interrupted` from `pausing`), and a task that
+/// ended without settling is moved to `interrupted`; the agent keeps running
+/// (ARCHITECTURE 4.13, SFH-15 and SFH-16).
 struct Supervisor {
     store: Arc<dyn DownloadStore>,
     sink: Arc<dyn EngineEventSink>,
     registry: Arc<Registry>,
     finished: mpsc::UnboundedSender<Uuid>,
+    live: Arc<LiveDownload>,
 }
+
+/// Attempts to move a leftover active download off its state.
+const LEFTOVER_ATTEMPTS: u32 = 3;
+/// Pause between those attempts.
+const LEFTOVER_RETRY: Duration = Duration::from_millis(100);
 
 impl Supervisor {
     async fn watch(self, id: Uuid, inner: JoinHandle<()>) {
-        if let Err(err) = inner.await
-            && err.is_panic()
-        {
+        let panicked = matches!(inner.await, Err(err) if err.is_panic());
+        if panicked {
             tracing::error!(%id, "a download task panicked");
-            self.fail_after_panic(id).await;
         }
-        self.registry.remove(id);
+        self.settle_leftovers(id, panicked).await;
+        self.registry.remove_live(&self.live);
+        self.live.mark_finished();
         let _ = self.finished.send(id);
     }
 
-    async fn fail_after_panic(&self, id: Uuid) {
-        let failure = crate::error::Failure::new(forgedm_protocol::DownloadErrorCode::Internal);
-        let stored = match self.store.load(id).await {
-            Ok(Some(stored)) => stored,
-            Ok(None) | Err(_) => return,
-        };
-        let Ok(step) = transition(stored.state, Command::Fail) else {
-            return;
-        };
-        let event = StoreEvent::now("failed").with_code(failure.code.as_str());
-        let moved = self
-            .store
-            .transition(id, stored.state, step.to, None, event)
-            .await;
-        if moved.is_ok() {
-            self.sink.emit(EngineEvent::Changed { id }).await;
-            self.sink
-                .emit(EngineEvent::Failed {
-                    id,
-                    error: failure.to_download_error(),
-                })
-                .await;
+    /// What the stored state of a finished task must become, if it is still active.
+    fn leftover_target(state: DownloadState, panicked: bool) -> Option<Command> {
+        use DownloadState as S;
+        match (state, panicked) {
+            (S::Probing | S::Downloading | S::Verifying | S::Finalizing, true) => {
+                Some(Command::Fail)
+            }
+            (S::Pausing, _) | (S::Probing | S::Downloading | S::Verifying, false) => {
+                Some(Command::Interrupt)
+            }
+            _ => None,
         }
+    }
+
+    async fn settle_leftovers(&self, id: Uuid, panicked: bool) {
+        let failure = crate::error::Failure::new(forgedm_protocol::DownloadErrorCode::Internal);
+        for attempt in 1..=LEFTOVER_ATTEMPTS {
+            let stored = match self.store.load(id).await {
+                Ok(Some(stored)) => stored,
+                Ok(None) => return,
+                Err(err) => {
+                    tracing::warn!(%id, error = %err, "cannot read a finished download");
+                    tokio::time::sleep(LEFTOVER_RETRY).await;
+                    continue;
+                }
+            };
+            let Some(cmd) = Self::leftover_target(stored.state, panicked) else {
+                return;
+            };
+            let Ok(step) = transition(stored.state, cmd) else {
+                return;
+            };
+            let failing = cmd == Command::Fail;
+            let (kind, code, reason) = if failing {
+                ("failed", failure.code.as_str(), None)
+            } else {
+                ("interrupted", "settle_failed", Some("crash".to_owned()))
+            };
+            let event = StoreEvent::now(kind).with_code(code);
+            let moved = self
+                .store
+                .transition(id, stored.state, step.to, reason, event)
+                .await;
+            match moved {
+                Ok(()) => {
+                    tracing::warn!(%id, from = ?stored.state, to = ?step.to, "settled a leftover download");
+                    self.sink.emit(EngineEvent::Changed { id }).await;
+                    if failing {
+                        let error = failure.to_download_error();
+                        self.sink.emit(EngineEvent::Failed { id, error }).await;
+                    }
+                    return;
+                }
+                Err(err) => {
+                    tracing::warn!(%id, attempt, error = %err, "could not settle a leftover download");
+                    tokio::time::sleep(LEFTOVER_RETRY).await;
+                }
+            }
+        }
+        tracing::error!(%id, "a finished download is still marked active");
     }
 }
 

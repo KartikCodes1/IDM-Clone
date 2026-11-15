@@ -9,6 +9,8 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
+use forgedm_protocol::DownloadState;
+use tokio::sync::watch;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
@@ -27,12 +29,21 @@ pub enum StopReason {
     Cancel,
     /// The agent is shutting down: the download becomes `interrupted`.
     Shutdown,
+    /// The user paused: the download checkpoints and becomes `paused`. Only the transfer
+    /// phases (probing, downloading) honour it; verifying and finalizing run to the end.
+    Pause,
 }
 
-/// A cancellation token that remembers why it fired (the first reason wins).
+/// A cancellation token that remembers why it fired.
+///
+/// Two tokens: `token` fires for every reason and stops the network phases; `hard` fires
+/// only for [`StopReason::Cancel`] and [`StopReason::Shutdown`] and also stops the disk
+/// phases (verify). The first reason wins, except that a pause is replaced by a cancel or a
+/// shutdown arriving later.
 #[derive(Debug, Clone)]
 pub struct StopSignal {
     token: CancellationToken,
+    hard: CancellationToken,
     reason: Arc<Mutex<Option<StopReason>>>,
 }
 
@@ -48,27 +59,42 @@ impl StopSignal {
     pub fn new() -> Self {
         Self {
             token: CancellationToken::new(),
+            hard: CancellationToken::new(),
             reason: Arc::new(Mutex::new(None)),
         }
     }
 
-    /// Fires the signal. Later calls keep the first reason.
+    /// Fires the signal. Later calls keep the first reason, except that `Cancel` and
+    /// `Shutdown` replace a `Pause`.
     pub fn request(&self, reason: StopReason) {
         let mut slot = self.reason.lock().unwrap_or_else(PoisonError::into_inner);
-        slot.get_or_insert(reason);
+        match *slot {
+            None => *slot = Some(reason),
+            Some(StopReason::Pause) if reason != StopReason::Pause => *slot = Some(reason),
+            Some(_) => {}
+        }
         drop(slot);
         self.token.cancel();
+        if reason != StopReason::Pause {
+            self.hard.cancel();
+        }
     }
 
-    /// Completes when the signal fires.
+    /// Completes when the signal fires (any reason).
     pub async fn cancelled(&self) {
         self.token.cancelled().await;
     }
 
-    /// The underlying token (for blocking work that polls it).
+    /// The token that fires for every reason (for network work that polls it).
     #[must_use]
     pub fn token(&self) -> &CancellationToken {
         &self.token
+    }
+
+    /// The token that fires only for cancel and shutdown (for blocking disk work).
+    #[must_use]
+    pub fn hard_token(&self) -> &CancellationToken {
+        &self.hard
     }
 
     /// Whether the signal has fired.
@@ -89,12 +115,24 @@ impl StopSignal {
         TaskStop::Stopped(self.reason().unwrap_or(StopReason::Cancel))
     }
 
-    /// `Err(Stopped)` when the signal has fired.
+    /// `Err(Stopped)` when the signal has fired for any reason.
     ///
     /// # Errors
     /// [`TaskStop::Stopped`].
     pub fn check(&self) -> Result<(), TaskStop> {
         if self.is_stopped() {
+            Err(self.stopped())
+        } else {
+            Ok(())
+        }
+    }
+
+    /// `Err(Stopped)` only when a cancel or shutdown fired (a pause is ignored).
+    ///
+    /// # Errors
+    /// [`TaskStop::Stopped`].
+    pub fn check_hard(&self) -> Result<(), TaskStop> {
+        if self.hard.is_cancelled() {
             Err(self.stopped())
         } else {
             Ok(())
@@ -117,6 +155,8 @@ pub struct LiveDownload {
     connections: AtomicU32,
     estimator: Mutex<Estimator>,
     stop: StopSignal,
+    state: Mutex<DownloadState>,
+    finished: watch::Sender<bool>,
 }
 
 impl LiveDownload {
@@ -131,7 +171,32 @@ impl LiveDownload {
             connections: AtomicU32::new(0),
             estimator: Mutex::new(Estimator::new(Instant::now(), None, 0)),
             stop,
+            state: Mutex::new(DownloadState::Queued),
+            finished: watch::channel(false).0,
         }
+    }
+
+    /// The state the owning task last persisted (the task is the only writer).
+    #[must_use]
+    pub fn state(&self) -> DownloadState {
+        *self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Records the state the task just persisted.
+    pub fn set_state(&self, state: DownloadState) {
+        *self.state.lock().unwrap_or_else(PoisonError::into_inner) = state;
+    }
+
+    /// Marks the owning task as finished (it settled, or its supervisor gave up on it).
+    pub fn mark_finished(&self) {
+        self.finished.send_replace(true);
+    }
+
+    /// Completes once the owning task has finished.
+    pub async fn finished(&self) {
+        let mut rx = self.finished.subscribe();
+        // The sender lives in `self`, so the wait can only end by the flag becoming true.
+        let _ = rx.wait_for(|done| *done).await;
     }
 
     /// The stop signal of this download.
@@ -158,6 +223,18 @@ impl LiveDownload {
     /// Records the cumulative bytes durable on disk and in the checkpoint.
     pub fn set_committed(&self, bytes: u64) {
         self.committed.store(bytes, Ordering::Release);
+    }
+
+    /// Starts the counters at `bytes` already on disk (a resumed download) and restarts the
+    /// speed estimate there, so the jump is not reported as speed.
+    pub fn resume_from(&self, bytes: u64) {
+        self.accepted.store(bytes, Ordering::Release);
+        self.committed.store(bytes, Ordering::Release);
+        let total = Some(self.total.load(Ordering::Acquire)).filter(|t| *t != NO_TOTAL);
+        *self
+            .estimator
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Estimator::new(Instant::now(), total, bytes);
     }
 
     /// Records how many connections are open.
@@ -225,6 +302,18 @@ impl Registry {
         self.map().remove(&id);
     }
 
+    /// Forgets `live` only if it is still the registered entry for its id: a download that
+    /// was resumed meanwhile has a newer entry that must stay.
+    pub fn remove_live(&self, live: &Arc<LiveDownload>) {
+        let mut map = self.map();
+        if map
+            .get(&live.id)
+            .is_some_and(|current| Arc::ptr_eq(current, live))
+        {
+            map.remove(&live.id);
+        }
+    }
+
     /// The live counters of `id`, if it is running.
     #[must_use]
     pub fn get(&self, id: Uuid) -> Option<Arc<LiveDownload>> {
@@ -272,6 +361,41 @@ mod tests {
         stop.request(StopReason::Shutdown);
         assert_eq!(stop.reason(), Some(StopReason::Cancel));
         assert_eq!(stop.check(), Err(TaskStop::Stopped(StopReason::Cancel)));
+    }
+
+    #[test]
+    fn a_pause_is_replaced_by_a_cancel_and_never_stops_the_disk_phases() {
+        let stop = StopSignal::new();
+        stop.request(StopReason::Pause);
+        assert_eq!(stop.check(), Err(TaskStop::Stopped(StopReason::Pause)));
+        assert!(stop.check_hard().is_ok(), "a pause leaves verify running");
+        stop.request(StopReason::Cancel);
+        assert_eq!(stop.reason(), Some(StopReason::Cancel));
+        assert_eq!(
+            stop.check_hard(),
+            Err(TaskStop::Stopped(StopReason::Cancel))
+        );
+        stop.request(StopReason::Pause);
+        assert_eq!(
+            stop.reason(),
+            Some(StopReason::Cancel),
+            "a pause never replaces"
+        );
+    }
+
+    #[tokio::test]
+    async fn finished_completes_after_the_task_marks_it() {
+        let live = Arc::new(LiveDownload::new(Uuid::nil(), StopSignal::new()));
+        assert_eq!(live.state(), DownloadState::Queued);
+        let waiter = tokio::spawn({
+            let live = Arc::clone(&live);
+            async move { live.finished().await }
+        });
+        live.set_state(DownloadState::Paused);
+        live.mark_finished();
+        waiter.await.unwrap();
+        assert_eq!(live.state(), DownloadState::Paused);
+        live.finished().await;
     }
 
     #[test]

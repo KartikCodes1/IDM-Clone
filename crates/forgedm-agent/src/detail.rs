@@ -94,7 +94,10 @@ fn mismatch_actual(events: &[EventRecord]) -> Option<String> {
 }
 
 fn checksum_info(record: &DownloadRecord, events: &[EventRecord]) -> ChecksumInfo {
-    let expected = expected_sha_from_events(events);
+    let expected = record
+        .checksum_expected
+        .clone()
+        .or_else(|| expected_sha_from_events(events));
     let actual = record
         .checksum_actual
         .clone()

@@ -11,10 +11,10 @@ use super::AgentHandler;
 use crate::app::request_shutdown;
 use crate::error::AgentError;
 
-/// Capabilities advertised only once implemented (A.2): replay on `Subscribe` (S0.8) and
-/// the expected-SHA-256 check (S1.7). Segmenting, resume and rate limits come with their
-/// slices.
-const CAPABILITIES: [&str; 2] = ["subscribe_replay", "checksum_sha256"];
+/// Capabilities advertised only once implemented (A.2): replay on `Subscribe` (S0.8), the
+/// expected-SHA-256 check (S1.7) and validated resume (S1.9). Segmenting and rate limits come
+/// with their slices.
+const CAPABILITIES: [&str; 3] = ["subscribe_replay", "checksum_sha256", "resume"];
 
 /// Answers the handshake. The transport already negotiated the protocol version.
 pub(super) fn handshake(handler: &AgentHandler) -> Result<ResultBody, AgentError> {

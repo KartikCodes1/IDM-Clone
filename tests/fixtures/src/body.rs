@@ -7,6 +7,8 @@ use futures_util::{Stream, StreamExt, stream};
 use hyper::body::{Body, Frame, SizeHint};
 use std::io;
 use std::pin::Pin;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
@@ -39,6 +41,8 @@ pub struct FixtureBody {
     exact_len: Option<u64>,
     /// Held until the body is finished or dropped, so concurrency covers the whole transfer.
     guard: Option<InFlight>,
+    /// Adds every data frame handed to the connection, when set.
+    served: Option<Arc<AtomicU64>>,
 }
 
 impl FixtureBody {
@@ -49,6 +53,7 @@ impl FixtureBody {
             stream: Box::pin(stream::empty()),
             exact_len: Some(0),
             guard: None,
+            served: None,
         }
     }
 
@@ -60,6 +65,7 @@ impl FixtureBody {
             stream: Box::pin(stream::once(async move { Ok(data) })),
             exact_len: Some(len),
             guard: None,
+            served: None,
         }
     }
 
@@ -81,7 +87,15 @@ impl FixtureBody {
             stream: Box::pin(stream),
             exact_len: exact_length.then_some(len),
             guard: None,
+            served: None,
         }
+    }
+
+    /// Counts the body bytes handed to the connection in `counter`.
+    #[must_use]
+    pub fn with_served(mut self, counter: Arc<AtomicU64>) -> Self {
+        self.served = Some(counter);
+        self
     }
 
     /// Ties a concurrency slot to this body's lifetime.
@@ -100,9 +114,11 @@ impl Body for FixtureBody {
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
     ) -> Poll<Option<Result<Frame<Bytes>, io::Error>>> {
-        self.stream
-            .poll_next_unpin(cx)
-            .map(|item| item.map(|r| r.map(Frame::data)))
+        let polled = self.stream.poll_next_unpin(cx);
+        if let (Poll::Ready(Some(Ok(bytes))), Some(counter)) = (&polled, &self.served) {
+            counter.fetch_add(u64::try_from(bytes.len()).unwrap_or(0), Ordering::AcqRel);
+        }
+        polled.map(|item| item.map(|r| r.map(Frame::data)))
     }
 
     fn size_hint(&self) -> SizeHint {

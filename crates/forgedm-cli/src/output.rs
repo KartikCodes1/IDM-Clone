@@ -3,24 +3,72 @@
 //! The workspace denies `print_stdout` and `print_stderr`; this module is the designated
 //! exception because a command-line client's job is to print.
 //!
-//! Writes go through locked handles and ignore I/O errors, so a closed pipe (for example
-//! `forgedm list | head`) ends output quietly instead of panicking.
+//! Writes go through locked handles and never panic. A write error is remembered and decides
+//! the exit code in [`finish`]: a closed pipe (for example `forgedm list | head`) is a quiet
+//! success, any other error (a full disk, a revoked handle) makes a successful command exit 1
+//! with a message, so a truncated result is never reported as complete.
 
-use std::io::Write;
+use std::io::{self, Write};
+use std::sync::atomic::{AtomicU8, Ordering};
 
 use forgedm_protocol::{
     AgentStatusInfo, DownloadDetail, DownloadState, DownloadSummary, HandshakeResult, ProgressItem,
 };
 use uuid::Uuid;
 
-/// Prints one line to standard output.
-pub fn line(text: &str) {
-    let _ = writeln!(std::io::stdout().lock(), "{text}");
+/// No output failure so far.
+const STDOUT_OK: u8 = 0;
+/// The reader went away (`BrokenPipe`): not an error.
+const STDOUT_CLOSED: u8 = 1;
+/// Any other write failure.
+const STDOUT_FAILED: u8 = 2;
+/// Exit code of an internal error (A.8: 1).
+const EXIT_INTERNAL: u8 = 1;
+
+static STDOUT_STATE: AtomicU8 = AtomicU8::new(STDOUT_OK);
+
+/// What a failed write means for the process.
+fn state_for(err: &io::Error) -> u8 {
+    if err.kind() == io::ErrorKind::BrokenPipe {
+        STDOUT_CLOSED
+    } else {
+        STDOUT_FAILED
+    }
 }
 
-/// Prints one error line to standard error.
+/// The exit code after output: a failed write turns success into 1; a closed pipe changes
+/// nothing; a command that already failed keeps its own code.
+fn code_after_output(code: u8, state: u8) -> u8 {
+    if code == 0 && state == STDOUT_FAILED {
+        EXIT_INTERNAL
+    } else {
+        code
+    }
+}
+
+/// Prints one line to standard output. Once the reader has gone, later lines are dropped.
+pub fn line(text: &str) {
+    if STDOUT_STATE.load(Ordering::Acquire) == STDOUT_CLOSED {
+        return;
+    }
+    if let Err(err) = writeln!(io::stdout().lock(), "{text}") {
+        STDOUT_STATE.fetch_max(state_for(&err), Ordering::AcqRel);
+    }
+}
+
+/// Settles the exit code once the command is done: reports a real write failure on stderr and
+/// makes a successful command exit 1; a closed pipe stays a quiet success.
+pub fn finish(code: u8) -> u8 {
+    let state = STDOUT_STATE.load(Ordering::Acquire);
+    if state == STDOUT_FAILED && code == 0 {
+        error_line("cannot write to standard output");
+    }
+    code_after_output(code, state)
+}
+
+/// Prints one error line to standard error (a failure to do so cannot be reported anywhere).
 pub fn error_line(message: &str) {
-    let _ = writeln!(std::io::stderr().lock(), "forgedm: {message}");
+    let _ = writeln!(io::stderr().lock(), "forgedm: {message}");
 }
 
 /// Prints a clap parse error or help text the way clap formats it.
@@ -186,6 +234,43 @@ pub fn progress(item: &ProgressItem) {
     line(&progress_line(item));
 }
 
+/// Prints the state a control command left a download in.
+pub fn state_result(id: Uuid, state: DownloadState) {
+    line(&format!("{} {id}", enum_text(serde_json::to_value(state))));
+}
+
+/// Prints the download detail as text.
+pub fn detail(detail: &DownloadDetail) {
+    let s = &detail.summary;
+    line(&format!("id {}", s.id));
+    line(&format!("name {}", sanitize_for_terminal(&s.display_name)));
+    line(&format!("state {}", ending_text(s)));
+    line(&format!("url {}", sanitize_for_terminal(&s.url_display)));
+    line(&format!(
+        "bytes {} accepted, {} committed, total {}",
+        s.accepted_bytes,
+        s.committed_bytes,
+        s.total_bytes
+            .map_or_else(|| "unknown".to_owned(), |t| t.to_string())
+    ));
+    line(&format!(
+        "resume {}",
+        enum_text(serde_json::to_value(s.resume))
+    ));
+    for segment in &detail.segments {
+        line(&format!(
+            "segment {} from {} committed {}{}",
+            segment.seg_no,
+            segment.start,
+            segment.committed,
+            if segment.active { " (active)" } else { "" }
+        ));
+    }
+    if let Some(path) = &s.final_path {
+        line(&format!("final {}", sanitize_for_terminal(path)));
+    }
+}
+
 /// Notes that an interrupted download starts over (it cannot resume).
 pub fn restarting_from_zero() {
     line("interrupted earlier; this download cannot resume, so it restarts from 0");
@@ -232,6 +317,30 @@ mod tests {
 
         assert_eq!(out, "a\u{FFFD}[2Jb\u{FFFD}c\u{FFFD}d\u{FFFD}");
         assert!(!out.chars().any(char::is_control));
+    }
+
+    #[test]
+    fn a_closed_pipe_is_a_quiet_success_and_any_other_write_error_is_exit_1() {
+        let closed = io::Error::from(io::ErrorKind::BrokenPipe);
+        let denied = io::Error::from(io::ErrorKind::PermissionDenied);
+        let full = io::Error::from_raw_os_error(112);
+        assert_eq!(state_for(&closed), STDOUT_CLOSED);
+        assert_eq!(state_for(&denied), STDOUT_FAILED);
+        assert_eq!(state_for(&full), STDOUT_FAILED);
+
+        assert_eq!(code_after_output(0, STDOUT_OK), 0);
+        assert_eq!(
+            code_after_output(0, STDOUT_CLOSED),
+            0,
+            "BrokenPipe is quiet success"
+        );
+        assert_eq!(code_after_output(0, STDOUT_FAILED), 1);
+        assert_eq!(
+            code_after_output(13, STDOUT_FAILED),
+            13,
+            "an earlier failure keeps its code"
+        );
+        assert_eq!(code_after_output(10, STDOUT_CLOSED), 10);
     }
 
     #[test]

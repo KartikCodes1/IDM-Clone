@@ -2,8 +2,9 @@
 //! all disk writes. The `forgedm-agent` binary is a thin wrapper around [`app`].
 //!
 //! Served so far: Handshake, Ping, GetAgentStatus, GetSnapshot, Subscribe, Unsubscribe,
-//! ListDownloads, ShutdownAgentSafely (S0.8) and EnqueueUrl and GetDownload (S1.7); every
-//! other action returns `not_implemented` until its slice lands.
+//! ListDownloads, ShutdownAgentSafely (S0.8), EnqueueUrl and GetDownload (S1.7) and Pause,
+//! Resume, Cancel, Retry and Remove (S1.9); every other action returns `not_implemented`
+//! until its slice lands.
 //!
 //! - [`config`]: flags and the pipe name derivation.
 //! - [`data_dir`]: data directory layout and the reparse-point check.

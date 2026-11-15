@@ -1,7 +1,8 @@
 //! Rolling file logs and the panic hook (ARCHITECTURE 8).
 //!
 //! JSON lines go to `<data-dir>\logs\agent.log.YYYY-MM-DD`, rotated daily with the newest 14
-//! files kept, through tracing-appender's non-blocking writer. The returned [`LogGuard`] must
+//! files kept, through tracing-appender's non-blocking writer. **The date in the file name is
+//! UTC**, not the local date: the appender rolls over at 00:00 UTC (a test pins this). The returned [`LogGuard`] must
 //! be held until the process is about to exit so buffered lines are flushed. Security events
 //! use the target `forgedm::security`. Nothing here logs URLs; call sites must only pass
 //! redacted URLs.

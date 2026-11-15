@@ -211,6 +211,22 @@ pub fn stop_from_platform(err: &PlatformError) -> TaskStop {
     }
 }
 
+/// Maps a store failure raised while a download runs: unreadable secrets fail the download
+/// as `secrets_unavailable`; anything else is an `internal` failure (the cause is logged,
+/// never shown).
+#[must_use]
+pub fn stop_from_store(err: &StoreError) -> TaskStop {
+    match err {
+        StoreError::SecretsUnavailable => {
+            TaskStop::Fail(Failure::new(DownloadErrorCode::SecretsUnavailable))
+        }
+        other => {
+            tracing::error!(error = %other, "storage failed while a download was running");
+            TaskStop::Fail(Failure::new(DownloadErrorCode::Internal))
+        }
+    }
+}
+
 /// A persistence failure reported through the [`DownloadStore`](crate::ports::DownloadStore)
 /// port. The adapter maps its own errors onto these.
 #[derive(Debug, Error)]
@@ -246,6 +262,15 @@ pub enum EngineError {
     /// The queue holds the maximum number of downloads (`limit_exceeded`).
     #[error("the download queue is full")]
     LimitExceeded,
+    /// No such download (`not_found`).
+    #[error("download not found")]
+    NotFound,
+    /// The command is not allowed in the download's current state (`invalid_state`).
+    #[error("the command is not allowed while the download is {}", .0.as_str())]
+    InvalidState(DownloadState),
+    /// Pause of an active non-resumable download without `discard_progress`.
+    #[error("the download cannot resume; pause needs discard_progress")]
+    NotResumable,
     /// A persistence failure.
     #[error(transparent)]
     Store(#[from] StoreError),

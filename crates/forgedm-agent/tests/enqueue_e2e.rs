@@ -250,9 +250,10 @@ async fn nonresumable_kill_restart_redownloads_from_zero() {
     let (data, target) = (TempDir::new().unwrap(), TempDir::new().unwrap());
     let size = 700_000;
     // Fast to 300 kB, then a crawl: the first run is killed in the crawl, the second
-    // finishes after about three seconds.
+    // finishes after about three seconds. `ranges=0`: the server ignores ranges, so the
+    // download is not resumable and must restart from zero (a range-capable one resumes).
     let url = format!(
-        "{}/f/7/{size}?slow=100000&slow_from=300000&t=restart",
+        "{}/f/7/{size}?slow=100000&slow_from=300000&ranges=0&t=restart",
         fixture.base_url()
     );
     let mut agent = AgentProc::start(data.path(), &[]);
@@ -301,11 +302,16 @@ async fn nonresumable_kill_restart_redownloads_from_zero() {
         "the restart is recorded: {:?}",
         finished.recent_events
     );
-    let requests = fixture.log().for_test("restart");
-    assert_eq!(requests.len(), 2, "one request per run: {requests:?}");
+    let log = fixture.log().for_test("restart");
+    // Each run probes (HEAD, then GET bytes=0-0) and then makes one plain GET.
+    let requests: Vec<_> = log
+        .iter()
+        .filter(|r| r.method == "GET" && r.range.as_deref() != Some("bytes=0-0"))
+        .collect();
+    assert_eq!(requests.len(), 2, "one transfer request per run: {log:?}");
     assert!(
         requests.iter().all(|r| r.range.is_none()),
-        "never a Range request"
+        "never a ranged transfer request"
     );
     let leftovers: Vec<String> = std::fs::read_dir(target.path())
         .unwrap()

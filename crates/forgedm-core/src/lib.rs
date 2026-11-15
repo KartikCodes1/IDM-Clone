@@ -12,6 +12,7 @@
 #[cfg(any(test, feature = "test-support"))]
 extern crate self as forgedm_core;
 
+pub mod checkpoint;
 pub mod client;
 pub mod clock;
 pub mod engine;
@@ -21,8 +22,10 @@ pub mod hash;
 pub mod http;
 pub mod naming;
 pub mod ports;
+pub mod probe;
 pub mod progress;
 pub mod rate_limit;
+pub mod resume;
 pub mod retry;
 pub mod state;
 #[cfg(any(test, feature = "test-support"))]

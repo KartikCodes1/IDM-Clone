@@ -52,6 +52,34 @@ pub fn file_matches(path: &Path, seed: u64, size: u64) -> Result<(), VerifyError
     Ok(())
 }
 
+/// Streams the first `len` bytes of `path` against the generator for `seed`. Bytes beyond
+/// `len` are ignored: this checks a committed prefix of a partial file.
+///
+/// # Errors
+/// [`VerifyError::Mismatch`] with the first differing offset (a file shorter than `len` reports
+/// its length), or [`VerifyError::Io`] when the file cannot be read.
+pub fn prefix_matches(path: &Path, seed: u64, len: u64) -> Result<(), VerifyError> {
+    let mut file = std::fs::File::open(path)?;
+    let mut actual = vec![0u8; VERIFY_CHUNK];
+    let mut expected = vec![0u8; VERIFY_CHUNK];
+    let mut pos = 0_u64;
+    while pos < len {
+        let want = usize::try_from(len - pos).map_or(VERIFY_CHUNK, |left| left.min(VERIFY_CHUNK));
+        let got = read_full(&mut file, &mut actual[..want])?;
+        content::fill(seed, pos, &mut expected[..got]);
+        if let Some(i) = first_diff(&actual[..got], &expected[..got]) {
+            return Err(VerifyError::Mismatch {
+                offset: pos + widen(i),
+            });
+        }
+        pos += widen(got);
+        if got < want {
+            return Err(VerifyError::Mismatch { offset: pos });
+        }
+    }
+    Ok(())
+}
+
 fn widen(n: usize) -> u64 {
     u64::try_from(n).unwrap_or(u64::MAX)
 }

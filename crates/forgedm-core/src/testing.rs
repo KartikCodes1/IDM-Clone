@@ -15,7 +15,7 @@ use forgedm_core::clock::BoxFuture;
 use forgedm_core::error::StoreError;
 use forgedm_core::ports::{
     DownloadStore, EngineEvent, EngineEventSink, NewJob, ProbeFacts, StoreEvent, StoreFuture,
-    StoredJob, unix_ms,
+    StoredJob, StoredProgress, unix_ms,
 };
 use forgedm_protocol::{DownloadState, TransferMode};
 use tokio::sync::Notify;
@@ -130,6 +130,7 @@ impl DownloadStore for MemoryStore {
                 part_path: None,
                 part_file_id: None,
                 transfer_mode: None,
+                progress: StoredProgress::default(),
             };
             self.seed(job);
             Ok(())
@@ -190,6 +191,14 @@ impl DownloadStore for MemoryStore {
             row.job.transfer_mode = Some(facts.transfer_mode);
             row.job.part_path = Some(facts.part_path);
             row.job.part_file_id = facts.part_file_id;
+            row.job.progress = StoredProgress {
+                total: facts.total,
+                committed: 0,
+                etag: facts.etag,
+                etag_strong: facts.etag_strong,
+                last_modified: facts.last_modified,
+                last_modified_strong: facts.last_modified_strong,
+            };
             Ok(())
         })
     }
@@ -199,6 +208,7 @@ impl DownloadStore for MemoryStore {
             let mut rows = self.rows();
             let row = rows.get_mut(&id).ok_or(StoreError::NotFound)?;
             row.checkpoints.push((committed, total));
+            row.job.progress.committed = committed;
             Ok(())
         })
     }
@@ -209,7 +219,20 @@ impl DownloadStore for MemoryStore {
             let row = rows.get_mut(&id).ok_or(StoreError::NotFound)?;
             row.checkpoints.clear();
             row.resets += 1;
+            row.job.progress = StoredProgress::default();
+            row.job.part_path = None;
+            row.job.part_file_id = None;
+            row.job.transfer_mode = None;
             Ok(())
+        })
+    }
+
+    fn remove(&self, id: Uuid) -> StoreFuture<'_, ()> {
+        Box::pin(async move {
+            self.rows()
+                .remove(&id)
+                .map(|_| ())
+                .ok_or(StoreError::NotFound)
         })
     }
 
