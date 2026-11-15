@@ -4,8 +4,12 @@
 use std::process::ExitCode;
 
 fn main() -> ExitCode {
-    match forgedm_desktop_lib::run() {
+    let log = forgedm_desktop_lib::logging::init();
+    match forgedm_desktop_lib::run(log) {
         Ok(()) => ExitCode::SUCCESS,
-        Err(_) => ExitCode::FAILURE,
+        Err(err) => {
+            tracing::error!(error = %err, "the desktop shell exited with an error");
+            ExitCode::FAILURE
+        }
     }
 }

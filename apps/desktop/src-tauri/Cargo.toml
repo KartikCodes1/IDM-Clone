@@ -35,6 +35,9 @@ serde_json.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["rt", "time"] }
 tracing.workspace = true
+# Coordinator decision (W3 finding S0.10-rust-reviewer-7): desktop log sink.
+tracing-subscriber.workspace = true
+tracing-appender.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt", "macros", "time"] }

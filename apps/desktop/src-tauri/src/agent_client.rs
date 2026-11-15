@@ -5,7 +5,6 @@
 //! image path before a single byte is sent.
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 use forgedm_ipc::{Client, ClientConfig};
 use forgedm_protocol::{
@@ -20,10 +19,6 @@ pub const AGENT_EXE_NAME: &str = "forgedm-agent.exe";
 /// Page size used for the Phase 0 list (`ListDownloads` accepts `1..=500`).
 pub const LIST_PAGE_LIMIT: u32 = 500;
 const CLIENT_NAME: &str = "forgedm-desktop";
-/// `CREATE_NO_WINDOW`: keeps the SID lookup from flashing a console.
-const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-/// Upper bound on a SID string (`SECURITY_MAX_SID_STRING_CHARACTERS`).
-const MAX_SID_CHARS: usize = 187;
 
 /// Where the agent listens and which executable it must be running from.
 #[derive(Debug, Clone)]
@@ -47,12 +42,11 @@ impl AgentLocator {
     ///
     /// # Errors
     /// [`CommandErrorKind::AgentUnavailable`] when the agent executable is missing,
-    /// [`CommandErrorKind::Internal`] when the user SID cannot be determined.
+    /// [`CommandErrorKind::Internal`] when the user's pipe name cannot be determined.
     pub fn for_current_user() -> Result<Self, CommandError> {
         let exe = std::env::current_exe().map_err(local_fault)?;
         let agent = sibling_agent_path(&exe)?;
-        let sid = current_user_sid()?;
-        Ok(Self::new(format!(r"\\.\pipe\ForgeDM-{sid}"), agent))
+        Ok(Self::new(default_pipe_name()?, agent))
     }
 }
 
@@ -78,38 +72,15 @@ fn local_fault(err: std::io::Error) -> CommandError {
     CommandError::new(CommandErrorKind::Internal, "A local error occurred.")
 }
 
-/// The current user's SID string, from `whoami /user`.
-///
-/// `forgedm-desktop` may depend only on `forgedm-ipc` and `forgedm-protocol`, so the
-/// platform crate's SID API is out of reach. A wrong answer cannot misdirect trust: the
-/// client verifies the server's SID and image path after connecting.
-fn current_user_sid() -> Result<String, CommandError> {
-    use std::os::windows::process::CommandExt;
-    let system_root = std::env::var_os("SystemRoot").unwrap_or_else(|| r"C:\Windows".into());
-    let whoami = Path::new(&system_root).join("System32").join("whoami.exe");
-    let output = Command::new(whoami)
-        .args(["/user", "/fo", "csv", "/nh"])
-        .creation_flags(CREATE_NO_WINDOW)
-        .output()
-        .map_err(local_fault)?;
-    let text = String::from_utf8_lossy(&output.stdout);
-    parse_whoami_sid(&text).ok_or_else(|| {
+/// The current user's default pipe name, from the shared `forgedm-ipc` helper.
+fn default_pipe_name() -> Result<String, CommandError> {
+    forgedm_ipc::pipe_name_for(None).map_err(|err| {
+        tracing::warn!(error = %err, "the agent pipe name could not be determined");
         CommandError::new(
             CommandErrorKind::Internal,
             "The current user could not be determined.",
         )
     })
-}
-
-/// Extracts the SID from `"DOMAIN\user","S-1-5-21-..."`.
-fn parse_whoami_sid(csv: &str) -> Option<String> {
-    let sid = csv.trim().rsplit(',').next()?.trim().trim_matches('"');
-    let valid = sid.starts_with("S-1-")
-        && sid.len() <= MAX_SID_CHARS
-        && sid
-            .bytes()
-            .all(|b| b.is_ascii_digit() || b == b'-' || b == b'S');
-    valid.then(|| sid.to_owned())
 }
 
 async fn connect(locator: &AgentLocator) -> Result<Client, CommandError> {
@@ -163,19 +134,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn whoami_csv_yields_the_sid() {
-        let csv = "\"DESKTOP\\me\",\"S-1-5-21-1-2-3-1001\"\r\n";
-        assert_eq!(
-            parse_whoami_sid(csv).as_deref(),
-            Some("S-1-5-21-1-2-3-1001")
-        );
-    }
-
-    #[test]
-    fn malformed_whoami_output_is_rejected() {
-        assert_eq!(parse_whoami_sid(""), None);
-        assert_eq!(parse_whoami_sid("\"a\\b\",\"not-a-sid\""), None);
-        assert_eq!(parse_whoami_sid("\"a\",\"S-1-5-21\\..\\evil\""), None);
+    fn default_pipe_name_is_local_and_user_scoped() {
+        let name = default_pipe_name().expect("current user resolves");
+        assert!(name.starts_with(r"\\.\pipe\ForgeDM-S-1-"), "{name}");
     }
 
     #[test]
