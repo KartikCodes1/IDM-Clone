@@ -4,15 +4,15 @@
 //! current user allowed, medium integrity label with no-write-up and no-read-up). A NULL
 //! descriptor would grant Everyone read access and is never used.
 //!
-//! The returned handle is overlapped, byte-mode, remote-client-rejecting and limited to
-//! [`PIPE_MAX_INSTANCES`] instances. The IPC crate adopts it into its async runtime.
+//! The returned tokio `NamedPipeServer` is byte-mode, remote-client-rejecting and limited to
+//! [`PIPE_MAX_INSTANCES`] instances. All unsafe adoption stays in this crate.
 #![allow(unsafe_code)] // Win32 pipe and security descriptor FFI; every block has a SAFETY comment.
 
-use std::os::windows::io::{AsRawHandle, BorrowedHandle, FromRawHandle, OwnedHandle};
+use std::os::windows::io::{AsRawHandle, BorrowedHandle};
 
-use windows::Win32::Foundation::{
-    ERROR_ACCESS_DENIED, ERROR_SUCCESS, GetLastError, HANDLE, HLOCAL, INVALID_HANDLE_VALUE,
-};
+use tokio::net::windows::named_pipe::{NamedPipeServer, PipeMode, ServerOptions};
+
+use windows::Win32::Foundation::{ERROR_SUCCESS, HANDLE, HLOCAL};
 use windows::Win32::Security::Authorization::{
     ConvertSecurityDescriptorToStringSecurityDescriptorW,
     ConvertStringSecurityDescriptorToSecurityDescriptorW, GetSecurityInfo, SE_KERNEL_OBJECT,
@@ -20,12 +20,6 @@ use windows::Win32::Security::Authorization::{
 use windows::Win32::Security::{
     DACL_SECURITY_INFORMATION, LABEL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR,
     SECURITY_ATTRIBUTES,
-};
-use windows::Win32::Storage::FileSystem::{
-    FILE_FLAG_FIRST_PIPE_INSTANCE, FILE_FLAG_OVERLAPPED, PIPE_ACCESS_DUPLEX,
-};
-use windows::Win32::System::Pipes::{
-    CreateNamedPipeW, PIPE_READMODE_BYTE, PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE, PIPE_WAIT,
 };
 use windows::core::{Owned, PCWSTR, PWSTR};
 
@@ -138,51 +132,53 @@ const SECURITY_ATTRIBUTES_LEN: u32 = {
 ///
 /// Set `first` to claim the name (`FILE_FLAG_FIRST_PIPE_INSTANCE`); it fails with
 /// [`PipeError::NameInUse`] if any instance exists. Replacement instances use
-/// `first = false`. The handle is overlapped, byte mode, rejects remote clients and
-/// allows at most [`PIPE_MAX_INSTANCES`] instances with 64 KiB buffers.
+/// `first = false`. The server is duplex, byte mode, rejects remote clients and allows at
+/// most [`PIPE_MAX_INSTANCES`] instances with [`PIPE_BUFFER_SIZE`] buffers.
+///
+/// This registers the handle with the tokio I/O driver, so it **must be called inside a
+/// tokio runtime** (a current-thread runtime is enough); outside one tokio panics.
 ///
 /// # Errors
 /// [`PipeError::NameInUse`] on access denied when `first` is set, [`PipeError::Platform`]
-/// otherwise
-/// (including a name outside the pipe namespace).
+/// otherwise (including a name outside the pipe namespace).
 pub fn create_pipe_instance(
     name: &str,
     first: bool,
     security: &PipeSecurity,
-) -> Result<OwnedHandle, PipeError> {
+) -> Result<NamedPipeServer, PipeError> {
     validate_pipe_name(name)?;
-    let wide = to_wide_nul(name)?;
-    let mut open_mode = PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED;
-    if first {
-        open_mode |= FILE_FLAG_FIRST_PIPE_INSTANCE;
-    }
-    let mode = PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS;
-    let sa = security.attributes();
-    // SAFETY: `wide` is NUL-terminated and `sa` (with its descriptor, kept alive by
-    // `security`) outlives the call.
-    let handle = unsafe {
-        CreateNamedPipeW(
-            PCWSTR(wide.as_ptr()),
-            open_mode,
-            mode,
-            PIPE_MAX_INSTANCES,
-            PIPE_BUFFER_SIZE,
-            PIPE_BUFFER_SIZE,
-            0,
-            Some(&raw const sa),
-        )
+    // Reject interior NULs before the name reaches the OS.
+    to_wide_nul(name)?;
+    let mut sa = security.attributes();
+    let mut options = ServerOptions::new();
+    options
+        .access_inbound(true)
+        .access_outbound(true)
+        .reject_remote_clients(true)
+        .first_pipe_instance(first)
+        .pipe_mode(PipeMode::Byte)
+        .max_instances(PIPE_MAX_INSTANCES as usize)
+        .in_buffer_size(PIPE_BUFFER_SIZE)
+        .out_buffer_size(PIPE_BUFFER_SIZE);
+    // SAFETY: `sa` is a live, properly initialised SECURITY_ATTRIBUTES whose pointer is
+    // valid for the whole call; it is only read by `CreateNamedPipeW`, which copies the
+    // descriptor into the kernel object. `sa.lpSecurityDescriptor` points into the
+    // LocalAlloc'd block owned by `security`, which is borrowed for this entire function,
+    // so it outlives the call. `bInheritHandle` is false and nothing retains the pointer.
+    let result = unsafe {
+        options.create_with_security_attributes_raw(name, (&raw mut sa).cast::<std::ffi::c_void>())
     };
-    if handle == INVALID_HANDLE_VALUE || handle.is_invalid() {
-        // SAFETY: GetLastError has no preconditions; called right after the failing call.
-        let code = unsafe { GetLastError() };
-        return Err(if first && code == ERROR_ACCESS_DENIED {
-            PipeError::NameInUse
-        } else {
-            PlatformError::win32("CreateNamedPipeW", code.0).into()
-        });
+    result.map_err(|e| map_create_error(&e, first))
+}
+
+fn map_create_error(err: &std::io::Error, first: bool) -> PipeError {
+    if first && err.kind() == std::io::ErrorKind::PermissionDenied {
+        return PipeError::NameInUse;
     }
-    // SAFETY: CreateNamedPipeW succeeded, so `handle` is a valid handle we exclusively own.
-    Ok(unsafe { OwnedHandle::from_raw_handle(handle.0) })
+    match err.raw_os_error() {
+        Some(code) => PlatformError::win32("CreateNamedPipeW", code.cast_unsigned()).into(),
+        None => PlatformError::Io(std::io::Error::new(err.kind(), err.to_string())).into(),
+    }
 }
 
 fn validate_pipe_name(name: &str) -> Result<(), PlatformError> {

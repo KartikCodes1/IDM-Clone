@@ -11,6 +11,8 @@ use forgedm_platform::peer::{self, PeerError};
 use forgedm_platform::pipe::{self, PIPE_MAX_INSTANCES, PipeError, PipeSecurity};
 use forgedm_platform::sid::{Sid, validate_sid_string};
 use forgedm_platform::wide;
+use tokio::io::Interest;
+use tokio::net::windows::named_pipe::{ClientOptions, NamedPipeServer, PipeEnd, PipeMode};
 
 static COUNTER: AtomicU32 = AtomicU32::new(0);
 
@@ -102,13 +104,19 @@ fn parse_sddl(sddl: &str) -> Option<(String, Vec<String>, String, Vec<String>)> 
     Some((df, da, sf, sa))
 }
 
-#[test]
-fn pipe_dacl_readback_from_live_handle_is_deny_nu_allow_user_me_label_only() {
+#[tokio::test]
+async fn pipe_dacl_readback_from_live_handle_is_deny_nu_allow_user_me_label_only() {
     let me = Sid::current_user().expect("me");
-    let sid = me.to_sid_string().expect("sid string");
     let security = PipeSecurity::for_user(&me).expect("security");
     let handle = pipe::create_pipe_instance(&unique_pipe_name(), true, &security).expect("pipe");
+    assert_locked_down(&handle, &me);
+}
 
+/// Reads the security descriptor back from a live pipe instance and asserts the exact
+/// deny-NU / allow-user / medium-label policy.
+#[allow(clippy::expect_used)]
+fn assert_locked_down(handle: &NamedPipeServer, me: &Sid) {
+    let sid = me.to_sid_string().expect("sid string");
     let readback = pipe::readback_security_sddl(handle.as_handle()).expect("readback");
     let (dflags, daces, sflags, saces) = parse_sddl(&readback).expect("readback parses");
 
@@ -146,8 +154,8 @@ fn pipe_dacl_readback_from_live_handle_is_deny_nu_allow_user_me_label_only() {
     }
 }
 
-#[test]
-fn second_first_instance_is_name_in_use() {
+#[tokio::test]
+async fn second_first_instance_is_name_in_use() {
     let security = PipeSecurity::for_current_user().expect("security");
     let name = unique_pipe_name();
     let _first = pipe::create_pipe_instance(&name, true, &security).expect("first");
@@ -160,8 +168,24 @@ fn second_first_instance_is_name_in_use() {
     let _replacement = pipe::create_pipe_instance(&name, false, &security).expect("replacement");
 }
 
-#[test]
-fn pipe_instances_are_capped_at_max() {
+#[tokio::test]
+async fn replacement_instances_carry_the_same_dacl_and_byte_mode() {
+    let me = Sid::current_user().expect("me");
+    let security = PipeSecurity::for_user(&me).expect("security");
+    let name = unique_pipe_name();
+    let first = pipe::create_pipe_instance(&name, true, &security).expect("first");
+    let replacement = pipe::create_pipe_instance(&name, false, &security).expect("replacement");
+    assert_locked_down(&first, &me);
+    assert_locked_down(&replacement, &me);
+    for server in [&first, &replacement] {
+        let info = server.info().expect("pipe info");
+        assert!(matches!(info.mode, PipeMode::Byte), "byte mode expected");
+        assert!(matches!(info.end, PipeEnd::Server), "server end expected");
+    }
+}
+
+#[tokio::test]
+async fn pipe_instances_are_capped_at_max() {
     let security = PipeSecurity::for_current_user().expect("security");
     let name = unique_pipe_name();
     let mut held = vec![pipe::create_pipe_instance(&name, true, &security).expect("first")];
@@ -179,8 +203,39 @@ fn pipe_instances_are_capped_at_max() {
     );
 }
 
-#[test]
-fn pipe_rejects_names_outside_the_pipe_namespace() {
+#[tokio::test]
+async fn pipe_instance_is_tokio_server_and_roundtrips_bytes() {
+    let security = PipeSecurity::for_current_user().expect("security");
+    let name = unique_pipe_name();
+    let server: NamedPipeServer =
+        pipe::create_pipe_instance(&name, true, &security).expect("server");
+    let client = ClientOptions::new().open(&name).expect("same-user client");
+    server.connect().await.expect("connect");
+    let wrote = client
+        .async_io(Interest::WRITABLE, || client.try_write(b"ping"))
+        .await
+        .expect("client write");
+    assert_eq!(wrote, 4);
+    let mut buf = [0_u8; 4];
+    let read = server
+        .async_io(Interest::READABLE, || server.try_read(&mut buf))
+        .await
+        .expect("server read");
+    assert_eq!((read, &buf), (4, b"ping"));
+    let wrote = server
+        .async_io(Interest::WRITABLE, || server.try_write(b"pong"))
+        .await
+        .expect("server write");
+    assert_eq!(wrote, 4);
+    let read = client
+        .async_io(Interest::READABLE, || client.try_read(&mut buf))
+        .await
+        .expect("client read");
+    assert_eq!((read, &buf), (4, b"pong"));
+}
+
+#[tokio::test]
+async fn pipe_rejects_names_outside_the_pipe_namespace() {
     let security = PipeSecurity::for_current_user().expect("security");
     for bad in [
         "",
@@ -197,8 +252,8 @@ fn pipe_rejects_names_outside_the_pipe_namespace() {
     }
 }
 
-#[test]
-fn same_user_client_connects_and_pid_is_self() {
+#[tokio::test]
+async fn same_user_client_connects_and_pid_is_self() {
     let security = PipeSecurity::for_current_user().expect("security");
     let name = unique_pipe_name();
     let server = pipe::create_pipe_instance(&name, true, &security).expect("server");
