@@ -338,7 +338,7 @@ Token tree engine -> download -> worker with reasons Pause, Cancel, Shutdown, Re
 ### 4.14 Filename sanitiser (`core::naming`)
 1. `filename*` (RFC 5987) over `filename` (RFC 6266); header input capped at 4 KiB (ignored above).
 2. Keep only the final segment after splitting on `/` and `\`.
-3. Remove `<>:"/\|?*`, U+0000-U+001F, U+007F, and format/bidi controls U+200B-U+200F, U+202A-U+202E, U+2066-U+2069, U+FEFF. Removing `:` blocks ADS syntax and drive-relative paths.
+3. Remove `<>:"/\|?*`, every Cc control (U+0000-U+001F, U+007F, C1 U+0080-U+009F), and format, bidi and invisible characters: U+00AD, U+061C, U+200B-U+200F, U+2028-U+202E, U+2060-U+2064, U+2066-U+2069, U+FEFF. The set was widened in S1.1 (W2 review). Removing `:` blocks ADS syntax and drive-relative paths.
 4. Trim leading spaces and trailing dots/spaces (Win32 strips them silently, verified).
 5. Prefix `_` when the stem (before the first `.`, trailing spaces trimmed, case-insensitive) is CON, PRN, AUX, NUL, CONIN$, CONOUT$, COM0-COM9, LPT0-LPT9, or COM/LPT followed by superscript 1, 2 or 3 (U+00B9, U+00B2, U+00B3). Deliberately broader than build 26300, where only bare NUL maps to a device.
 6. Empty, `.` or `..` -> `download`.

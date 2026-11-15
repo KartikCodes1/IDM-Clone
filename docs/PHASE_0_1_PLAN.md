@@ -623,7 +623,7 @@ If the execution policy blocks scripts, record it and use `-ExecutionPolicy Bypa
 
 ### 11.1 Protocol-change requests
 
-Appendix A changes only through a serialized protocol-change request. The S0.2 review (PCR-01, PCR-02) and the W1 reviews (PCR-03, PCR-04) found the requests below. The coordinator decided each one on 2026-11-15 and applied it as an additive v1 change.
+Appendix A changes only through a serialized protocol-change request. The S0.2 review (PCR-01, PCR-02), the W1 reviews (PCR-03, PCR-04) and the W2 reviews (PCR-05) found the requests below. The coordinator decided each one on 2026-11-15 and applied it as an additive v1 change.
 
 | PCR | Conflict | Decision (applied) |
 |---|---|---|
@@ -631,6 +631,7 @@ Appendix A changes only through a serialized protocol-change request. The S0.2 r
 | PCR-02 | A path escape found after `.part` creation had no DownloadErrorCode. `invalid_destination` is response-only. | New DownloadErrorCode `path_escape`: never retried, failed. The just-created file is deleted by handle, and a `forgedm::security` event is logged. ARCHITECTURE 5.1, THREAT_MODEL FS-02 and Inv-12 use it. |
 | PCR-03 | S0.3 found three shapes that Appendix A left unspecified: the A.7 code parameters (`rate_limited{retry_at_ms}` and others) had no field in `last_error`; the `recent_events` element shape was undefined; DownloadDetail needed result-side flatten. | Additive v1, applied in A.4: optional `last_error.details{retry_at_ms?, status?, reason?, last?}`, `recent_events` elements `{at_ms, kind, message}`, and a flat DownloadDetail with flatten allowed on result types only. The serde `unknown` fallback variants on DownloadState / ErrorCode / DownloadErrorCode implement the A.1 client-tolerance rule; the agent's request validation still rejects `unknown`. Golden files in `crates/forgedm-protocol/tests/golden/v1` are canonical. |
 | PCR-04 | The platform pipe primitive could not return a tokio server, because tokio was not a platform dependency. | The coordinator added `tokio` (feature `net`) to `forgedm-platform`; the Cargo.lock diff is one line. S0.7 changes `platform::pipe::create_pipe_instance` to return a tokio `NamedPipeServer` via `ServerOptions::create_with_security_attributes_raw`, keeping all unsafe code in platform as ARCHITECTURE 3.3 requires. |
+| PCR-05 | S0.7 needed two timings that A.9 did not define. A server write to a client that never reads would hold a connection permit forever. tokio/mio close a dropped pipe handle lazily, so creating the replacement instance can briefly see ERROR_PIPE_BUSY at 17 instances (reproduced by `seventeenth_client_waits_then_served`). | Two additions to A.9: WRITE_TIMEOUT = 10 s, and a bounded replacement retry on ERROR_PIPE_BUSY only. The retry is safe because the connected instance (ours, user-only DACL) is still held, so the pipe name cannot vanish and cannot be taken over. Every other create error, and a busy state that persists past 1 s, stays fatal. The S0.7 rule "never retried without first_pipe_instance(true)" still applies to any situation where no instance of ours is held. The agent (S0.8) bounds each handler call with ENGINE_REPLY_TIMEOUT -> `busy`. |
 
 ## Appendix A. Canonical contract (protocol v1, states, codes, constants)
 
@@ -821,6 +822,8 @@ Anything not listed returns `invalid_state`. Every DB transition is a compare-an
 | | MAX_ACTIVE_CONNECTIONS / PIPE_MAX_INSTANCES | 16 / 17 |
 | | pipe in/out buffers | 64 KiB |
 | | HANDSHAKE_TIMEOUT / FRAME_BODY_TIMEOUT / IDLE_TIMEOUT | 5 s / 10 s / 60 s |
+| | WRITE_TIMEOUT (server write to a client that is not reading; PCR-05) | 10 s |
+| | REPLACEMENT_BUSY_RETRY (replacement listening instance; PCR-05) | ERROR_PIPE_BUSY only, every 5 ms, up to 1 s, while the connected instance is still held; then fatal |
 | | CLIENT_REQUEST_TIMEOUT / ENGINE_REPLY_TIMEOUT | 10 s / 5 s |
 | | PIPE_BUSY_RETRY | every 50 ms, up to 5 s |
 | | BOOTSTRAP_WAIT / STARTUP_LOCK_AND_PIPE_RETRY | 10 s / 3 s |

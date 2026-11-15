@@ -16,7 +16,14 @@ Updated 2026-11-15.
 1. **Done:** GATE 2 confirmed, commits `a47b9d5` (scaffold) and `b1e8727` (docs + specs). The user chose **one commit confirmation per wave**, with one commit per slice.
    - Reusable wave workflow script: `~/.claude/projects/C--Users-karti-Desktop-IDM-Clone/<session>/workflows/scripts/forgedm-wave-*.js`
    - It takes args `{wave, slices:[{id,title,crate,owns,refs,reviewers,notes}]}`.
-2. **W1 (running), in parallel in the main checkout:**
+2. **W1 done and committed** (`02c4656`..`6af19d5`): S0.3, S0.4 and S0.5 tested; 67 workspace tests pass. PCR-03 and PCR-04 decided.
+3. **W2 is running** with dependency ordering (the wave script's `after` field):
+   - S0.4b (pipe returns tokio server) runs alongside S0.6 storage.
+   - S0.7 IPC and S1.1 url/naming/state start after S0.4b.
+   - S1.2 range/redirect starts after S1.1.
+
+   `.gitattributes` (`* text=auto eol=lf`) is staged for the W2 commit batch.
+4. **W1 slices as originally planned (all done):**
    - S0.3 Protocol v1 (owns `crates/forgedm-protocol/**`)
    - S0.4 Platform security primitives (platform files per PLAN S0.4)
    - S0.5 Fixture baseline (`tests/fixtures/**`)

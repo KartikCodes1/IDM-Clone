@@ -131,7 +131,7 @@ Format: **ID title (severity; L/I) [scope]** then Controls / Owner / Tests / Res
 - PL controls (Phase 3, required before the browser extension ships): classify resolved addresses for DNS names using a pinned custom resolver (`ClientBuilder::dns_resolver`; `resolve()` overrides bypass it, so tests need an injectable resolver); extension-sourced requests blocked from private destinations unless the user allows the host.
 - Owner: core `url_policy` (S1.1), `http::redirect` (S1.2).
 - Tests: S1.1 `local_destination_classification`; S1.2 `redirect_public_to_local_rejected_unless_origin_local`; S1.12 `public_to_loopback_literal_rejected`.
-- Residual (Phase 1): a public DNS name resolving to a private or loopback address (incl. DNS rebinding) is not blocked; acceptable while only the local user can enqueue. With a proxy configured, destination classification is the proxy's.
+- Residual (Phase 1): a public DNS name resolving to a private or loopback address (incl. DNS rebinding) is not blocked; acceptable while only the local user can enqueue. With a proxy configured, destination classification is the proxy's. Reserved and multicast literals (224/4, 240/4, 255.255.255.255, 192.0.0.0/24, 198.18/15, IPv6 multicast) classify as `Public` in Phase 1, because `HostClass` has no variant for them (S1.1, W2). They are revisited with the Phase 3 DNS-resolved policy.
 
 **NET-07 Decompression and size bombs, header floods (HIGH; Med/Med) [P01]**
 - Controls: no reqwest compression features plus `no_gzip/no_brotli/no_deflate/no_zstd` plus `Accept-Encoding: identity`; any non-identity Content-Encoding rejected (Inv-07); `http1_max_headers(128)` bounds header count (byte-size enforcement UNVERIFIED, covered by the raw huge-header test); body never exceeds Content-Range; free-space precheck before the first write; memory bounded independent of file size.
@@ -243,7 +243,7 @@ Format: **ID title (severity; L/I) [scope]** then Controls / Owner / Tests / Res
 - Controls: original and final URLs stored only as per-value DPAPI CurrentUser blobs with entropy `"ForgeDM/v1/<column>/<download_id>"` (binds value to row and column); redacted `url_display` in plaintext; `CRYPTPROTECT_UI_FORBIDDEN`, no prompt struct, never LOCAL_MACHINE; plaintext zeroed; unseal failure -> `secrets_unavailable`; no new dependency (AES-GCM envelope rejected, C11).
 - Owner: platform `dpapi` (S0.4), agent `sealer` (S0.8), storage (S0.6).
 - Tests: S0.4 `dpapi_roundtrip_and_ciphertext_hides_plaintext`, `dpapi_tampered_blob_fails`, `dpapi_wrong_entropy_fails`; S0.6 `sealed_columns_raw_db_and_wal_bytes_lack_canary`, `wrong_row_entropy_fails`, `unseal_failure_is_typed_crypto_error`; S1.14 `secret_canary_absent`.
-- Residual: DPAPI stops other users and offline theft, not same-user malware (which can call CryptUnprotectData); an admin password reset makes values unrecoverable (handled as `secrets_unavailable`).
+- Residual: DPAPI stops other users and offline theft, not same-user malware (which can call CryptUnprotectData); an admin password reset makes values unrecoverable (handled as `secrets_unavailable`). Plaintext URLs live in agent memory for the lifetime of a download, because requests need them. Platform DPAPI buffers are zeroed, but storage does not zero caller-owned `String`s after sealing, because there is no `zeroize` dependency (accepted residual, W2 S0.6).
 
 ### 4.5 Privacy and secrets
 
