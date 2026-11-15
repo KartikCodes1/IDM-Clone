@@ -23,6 +23,7 @@ use reqwest::header::CONTENT_DISPOSITION;
 use url::Url;
 
 mod ranged;
+mod segmented;
 mod settle;
 
 use super::REASON_RESTART_FROM_ZERO;
@@ -38,6 +39,9 @@ use crate::resume::{
     Continuation, RestartReason, ResumePlan, is_resumable_mode, open_valid_part, plan_resume,
 };
 use crate::state::{Command, transition};
+use crate::transfer::prealloc::{open_part_for_segments, prepare_part_on_volume};
+use crate::transfer::segment_table::SegmentTable;
+use crate::transfer::segmented::ConnectionCap;
 use crate::transfer::single::{
     Checkpointer, PartFile, Plan, Stream, choose_name, create_part, ensure_free_space, id8,
     plan_response, probe_facts, stream_body, writer_stop,
@@ -52,6 +56,7 @@ pub(crate) struct TaskCtx {
     pub client: HttpClient,
     pub motw: Arc<MotwService>,
     pub live: Arc<LiveDownload>,
+    pub cap: Arc<ConnectionCap>,
 }
 
 /// What the first response of a plain GET produced.
@@ -143,6 +148,9 @@ impl DownloadTask {
             .flatten()
             .filter(|total| *total > 0);
         match ranged_total {
+            Some(total) if probed.result.transfer_mode == TransferMode::Segmented => {
+                self.fresh_segmented(probed, total).await
+            }
             Some(total) => self.fresh_ranged(probed, total).await,
             None => self.plain().await,
         }
@@ -163,10 +171,24 @@ impl DownloadTask {
     /// replaced or short restarts the download from zero (PCR-01, before `finalizing`).
     async fn resume(&mut self, from: Continuation) -> Result<Landed, TaskStop> {
         self.stop_check()?;
-        let (job, committed) = (self.job.clone(), from.committed);
-        let opened = tokio::task::spawn_blocking(move || open_valid_part(&job, committed))
-            .await
-            .map_err(|_| internal())?;
+        let table = if self.job.transfer_mode == Some(TransferMode::Segmented) {
+            let Some(table) = self.restore_table(&from).await? else {
+                self.restart(RestartReason::PartFileInvalid).await?;
+                return self.start_fresh().await;
+            };
+            Some(table)
+        } else {
+            None
+        };
+        let job = self.job.clone();
+        let committed = from.committed;
+        let keep_len = table.as_ref().map(SegmentTable::max_committed);
+        let opened = tokio::task::spawn_blocking(move || match keep_len {
+            Some(len) => open_part_for_segments(&job, len),
+            None => open_valid_part(&job, committed),
+        })
+        .await
+        .map_err(|_| internal())?;
         let file = match opened {
             Ok(file) => file,
             Err(err) => {
@@ -199,7 +221,13 @@ impl DownloadTask {
         self.ctx.live.set_total(Some(from.total));
         self.ctx.live.resume_from(from.committed);
         self.advance(Command::ProbeSucceeded, None).await?;
-        let final_url = self.ranged_transfer(file, &from).await?;
+        let final_url = match table {
+            Some(table) => {
+                self.segmented_transfer(file, table, from.identity.clone())
+                    .await?
+            }
+            None => self.ranged_transfer(file, &from).await?,
+        };
         Ok(Landed {
             path,
             final_url,
@@ -321,6 +349,15 @@ impl DownloadTask {
         let part = tokio::task::spawn_blocking(move || create_part(&dir, &owned_name, id))
             .await
             .map_err(|_| internal())??;
+        if plan.transfer_mode == TransferMode::Segmented {
+            let total = plan.total.unwrap_or(0);
+            if let Err(stop) = prepare_part_on_volume(&part.file, total) {
+                if let Err(err) = forgedm_platform::fs::delete_by_handle(&part.file) {
+                    tracing::warn!(error = %err, "could not delete a refused staging file");
+                }
+                return Err(stop);
+            }
+        }
         if let Err(stop) = self.save_facts(plan, final_url, name, &part).await {
             // The file's name and id were never recorded, so nothing could clean it up later.
             if let Err(err) = forgedm_platform::fs::delete_by_handle(&part.file) {

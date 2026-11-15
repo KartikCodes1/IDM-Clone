@@ -108,6 +108,9 @@ pub struct AddArgs {
     /// Do not start the agent when it is not running (exit 10 instead).
     #[arg(long)]
     pub no_start: bool,
+    /// Most connections to open for this download (1 to 16; default 8).
+    #[arg(long, value_name = "N", value_parser = clap::value_parser!(u32).range(1..=16))]
+    pub connections: Option<u32>,
 }
 
 /// `forgedm agent ...`.
@@ -178,6 +181,26 @@ mod tests {
         assert_eq!(args.url, "-");
         assert!(args.watch && args.no_start);
         assert_eq!(args.file_name.as_deref(), Some("a.bin"));
+    }
+
+    #[test]
+    fn connections_flag_takes_1_to_16_only() {
+        let parse =
+            |n: &str| Cli::try_parse_from(["forgedm", "add", "https://a/b", "--connections", n]);
+        let Command::Add(args) = parse("8").unwrap().command else {
+            unreachable!("not add");
+        };
+        assert_eq!(args.connections, Some(8));
+        assert!(parse("0").is_err());
+        assert!(parse("17").is_err());
+        assert!(parse("x").is_err());
+        let Command::Add(args) = Cli::try_parse_from(["forgedm", "add", "https://a/b"])
+            .unwrap()
+            .command
+        else {
+            unreachable!("not add");
+        };
+        assert_eq!(args.connections, None, "the agent picks the default");
     }
 
     #[test]

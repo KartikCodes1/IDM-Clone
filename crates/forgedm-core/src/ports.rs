@@ -12,6 +12,7 @@ use uuid::Uuid;
 
 use crate::clock::BoxFuture;
 use crate::error::StoreError;
+use crate::transfer::segment_table::SegmentSnapshot;
 use crate::url_policy::SecretUrl;
 
 /// Result of a store call.
@@ -108,6 +109,8 @@ pub struct StoredJob {
     pub transfer_mode: Option<TransferMode>,
     /// Identity and committed bytes from earlier runs.
     pub progress: StoredProgress,
+    /// The per-download connection cap chosen at enqueue (A.3), restored after a restart.
+    pub max_connections: u32,
 }
 
 impl std::fmt::Debug for StoredJob {
@@ -212,6 +215,25 @@ pub trait DownloadStore: Send + Sync + 'static {
     /// Persists committed progress in one commit: one segment `[0, total)` (or open-ended)
     /// with `committed` bytes durable on disk. Callers flush the file to disk first.
     fn checkpoint(&self, id: Uuid, committed: u64, total: Option<u64>) -> StoreFuture<'_, ()>;
+    /// Persists a segmented download's whole segment table in one commit (the segments are
+    /// rewritten and `bytes_committed` becomes the sum of `committed - start`). Callers
+    /// flush the file to disk first. The default refuses: a store that cannot keep segment
+    /// tables cannot run segmented downloads.
+    fn checkpoint_segments(
+        &self,
+        _id: Uuid,
+        _segments: Vec<SegmentSnapshot>,
+    ) -> StoreFuture<'_, ()> {
+        Box::pin(async {
+            Err(StoreError::Unavailable(
+                "this store cannot persist segment tables".to_owned(),
+            ))
+        })
+    }
+    /// The persisted segments of a download, ordered by start offset (empty when none).
+    fn load_segments(&self, _id: Uuid) -> StoreFuture<'_, Vec<SegmentSnapshot>> {
+        Box::pin(async { Ok(Vec::new()) })
+    }
     /// Forgets all progress and the remote identity (validators, total, staging file) in one
     /// transaction: restart from zero.
     fn reset_progress(&self, id: Uuid) -> StoreFuture<'_, ()>;

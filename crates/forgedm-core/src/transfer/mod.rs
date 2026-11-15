@@ -1,7 +1,8 @@
 //! Transfers: how a response body becomes a verified file on disk.
 //!
-//! S1.7 has one transfer, the plain single stream ([`single`]). Segmented transfer joins in
-//! S1.11.
+//! The plain single stream ([`single`]) serves small and non-ranged downloads. A ranged download
+//! of 8 MiB or more runs segmented: [`segment_table`] (who fetches what), [`worker`] (one
+//! connection), [`segmented`] (the supervisor) and [`prealloc`] (sparse files, FAT32 limit).
 
 use std::path::Path;
 
@@ -13,7 +14,11 @@ use crate::engine::StopReason;
 use crate::error::{Failure, TaskStop, stop_from_io};
 use crate::hash::{HashError, sha256_file};
 
+pub mod prealloc;
+pub mod segment_table;
+pub mod segmented;
 pub mod single;
+pub mod worker;
 
 /// The `part_file_id` bytes stored for a staged file: volume serial (little endian) then
 /// the 128-bit file id.

@@ -8,6 +8,10 @@
 //!
 //! `Flush` runs `sync_data` and answers with the written frontier; `Close` runs `sync_all`
 //! and drops the file, so no disk I/O ever happens on an async thread.
+//!
+//! A segmented download (S1.11) writes at many offsets from many workers: each worker owns a
+//! [`Coalescer`] and sends its pieces through a cloned [`WriteHandle`]. A [`WriteTracker`]
+//! lets the segment table follow every completed write and every `sync_data`.
 
 use std::fs::File;
 use std::io;
@@ -102,6 +106,21 @@ pub enum WriterError {
 
 type Reply = oneshot::Sender<Result<u64, WriteFailure>>;
 
+/// Per-segment `(segment number, offset)` pairs.
+pub type Frontier = Vec<(u32, u64)>;
+
+/// Follows the writer thread's progress. Called on the writer thread, so implementations
+/// must only take short locks and never block.
+pub trait WriteTracker: Send + Sync + 'static {
+    /// A piece `[offset, offset + len)` was written completely.
+    fn wrote(&self, offset: u64, len: u64);
+    /// A sync is about to run: the frontier it will make durable (taken before the sync so
+    /// it never overstates what is on disk).
+    fn before_sync(&self) -> Frontier;
+    /// The sync that followed [`before_sync`](Self::before_sync) succeeded.
+    fn synced(&self, frontier: &Frontier);
+}
+
 enum Msg {
     Data { offset: u64, bytes: Bytes },
     Flush(Reply),
@@ -110,14 +129,141 @@ enum Msg {
 
 type SharedFailure = Arc<Mutex<Option<WriteFailure>>>;
 
+/// The error for a writer that is gone: its recorded failure, or a generic one.
+fn stopped(failure: &SharedFailure) -> WriterError {
+    let recorded = failure
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .clone();
+    WriterError::Failed(recorded.unwrap_or(WriteFailure {
+        class: IoClass::Other,
+        kind: io::ErrorKind::BrokenPipe,
+        message: "the writer thread stopped".to_owned(),
+    }))
+}
+
+/// Gathers contiguous data into pieces of at most [`WRITE_COALESCE`] bytes.
+#[derive(Debug, Default)]
+pub struct Coalescer {
+    pending: BytesMut,
+    pending_offset: u64,
+}
+
+impl Coalescer {
+    /// An empty coalescer.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            pending: BytesMut::with_capacity(WRITE_COALESCE),
+            pending_offset: 0,
+        }
+    }
+
+    /// Buffers `data` that starts at `offset`.
+    ///
+    /// # Errors
+    /// [`WriterError::NotContiguous`] when `offset` does not continue the buffered data.
+    pub fn push(&mut self, offset: u64, data: &[u8]) -> Result<(), WriterError> {
+        let expected = self.pending_offset + self.pending.len() as u64;
+        if self.pending.is_empty() {
+            self.pending_offset = offset;
+        } else if offset != expected {
+            return Err(WriterError::NotContiguous {
+                got: offset,
+                expected,
+            });
+        }
+        self.pending.extend_from_slice(data);
+        Ok(())
+    }
+
+    /// The next complete piece, if a full [`WRITE_COALESCE`] bytes are buffered.
+    pub fn next_piece(&mut self) -> Option<(u64, Bytes)> {
+        if self.pending.len() < WRITE_COALESCE {
+            return None;
+        }
+        let piece = self.pending.split_to(WRITE_COALESCE).freeze();
+        let at = self.pending_offset;
+        self.pending_offset += WRITE_COALESCE as u64;
+        Some((at, piece))
+    }
+
+    /// Everything still buffered (a partial piece), emptying the buffer.
+    pub fn take_rest(&mut self) -> Option<(u64, Bytes)> {
+        if self.pending.is_empty() {
+            return None;
+        }
+        let at = self.pending_offset;
+        self.pending_offset += self.pending.len() as u64;
+        Some((at, self.pending.split().freeze()))
+    }
+
+    /// Bytes buffered.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.pending.len()
+    }
+
+    /// Whether nothing is buffered.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.pending.is_empty()
+    }
+}
+
+/// A cloneable sender of positioned pieces. The queue is bounded ([`WRITER_QUEUE`]), so a
+/// slow disk makes producers wait instead of buffering without limit.
+#[derive(Debug, Clone)]
+pub struct WriteHandle {
+    tx: mpsc::Sender<Msg>,
+    failure: SharedFailure,
+}
+
+/// A reserved queue slot: sending through it cannot wait or fail.
+pub struct WritePermit<'a>(mpsc::Permit<'a, Msg>);
+
+impl WritePermit<'_> {
+    /// Queues `bytes` for a positional write at `offset`.
+    pub fn send(self, offset: u64, bytes: Bytes) {
+        self.0.send(Msg::Data { offset, bytes });
+    }
+}
+
+impl WriteHandle {
+    /// Waits for a free queue slot. Cancel-safe: dropping the future queues nothing.
+    ///
+    /// # Errors
+    /// [`WriterError::Failed`] when the writer thread has stopped.
+    pub async fn reserve(&self) -> Result<WritePermit<'_>, WriterError> {
+        self.tx
+            .reserve()
+            .await
+            .map(WritePermit)
+            .map_err(|_| stopped(&self.failure))
+    }
+
+    /// Queues one piece (waiting for a slot).
+    ///
+    /// # Errors
+    /// [`WriterError::Failed`] when the writer thread has stopped.
+    pub async fn send(&self, offset: u64, bytes: Bytes) -> Result<(), WriterError> {
+        self.reserve().await?.send(offset, bytes);
+        Ok(())
+    }
+
+    /// Whether the writer thread is gone.
+    #[must_use]
+    pub fn is_closed(&self) -> bool {
+        self.tx.is_closed()
+    }
+}
+
 /// The producer's end: coalesces data and talks to the writer thread.
 #[derive(Debug)]
 pub struct Writer {
-    tx: mpsc::Sender<Msg>,
+    handle: WriteHandle,
     thread: Option<JoinHandle<()>>,
-    failure: SharedFailure,
-    pending: BytesMut,
-    pending_offset: u64,
+    coalescer: Coalescer,
 }
 
 impl Writer {
@@ -131,20 +277,47 @@ impl Writer {
         sink: impl Sink,
         written: Arc<AtomicU64>,
     ) -> Result<Self, WriterError> {
+        Self::start(name, sink, written, None)
+    }
+
+    /// As [`spawn`](Self::spawn), with a [`WriteTracker`] that sees every completed write
+    /// and every successful sync.
+    ///
+    /// # Errors
+    /// [`WriterError::Spawn`] when the OS refuses a new thread.
+    pub fn spawn_tracked(
+        name: String,
+        sink: impl Sink,
+        written: Arc<AtomicU64>,
+        tracker: Arc<dyn WriteTracker>,
+    ) -> Result<Self, WriterError> {
+        Self::start(name, sink, written, Some(tracker))
+    }
+
+    fn start(
+        name: String,
+        sink: impl Sink,
+        written: Arc<AtomicU64>,
+        tracker: Option<Arc<dyn WriteTracker>>,
+    ) -> Result<Self, WriterError> {
         let (tx, rx) = mpsc::channel(WRITER_QUEUE);
         let failure: SharedFailure = Arc::new(Mutex::new(None));
         let thread_failure = Arc::clone(&failure);
         let thread = std::thread::Builder::new()
             .name(name)
-            .spawn(move || run(sink, rx, &written, &thread_failure))
+            .spawn(move || run(sink, rx, &written, &thread_failure, tracker.as_deref()))
             .map_err(WriterError::Spawn)?;
         Ok(Self {
-            tx,
+            handle: WriteHandle { tx, failure },
             thread: Some(thread),
-            failure,
-            pending: BytesMut::with_capacity(WRITE_COALESCE),
-            pending_offset: 0,
+            coalescer: Coalescer::new(),
         })
+    }
+
+    /// A cloneable handle for producers that coalesce on their own.
+    #[must_use]
+    pub fn handle(&self) -> WriteHandle {
+        self.handle.clone()
     }
 
     /// Appends `data` at `offset`. Contiguous data is coalesced; a full piece is sent to
@@ -154,25 +327,9 @@ impl Writer {
     /// [`WriterError::Failed`] when the thread stopped, [`WriterError::NotContiguous`] when
     /// `offset` does not continue the buffered data.
     pub async fn write(&mut self, offset: u64, data: &[u8]) -> Result<(), WriterError> {
-        let expected = self.pending_offset + self.pending.len() as u64;
-        if self.pending.is_empty() {
-            self.pending_offset = offset;
-        } else if offset != expected {
-            return Err(WriterError::NotContiguous {
-                got: offset,
-                expected,
-            });
-        }
-        self.pending.extend_from_slice(data);
-        while self.pending.len() >= WRITE_COALESCE {
-            let piece = self.pending.split_to(WRITE_COALESCE).freeze();
-            let at = self.pending_offset;
-            self.pending_offset += WRITE_COALESCE as u64;
-            self.send(Msg::Data {
-                offset: at,
-                bytes: piece,
-            })
-            .await?;
+        self.coalescer.push(offset, data)?;
+        while let Some((at, piece)) = self.coalescer.next_piece() {
+            self.handle.send(at, piece).await?;
         }
         Ok(())
     }
@@ -180,7 +337,7 @@ impl Writer {
     /// Bytes accepted but not yet handed to the thread.
     #[must_use]
     pub fn buffered(&self) -> usize {
-        self.pending.len()
+        self.coalescer.len()
     }
 
     /// Sends whatever is buffered, then `sync_data`; returns the written frontier, which
@@ -211,40 +368,24 @@ impl Writer {
     }
 
     async fn send_pending(&mut self) -> Result<(), WriterError> {
-        if self.pending.is_empty() {
-            return Ok(());
+        match self.coalescer.take_rest() {
+            Some((offset, bytes)) => self.handle.send(offset, bytes).await,
+            None => Ok(()),
         }
-        let bytes = self.pending.split().freeze();
-        let offset = self.pending_offset;
-        self.send(Msg::Data { offset, bytes }).await
     }
 
     async fn round_trip(&self, make: impl FnOnce(Reply) -> Msg) -> Result<u64, WriterError> {
         let (reply, answer) = oneshot::channel();
-        self.send(make(reply)).await?;
+        self.handle
+            .tx
+            .send(make(reply))
+            .await
+            .map_err(|_| stopped(&self.handle.failure))?;
         match answer.await {
             Ok(Ok(frontier)) => Ok(frontier),
             Ok(Err(failure)) => Err(WriterError::Failed(failure)),
-            Err(_) => Err(self.stopped()),
+            Err(_) => Err(stopped(&self.handle.failure)),
         }
-    }
-
-    async fn send(&self, msg: Msg) -> Result<(), WriterError> {
-        self.tx.send(msg).await.map_err(|_| self.stopped())
-    }
-
-    /// The error for a writer that is gone: its recorded failure, or a generic one.
-    fn stopped(&self) -> WriterError {
-        let recorded = self
-            .failure
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .clone();
-        WriterError::Failed(recorded.unwrap_or(WriteFailure {
-            class: IoClass::Other,
-            kind: io::ErrorKind::BrokenPipe,
-            message: "the writer thread stopped".to_owned(),
-        }))
     }
 }
 
@@ -258,6 +399,7 @@ fn run(
     mut rx: mpsc::Receiver<Msg>,
     written: &AtomicU64,
     failure: &SharedFailure,
+    tracker: Option<&dyn WriteTracker>,
 ) {
     while let Some(msg) = rx.blocking_recv() {
         match msg {
@@ -266,16 +408,21 @@ fn run(
                     record(failure, WriteFailure::from_io(&err));
                     return;
                 }
+                if let Some(tracker) = tracker {
+                    tracker.wrote(offset, bytes.len() as u64);
+                }
             }
             Msg::Flush(reply) => {
+                let frontier = tracker.map(WriteTracker::before_sync);
                 let result = sink.sync_data();
-                if !answer(result, reply, written, failure) {
+                if !answer(result, reply, written, failure, tracker, frontier) {
                     return;
                 }
             }
             Msg::Close(reply) => {
+                let frontier = tracker.map(WriteTracker::before_sync);
                 let result = sink.sync_all();
-                answer(result, reply, written, failure);
+                answer(result, reply, written, failure, tracker, frontier);
                 return;
             }
         }
@@ -288,9 +435,14 @@ fn answer(
     reply: Reply,
     written: &AtomicU64,
     failure: &SharedFailure,
+    tracker: Option<&dyn WriteTracker>,
+    frontier: Option<Frontier>,
 ) -> bool {
     match result {
         Ok(()) => {
+            if let (Some(tracker), Some(frontier)) = (tracker, frontier.as_ref()) {
+                tracker.synced(frontier);
+            }
             let _ = reply.send(Ok(written.load(Ordering::Acquire)));
             true
         }

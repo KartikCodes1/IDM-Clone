@@ -146,11 +146,12 @@ async fn single_stream_matches_generator() {
         assert_eq!(h.store.state(id), Some(DownloadState::Completed));
         let row = h.store.row(id).unwrap();
         // S1.9: the probe finds the fixture range-capable, so a non-empty file is a ranged
-        // single stream (the plain non-resumable path is covered with `ranges=0` below).
-        let expected_mode = if size == 0 {
-            TransferMode::ZeroLength
-        } else {
-            TransferMode::SingleRanged
+        // transfer (the plain non-resumable path is covered with `ranges=0` below). S1.11:
+        // from 8 MiB on it is segmented; below, a single ranged stream.
+        let expected_mode = match size {
+            0 => TransferMode::ZeroLength,
+            s if s >= 8 * 1024 * 1024 => TransferMode::Segmented,
+            _ => TransferMode::SingleRanged,
         };
         assert_eq!(row.probe, Some((expected_mode, Some(size))));
         assert!(

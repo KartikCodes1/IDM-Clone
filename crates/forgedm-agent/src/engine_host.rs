@@ -61,6 +61,14 @@ pub trait EngineControl: Send + Sync + 'static {
     ) -> BoxFuture<'_, Result<DownloadState, AgentError>> {
         Box::pin(async { Err(AgentError::NotImplemented) })
     }
+    /// Sets the connection cap of a download (`1..=16`); returns the cap now in force.
+    fn set_max_connections(
+        &self,
+        _id: Uuid,
+        _value: u32,
+    ) -> BoxFuture<'_, Result<u32, AgentError>> {
+        Box::pin(async { Err(AgentError::NotImplemented) })
+    }
     /// Removes a download (and, on request, its recorded `.part`).
     fn remove(&self, _id: Uuid, _delete_partial: bool) -> BoxFuture<'_, Result<(), AgentError>> {
         Box::pin(async { Err(AgentError::NotImplemented) })
@@ -293,6 +301,10 @@ impl EngineControl for EngineHost {
 
     fn remove(&self, id: Uuid, delete_partial: bool) -> BoxFuture<'_, Result<(), AgentError>> {
         Box::pin(async move { Ok(self.engine.remove(id, delete_partial).await?) })
+    }
+
+    fn set_max_connections(&self, id: Uuid, value: u32) -> BoxFuture<'_, Result<u32, AgentError>> {
+        Box::pin(async move { Ok(self.engine.set_max_connections(id, value).await?) })
     }
 }
 

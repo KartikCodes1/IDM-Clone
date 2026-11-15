@@ -15,6 +15,7 @@ use forgedm_core::error::StoreError;
 use forgedm_core::ports::{
     DownloadStore, NewJob, ProbeFacts, StoreEvent, StoreFuture, StoredJob, StoredProgress, unix_ms,
 };
+use forgedm_core::transfer::segment_table::SegmentSnapshot;
 use forgedm_core::url_policy::{SecretUrl, validate_user_url};
 use forgedm_protocol::{DownloadError, DownloadState};
 use forgedm_storage::{
@@ -179,6 +180,7 @@ impl StorageStore {
             part_file_id: record.part_file_id,
             transfer_mode: record.transfer_mode,
             progress,
+            max_connections: record.max_connections,
         })
     }
 
@@ -326,6 +328,47 @@ impl DownloadStore for StorageStore {
                 .save_checkpoint(id, committed, &[segment(committed, total)])
                 .await
                 .map_err(map_error)
+        })
+    }
+
+    fn checkpoint_segments(&self, id: Uuid, segments: Vec<SegmentSnapshot>) -> StoreFuture<'_, ()> {
+        Box::pin(async move {
+            let now = unix_ms();
+            let records: Vec<SegmentRecord> = segments
+                .iter()
+                .map(|s| SegmentRecord {
+                    seg_no: s.seg_no,
+                    start: s.start,
+                    end: Some(s.end),
+                    committed: s.committed,
+                    retry_count: 0,
+                    updated_at_ms: now,
+                })
+                .collect();
+            let committed: u64 = records.iter().map(|r| r.committed - r.start).sum();
+            self.storage
+                .segments()
+                .save_checkpoint(id, committed, &records)
+                .await
+                .map_err(map_error)
+        })
+    }
+
+    fn load_segments(&self, id: Uuid) -> StoreFuture<'_, Vec<SegmentSnapshot>> {
+        Box::pin(async move {
+            let records = self.storage.segments().load(id).await.map_err(map_error)?;
+            // A record without an end is an open-ended single stream, never a segmented plan.
+            Ok(records
+                .into_iter()
+                .filter_map(|r| {
+                    r.end.map(|end| SegmentSnapshot {
+                        seg_no: r.seg_no,
+                        start: r.start,
+                        end,
+                        committed: r.committed,
+                    })
+                })
+                .collect())
         })
     }
 

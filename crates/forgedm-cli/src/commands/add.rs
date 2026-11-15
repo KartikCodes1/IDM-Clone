@@ -1,4 +1,4 @@
-//! `forgedm add <url|-> [--dir] [--file-name] [--sha256] [--watch] [--no-start]`.
+//! `forgedm add <url|-> [--dir] [--file-name] [--sha256] [--connections N] [--watch] [--no-start]`.
 //!
 //! The URL may carry a secret token, so `-` reads it from standard input and nothing here
 //! ever prints it: the agent seals it and only a redacted form comes back.
@@ -31,6 +31,7 @@ pub async fn run(target: &Target, args: AddArgs) -> Result<(), CliError> {
         .map(|dir| dir.to_string_lossy().into_owned());
     request.file_name = args.file_name;
     request.expected_sha256 = args.sha256;
+    request.max_connections = args.connections;
     let queued = match client.call(RequestBody::EnqueueUrl(request)).await? {
         ResultBody::EnqueueUrl(result) => result,
         _ => return Err(CliError::Unexpected),

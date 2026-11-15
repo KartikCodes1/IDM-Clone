@@ -17,6 +17,7 @@ use forgedm_core::ports::{
     DownloadStore, EngineEvent, EngineEventSink, NewJob, ProbeFacts, StoreEvent, StoreFuture,
     StoredJob, StoredProgress, unix_ms,
 };
+use forgedm_core::transfer::segment_table::SegmentSnapshot;
 use forgedm_protocol::{DownloadState, TransferMode};
 use tokio::sync::Notify;
 use uuid::Uuid;
@@ -32,6 +33,10 @@ pub struct Row {
     pub file_name: Option<String>,
     /// Every checkpoint written, as `(committed, total)`.
     pub checkpoints: Vec<(u64, Option<u64>)>,
+    /// The segment table last checkpointed (segmented downloads).
+    pub segments: Vec<SegmentSnapshot>,
+    /// Every segment table checkpointed, oldest first.
+    pub segment_checkpoints: Vec<Vec<SegmentSnapshot>>,
     /// Every event, oldest first.
     pub events: Vec<StoreEvent>,
     /// Every rename candidate persisted.
@@ -80,6 +85,8 @@ impl MemoryStore {
             probe: None,
             file_name: job.file_name.clone(),
             checkpoints: Vec::new(),
+            segments: Vec::new(),
+            segment_checkpoints: Vec::new(),
             events: Vec::new(),
             finalize_targets: Vec::new(),
             completion: None,
@@ -131,6 +138,7 @@ impl DownloadStore for MemoryStore {
                 part_file_id: None,
                 transfer_mode: None,
                 progress: StoredProgress::default(),
+                max_connections: new.max_connections,
             };
             self.seed(job);
             Ok(())
@@ -213,11 +221,36 @@ impl DownloadStore for MemoryStore {
         })
     }
 
+    fn checkpoint_segments(&self, id: Uuid, segments: Vec<SegmentSnapshot>) -> StoreFuture<'_, ()> {
+        Box::pin(async move {
+            let mut rows = self.rows();
+            let row = rows.get_mut(&id).ok_or(StoreError::NotFound)?;
+            let committed: u64 = segments.iter().map(|s| s.committed - s.start).sum();
+            row.checkpoints.push((committed, row.job.progress.total));
+            row.job.progress.committed = committed;
+            row.segment_checkpoints.push(segments.clone());
+            row.segments = segments;
+            Ok(())
+        })
+    }
+
+    fn load_segments(&self, id: Uuid) -> StoreFuture<'_, Vec<SegmentSnapshot>> {
+        Box::pin(async move {
+            let rows = self.rows();
+            Ok(rows
+                .get(&id)
+                .map(|r| r.segments.clone())
+                .unwrap_or_default())
+        })
+    }
+
     fn reset_progress(&self, id: Uuid) -> StoreFuture<'_, ()> {
         Box::pin(async move {
             let mut rows = self.rows();
             let row = rows.get_mut(&id).ok_or(StoreError::NotFound)?;
             row.checkpoints.clear();
+            row.segments.clear();
+            row.segment_checkpoints.clear();
             row.resets += 1;
             row.job.progress = StoredProgress::default();
             row.job.part_path = None;

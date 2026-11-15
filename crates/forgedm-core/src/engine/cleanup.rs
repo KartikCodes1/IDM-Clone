@@ -92,6 +92,7 @@ mod tests {
             part_file_id: id,
             transfer_mode: None,
             progress: StoredProgress::default(),
+            max_connections: 8,
         }
     }
 

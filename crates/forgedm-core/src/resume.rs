@@ -223,6 +223,7 @@ mod tests {
             part_file_id: part.then(|| vec![1]),
             transfer_mode: mode,
             progress,
+            max_connections: 8,
         }
     }
 

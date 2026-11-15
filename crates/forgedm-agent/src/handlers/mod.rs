@@ -2,8 +2,9 @@
 //!
 //! Served here: Handshake, Ping, GetAgentStatus, GetSnapshot, Subscribe, Unsubscribe,
 //! ListDownloads, ShutdownAgentSafely, (S1.7) EnqueueUrl and GetDownload and (S1.9) Pause,
-//! Resume, Cancel, Retry and Remove through an injected [`EngineControl`]. Without an engine
-//! they answer `not_implemented`, as do the limits actions ([`limits`]) until S1.13.
+//! Resume, Cancel, Retry and Remove through an injected [`EngineControl`], and (S1.11)
+//! `UpdateLimits` for the connection cap of one download. Without an engine
+//! they answer `not_implemented`, as do the other limits actions ([`limits`]) until S1.13.
 //!
 //! The IPC server does not cancel handlers (S0.7), so every call is bounded here by
 //! `ENGINE_REPLY_TIMEOUT` (5 s); a timeout maps to the retryable `busy` error (PCR-05).
@@ -110,7 +111,7 @@ impl AgentHandler {
             B::Remove(request) => control::remove(self, request).await,
             B::PauseAll(request) => limits::pause_all(&request),
             B::ResumeAll(request) => limits::resume_all(&request),
-            B::UpdateLimits(request) => limits::update_limits(&request),
+            B::UpdateLimits(request) => limits::update_limits(self, request).await,
             B::UpdatePriority(request) => limits::update_priority(&request),
         }
     }
@@ -359,6 +360,121 @@ mod tests {
         assert!(!conn.is_subscribed());
     }
 
+    /// An engine that only records connection caps.
+    struct CapEngine {
+        caps: std::sync::Mutex<Vec<(Uuid, u32)>>,
+    }
+
+    impl EngineControl for CapEngine {
+        fn enqueue(
+            &self,
+            _spec: crate::engine_host::EnqueueSpec,
+        ) -> forgedm_core::clock::BoxFuture<
+            '_,
+            Result<forgedm_protocol::EnqueueUrlResult, AgentError>,
+        > {
+            Box::pin(async { Err(AgentError::NotImplemented) })
+        }
+
+        fn detail(
+            &self,
+            _id: Uuid,
+        ) -> forgedm_core::clock::BoxFuture<'_, Result<forgedm_protocol::DownloadDetail, AgentError>>
+        {
+            Box::pin(async { Err(AgentError::NotImplemented) })
+        }
+
+        fn set_max_connections(
+            &self,
+            id: Uuid,
+            value: u32,
+        ) -> forgedm_core::clock::BoxFuture<'_, Result<u32, AgentError>> {
+            self.caps.lock().unwrap().push((id, value));
+            Box::pin(async move { Ok(value) })
+        }
+    }
+
+    fn limits_request(
+        scope: forgedm_protocol::LimitScope,
+    ) -> forgedm_protocol::UpdateLimitsRequest {
+        forgedm_protocol::UpdateLimitsRequest::new(scope)
+    }
+
+    #[tokio::test]
+    async fn update_limits_sets_the_connection_cap_of_one_download() {
+        let engine = Arc::new(CapEngine {
+            caps: std::sync::Mutex::new(Vec::new()),
+        });
+        let handler = handler().with_engine(engine.clone());
+        let mut conn = conn();
+        let id = Uuid::now_v7();
+        let mut request =
+            limits_request(forgedm_protocol::LimitScope::Download { download_id: id });
+        request.max_connections = Some(12);
+
+        let response = handler
+            .handle(
+                &mut conn,
+                super::Request::new(3, RequestBody::UpdateLimits(request)),
+            )
+            .await;
+
+        let ResultBody::UpdateLimits(result) = ResultBody::from_value(
+            forgedm_protocol::Action::UpdateLimits,
+            response.result().expect("a success").clone(),
+        )
+        .unwrap() else {
+            unreachable!("not an UpdateLimits result");
+        };
+        assert_eq!(result.effective.max_connections, Some(12));
+        assert_eq!(engine.caps.lock().unwrap().as_slice(), [(id, 12)]);
+    }
+
+    #[tokio::test]
+    async fn limits_that_belong_to_later_slices_are_refused_not_ignored() {
+        let engine = Arc::new(CapEngine {
+            caps: std::sync::Mutex::new(Vec::new()),
+        });
+        let handler = handler().with_engine(engine.clone());
+        let mut conn = conn();
+        let id = Uuid::now_v7();
+        let mut global = limits_request(forgedm_protocol::LimitScope::Global);
+        global.max_connections = Some(4);
+        let mut rate = limits_request(forgedm_protocol::LimitScope::Download { download_id: id });
+        rate.rate_limit_bps = Some(Some(2048));
+        for request in [global, rate] {
+            let response = handler
+                .handle(
+                    &mut conn,
+                    super::Request::new(4, RequestBody::UpdateLimits(request)),
+                )
+                .await;
+            assert_eq!(error_code(&response), ErrorCode::NotImplemented);
+        }
+        assert!(
+            engine.caps.lock().unwrap().is_empty(),
+            "nothing was applied"
+        );
+    }
+
+    #[tokio::test]
+    async fn update_limits_without_an_engine_is_not_implemented() {
+        let handler = handler();
+        let mut conn = conn();
+        let mut request = limits_request(forgedm_protocol::LimitScope::Download {
+            download_id: Uuid::nil(),
+        });
+        request.max_connections = Some(2);
+
+        let response = handler
+            .handle(
+                &mut conn,
+                super::Request::new(5, RequestBody::UpdateLimits(request)),
+            )
+            .await;
+
+        assert_eq!(error_code(&response), ErrorCode::NotImplemented);
+    }
     #[test]
     fn starting_response_is_retryable_busy() {
         let response = starting_response(&request(RequestBody::Ping(Empty {})));

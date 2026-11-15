@@ -8,8 +8,12 @@
 //!
 //! A commit therefore never exceeds the last flush, a failed `sync_data` stops the sequence
 //! before the commit, and nothing is published that is not committed.
+//!
+//! A segmented download (S1.11) checkpoints its whole segment table the same way: the writer
+//! thread records `flushed` per segment after each successful sync, and
+//! [`commit_segments`] persists every segment in one transaction before publishing.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 
 use uuid::Uuid;
 
@@ -17,6 +21,7 @@ use crate::clock::BoxFuture;
 use crate::engine::LiveDownload;
 use crate::error::{TaskStop, stop_from_store};
 use crate::ports::DownloadStore;
+use crate::transfer::segment_table::SegmentTable;
 use crate::transfer::single::{Checkpointer, writer_stop};
 use crate::writer::Writer;
 
@@ -62,4 +67,50 @@ impl Checkpointer for StoreCommitter {
                 .map_err(|e| stop_from_store(&e))
         })
     }
+}
+
+/// Commits the segment table as one checkpoint: the flushed offsets become the committed
+/// offsets of every segment in one transaction (the store rewrites the whole segment set and
+/// `bytes_committed` atomically), and only after that commit are they published on the table
+/// and on `live`. Returns the committed byte count.
+///
+/// # Errors
+/// The store's failure; nothing is published then.
+pub async fn commit_segments(
+    store: &dyn DownloadStore,
+    id: Uuid,
+    table: &Mutex<SegmentTable>,
+    live: &LiveDownload,
+) -> Result<u64, TaskStop> {
+    let view = table
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .checkpoint_view();
+    store
+        .checkpoint_segments(id, view.records.clone())
+        .await
+        .map_err(|e| stop_from_store(&e))?;
+    let committed = table
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .apply_committed(&view);
+    live.set_committed(committed);
+    Ok(committed)
+}
+
+/// Flushes `writer` (`sync_data`, which also advances the table's `flushed` offsets through
+/// the writer's tracker), then commits the table with [`commit_segments`]. A failed sync
+/// stops the sequence before the commit.
+///
+/// # Errors
+/// A writer failure or the store's failure.
+pub async fn flush_then_commit_segments(
+    writer: &mut Writer,
+    store: &dyn DownloadStore,
+    id: Uuid,
+    table: &Mutex<SegmentTable>,
+    live: &LiveDownload,
+) -> Result<u64, TaskStop> {
+    writer.flush().await.map_err(|e| writer_stop(&e))?;
+    commit_segments(store, id, table, live).await
 }

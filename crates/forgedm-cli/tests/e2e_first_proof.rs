@@ -84,6 +84,41 @@ fn range_start(range: &str) -> u64 {
         .unwrap_or_else(|| panic!("not a byte range: {range}"))
 }
 
+/// Checks that bytes `[start, start + len)` of `path` are the generator's bytes (S1.11: a
+/// segmented download commits per segment, so what is durable is a set of ranges, not a
+/// prefix).
+fn range_matches(path: &Path, seed: u64, start: u64, len: u64) {
+    use std::os::windows::fs::FileExt;
+    let file = std::fs::File::open(path).expect("open the .part");
+    let (mut pos, end) = (start, start + len);
+    let mut actual = vec![0u8; 64 * 1024];
+    let mut expected = vec![0u8; 64 * 1024];
+    while pos < end {
+        let n = usize::try_from((end - pos).min(64 * 1024)).unwrap();
+        let mut got = 0;
+        while got < n {
+            let read = file
+                .seek_read(&mut actual[got..n], pos + got as u64)
+                .expect("read the .part");
+            assert!(read > 0, "the .part ends before {end}");
+            got += read;
+        }
+        forgedm_fixture::content::fill(seed, pos, &mut expected[..n]);
+        assert_eq!(actual[..n], expected[..n], "mismatch at {pos}");
+        pos += n as u64;
+    }
+}
+
+/// `(start, committed bytes)` of every segment in a `get --json` object.
+fn committed_ranges(detail: &Value) -> Vec<(u64, u64)> {
+    detail["segments"]
+        .as_array()
+        .expect("segments")
+        .iter()
+        .map(|s| (number(s, "start"), number(s, "committed")))
+        .collect()
+}
+
 fn wait_until(what: &str, mut done: impl FnMut() -> bool) {
     let started = Instant::now();
     while !done() {
@@ -145,22 +180,31 @@ fn resume_after_agent_kill_identical_sha256() {
 
     agent.kill();
 
-    // The committed prefix of the .part matches the generator.
+    // Every committed range of the .part matches the generator.
     let part = part_file(target.path());
-    verify::prefix_matches(&part, seed, committed_before).unwrap();
+    let before_ranges = committed_ranges(&last);
+    for (start, len) in &before_ranges {
+        range_matches(&part, seed, *start, *len);
+    }
+    let requests_before_kill = fixture_log(fixture.base_url())["requests"]
+        .as_array()
+        .unwrap()
+        .len();
 
-    // Restart. The first look at the database's segment (before the new agent's own first
+    // Restart. The first look at the database's segments (before the new agent's own first
     // checkpoint, two seconds away) is what the killed agent left committed.
     let agent2 = AgentProc::start(data.path());
     agent2.wait_ready();
     let restarted = get_json(data.path(), &id);
-    let segment = &restarted["segments"][0];
-    let db_committed = number(segment, "start") + number(segment, "committed");
+    let after_ranges = committed_ranges(&restarted);
+    let db_committed: u64 = after_ranges.iter().map(|r| r.1).sum();
     assert!(
         db_committed >= committed_before,
         "commits only grow: {db_committed} < {committed_before}"
     );
-    verify::prefix_matches(&part, seed, db_committed).unwrap();
+    for (start, len) in &after_ranges {
+        range_matches(&part, seed, *start, *len);
+    }
 
     // Auto-resume finishes it.
     let mut done = restarted;
@@ -188,11 +232,25 @@ fn resume_after_agent_kill_identical_sha256() {
         "a transfer before and after the kill: {transfers:?}"
     );
     assert_eq!(range_start(transfers[0]["range"].as_str().unwrap()), 0);
-    for resumed in &transfers[1..] {
+    // The requests after the kill are the resumed ones: each starts at or after the committed
+    // offset of the segment that contains it (S1.11: segments resume independently).
+    let resumed_gets: Vec<&Value> = log["requests"].as_array().unwrap()[requests_before_kill..]
+        .iter()
+        .filter(|r| r["method"] == "GET" && r["range"].as_str() != Some("bytes=0-0"))
+        .collect();
+    assert!(!resumed_gets.is_empty(), "the restart made requests");
+    for resumed in &resumed_gets {
         let start = range_start(resumed["range"].as_str().unwrap());
+        let (seg_start, seg_committed) = after_ranges
+            .iter()
+            .rev()
+            .find(|(s, _)| *s <= start)
+            .copied()
+            .expect("a segment contains the request");
         assert!(
-            start >= committed_before,
-            "a resumed GET starts at or after the committed offset: {start} < {committed_before}"
+            start >= seg_start + seg_committed,
+            "a resumed GET starts at or after its segment's committed offset: {start} < {}",
+            seg_start + seg_committed
         );
         assert!(
             resumed["if_range"].is_string(),

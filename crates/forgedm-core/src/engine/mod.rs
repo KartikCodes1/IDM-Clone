@@ -33,6 +33,7 @@ use crate::ports::{
 };
 use crate::progress::TICK;
 use crate::state::{Command, transition};
+use crate::transfer::segmented::ConnectionCaps;
 use task::{DownloadTask, TaskCtx};
 
 /// Commands the dispatch channel holds (implementation constant, ARCHITECTURE 4.1).
@@ -129,6 +130,11 @@ enum Cmd {
         delete_partial: bool,
         reply: oneshot::Sender<Result<(), EngineError>>,
     },
+    SetMaxConnections {
+        id: Uuid,
+        value: u32,
+        reply: oneshot::Sender<Result<u32, EngineError>>,
+    },
     Shutdown {
         reply: oneshot::Sender<()>,
     },
@@ -208,6 +214,19 @@ impl EngineHandle {
         self.call(cmd, answer).await?
     }
 
+    /// Sets the connection cap of download `id` (`1..=16`, clamped), live: a running
+    /// segmented download opens or retires connections within a quarter of a second, and a
+    /// queued one starts with it. Returns the cap now in force.
+    ///
+    /// # Errors
+    /// [`EngineError::NotFound`] for an unknown download, plus the errors of
+    /// [`enqueue`](Self::enqueue).
+    pub async fn set_max_connections(&self, id: Uuid, value: u32) -> Result<u32, EngineError> {
+        let (reply, answer) = oneshot::channel();
+        let cmd = Cmd::SetMaxConnections { id, value, reply };
+        self.call(cmd, answer).await?
+    }
+
     /// Asks a running download to stop and become `cancelled` (the `.part` is kept).
     /// Returns whether `id` was running. [`control`](Self::control) is the checked,
     /// serialized form.
@@ -270,6 +289,7 @@ pub fn start(config: EngineConfig, deps: EngineDeps) -> EngineHandle {
         tracker: TaskTracker::new(),
         finished_tx,
         closing: false,
+        caps: Arc::new(ConnectionCaps::default()),
     };
     tokio::spawn(actor.run(rx, finished_rx, ticker));
     EngineHandle {
@@ -305,6 +325,7 @@ struct Actor {
     tracker: TaskTracker,
     finished_tx: mpsc::UnboundedSender<Uuid>,
     closing: bool,
+    caps: Arc<ConnectionCaps>,
 }
 
 impl Actor {
@@ -354,7 +375,15 @@ impl Actor {
                 delete_partial,
                 reply,
             } => {
-                let _ = reply.send(self.remove(id, delete_partial).await);
+                let result = self.remove(id, delete_partial).await;
+                if result.is_ok() {
+                    self.caps.forget(id);
+                }
+                let _ = reply.send(result);
+                false
+            }
+            Cmd::SetMaxConnections { id, value, reply } => {
+                let _ = reply.send(self.set_max_connections(id, value).await);
                 false
             }
             Cmd::Shutdown { reply } => {
@@ -386,7 +415,9 @@ impl Actor {
             part_file_id: None,
             transfer_mode: None,
             progress: StoredProgress::default(),
+            max_connections: new.max_connections,
         };
+        self.caps.set(new.id, new.max_connections);
         let enqueued = Enqueued {
             id: new.id,
             state: DownloadState::Queued,
@@ -448,6 +479,20 @@ impl Actor {
         Some(job)
     }
 
+    /// Applies a new connection cap to download `id`.
+    async fn set_max_connections(&mut self, id: Uuid, value: u32) -> Result<u32, EngineError> {
+        if self.closing {
+            return Err(EngineError::ShuttingDown);
+        }
+        self.deps
+            .store
+            .load(id)
+            .await?
+            .ok_or(EngineError::NotFound)?;
+        self.caps.set(id, value);
+        Ok(self.caps.cap_for(id, value).get())
+    }
+
     /// Starts queued downloads while slots are free.
     async fn admit(&mut self) {
         while !self.closing && self.active < self.config.max_active {
@@ -469,6 +514,7 @@ impl Actor {
             client: self.deps.client.clone(),
             motw: Arc::clone(&self.deps.motw),
             live: Arc::clone(&live),
+            cap: self.caps.cap_for(id, job.max_connections),
         };
         let supervisor = Supervisor {
             store: Arc::clone(&self.deps.store),
