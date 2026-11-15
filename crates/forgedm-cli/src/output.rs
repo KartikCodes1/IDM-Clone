@@ -8,7 +8,10 @@
 
 use std::io::Write;
 
-use forgedm_protocol::{AgentStatusInfo, DownloadSummary, HandshakeResult};
+use forgedm_protocol::{
+    AgentStatusInfo, DownloadDetail, DownloadState, DownloadSummary, HandshakeResult, ProgressItem,
+};
+use uuid::Uuid;
 
 /// Prints one line to standard output.
 pub fn line(text: &str) {
@@ -108,6 +111,117 @@ fn enum_text(value: Result<serde_json::Value, serde_json::Error>) -> String {
         .unwrap_or_else(|| "unknown".to_owned())
 }
 
+/// Bytes per KiB, MiB and GiB.
+const KIB: u64 = 1024;
+const MIB: u64 = KIB * 1024;
+const GIB: u64 = MIB * 1024;
+
+/// `1.43 MiB`, `812 B`: two decimals above 1 KiB, integer arithmetic only.
+pub fn format_bytes(bytes: u64) -> String {
+    let (unit, name) = match bytes {
+        b if b >= GIB => (GIB, "GiB"),
+        b if b >= MIB => (MIB, "MiB"),
+        b if b >= KIB => (KIB, "KiB"),
+        _ => return format!("{bytes} B"),
+    };
+    let whole = bytes / unit;
+    let hundredths = u128::from(bytes % unit) * 100 / u128::from(unit);
+    format!("{whole}.{hundredths:02} {name}")
+}
+
+/// `1.43 MiB/s`, or `-- B/s` while the speed is unknown.
+pub fn format_speed(bytes_per_second: Option<u64>) -> String {
+    bytes_per_second.map_or_else(
+        || "-- B/s".to_owned(),
+        |bps| format!("{}/s", format_bytes(bps)),
+    )
+}
+
+/// `ETA 1m05s`, `ETA 12s`, or `ETA --` while it is unknown.
+pub fn format_eta(eta_ms: Option<u64>) -> String {
+    let Some(ms) = eta_ms else {
+        return "ETA --".to_owned();
+    };
+    let seconds = ms.div_ceil(1000);
+    match (seconds / 3600, seconds / 60 % 60, seconds % 60) {
+        (0, 0, s) => format!("ETA {s}s"),
+        (0, m, s) => format!("ETA {m}m{s:02}s"),
+        (h, m, s) => format!("ETA {h}h{m:02}m{s:02}s"),
+    }
+}
+
+/// The progress line shown while a download runs: true bytes against the real total, speed
+/// and ETA. Unknown totals show no percentage.
+pub fn progress_line(item: &ProgressItem) -> String {
+    let speed = format_speed(item.speed_bps);
+    let eta = format_eta(item.eta_ms);
+    match item.total_bytes.filter(|total| *total > 0) {
+        Some(total) => {
+            let percent = u128::from(item.accepted_bytes) * 100 / u128::from(total);
+            format!(
+                "downloading {} / {} ({percent}%)  {speed}  {eta}",
+                format_bytes(item.accepted_bytes),
+                format_bytes(total)
+            )
+        }
+        None => format!(
+            "downloading {}  {speed}  {eta}",
+            format_bytes(item.accepted_bytes)
+        ),
+    }
+}
+
+/// Prints the download id and name right after `add`.
+pub fn added(id: Uuid, file_name: &str) {
+    line(&format!("added {id} {}", sanitize_for_terminal(file_name)));
+}
+
+/// Prints a state change while watching.
+pub fn state_change(state: DownloadState) {
+    line(&format!("-> {}", enum_text(serde_json::to_value(state))));
+}
+
+/// Prints a progress line.
+pub fn progress(item: &ProgressItem) {
+    line(&progress_line(item));
+}
+
+/// Notes that an interrupted download starts over (it cannot resume).
+pub fn restarting_from_zero() {
+    line("interrupted earlier; this download cannot resume, so it restarts from 0");
+}
+
+/// Prints the result of a completed download: where it is and its verified digest.
+pub fn completed(detail: &DownloadDetail) {
+    let summary = &detail.summary;
+    line(&format!(
+        "completed {}",
+        sanitize_for_terminal(summary.final_path.as_deref().unwrap_or("(unknown path)"))
+    ));
+    if let Some(sha) = &detail.checksum.actual {
+        line(&format!("sha256 {}", sanitize_for_terminal(sha)));
+    }
+    if detail.length_verified == Some(false) {
+        line("note: the server declared no length, so completeness is not proven by size");
+    }
+}
+
+/// The text describing how a watched download ended badly.
+pub fn ending_text(summary: &DownloadSummary) -> String {
+    let state = enum_text(serde_json::to_value(summary.state));
+    match &summary.last_error {
+        Some(error) => format!(
+            "{state} ({}): {}",
+            enum_text(serde_json::to_value(error.code)),
+            sanitize_for_terminal(&error.message)
+        ),
+        None => match summary.state_reason.as_deref() {
+            Some(reason) => format!("{state} ({})", sanitize_for_terminal(reason)),
+            None => state,
+        },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -126,5 +240,52 @@ mod tests {
             sanitize_for_terminal("\u{FC}ber 日本.zip"),
             "\u{FC}ber 日本.zip"
         );
+    }
+    #[test]
+    fn bytes_use_binary_units_with_two_decimals() {
+        assert_eq!(format_bytes(0), "0 B");
+        assert_eq!(format_bytes(1023), "1023 B");
+        assert_eq!(format_bytes(1024), "1.00 KiB");
+        assert_eq!(format_bytes(3_000_000), "2.86 MiB");
+        assert_eq!(
+            format_bytes(5 * 1024 * 1024 * 1024 + 512 * 1024 * 1024),
+            "5.50 GiB"
+        );
+        assert_eq!(format_bytes(u64::MAX), "17179869183.99 GiB");
+    }
+
+    #[test]
+    fn speed_and_eta_cover_known_and_unknown_values() {
+        assert_eq!(format_speed(Some(1_500_000)), "1.43 MiB/s");
+        assert_eq!(format_speed(None), "-- B/s");
+        assert_eq!(format_eta(None), "ETA --");
+        assert_eq!(format_eta(Some(12_000)), "ETA 12s");
+        assert_eq!(format_eta(Some(12_001)), "ETA 13s");
+        assert_eq!(format_eta(Some(65_000)), "ETA 1m05s");
+        assert_eq!(format_eta(Some(3_725_000)), "ETA 1h02m05s");
+    }
+
+    #[test]
+    fn progress_lines_show_percentage_only_for_a_known_total() {
+        let mut item = ProgressItem {
+            id: Uuid::nil(),
+            accepted_bytes: 1_500_000,
+            committed_bytes: 1_000_000,
+            total_bytes: Some(3_000_000),
+            speed_bps: Some(1_500_000),
+            eta_ms: Some(1_000),
+            active_connections: 1,
+        };
+        assert_eq!(
+            progress_line(&item),
+            "downloading 1.43 MiB / 2.86 MiB (50%)  1.43 MiB/s  ETA 1s"
+        );
+        item.total_bytes = None;
+        assert_eq!(
+            progress_line(&item),
+            "downloading 1.43 MiB  1.43 MiB/s  ETA 1s"
+        );
+        item.total_bytes = Some(0);
+        assert!(!progress_line(&item).contains('%'));
     }
 }

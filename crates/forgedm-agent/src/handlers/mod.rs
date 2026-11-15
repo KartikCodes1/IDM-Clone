@@ -1,9 +1,9 @@
 //! The agent's request handler (PHASE_0_1_PLAN S0.8).
 //!
 //! Served here: Handshake, Ping, GetAgentStatus, GetSnapshot, Subscribe, Unsubscribe,
-//! ListDownloads, ShutdownAgentSafely. EnqueueUrl and GetDownload ([`enqueue`]), the control
-//! actions ([`control`]) and the limits actions ([`limits`]) answer `not_implemented` until
-//! S1.7, S1.9 and S1.13 fill them in.
+//! ListDownloads, ShutdownAgentSafely, and (S1.7) EnqueueUrl and GetDownload through an
+//! injected [`EngineControl`]. Without an engine they answer `not_implemented`, as do the
+//! control actions ([`control`]) and the limits actions ([`limits`]) until S1.9 and S1.13.
 //!
 //! The IPC server does not cancel handlers (S0.7), so every call is bounded here by
 //! `ENGINE_REPLY_TIMEOUT` (5 s); a timeout maps to the retryable `busy` error (PCR-05).
@@ -14,6 +14,7 @@ mod lifecycle;
 mod limits;
 mod query;
 
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use forgedm_ipc::{Connection, HandlerFuture, RequestHandler};
@@ -21,6 +22,7 @@ use forgedm_protocol::{ErrorBody, ErrorCode, Request, RequestBody, Response, Res
 use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 
+use crate::engine_host::EngineControl;
 use crate::error::AgentError;
 use crate::events_hub::HubHandle;
 
@@ -28,12 +30,20 @@ use crate::events_hub::HubHandle;
 pub const ENGINE_REPLY_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Answers requests from pipe clients.
-#[derive(Debug)]
 pub struct AgentHandler {
     hub: HubHandle,
     shutdown: CancellationToken,
     started: Instant,
     reply_timeout: Duration,
+    engine: Option<Arc<dyn EngineControl>>,
+}
+
+impl std::fmt::Debug for AgentHandler {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AgentHandler")
+            .field("engine", &self.engine.is_some())
+            .finish_non_exhaustive()
+    }
 }
 
 impl AgentHandler {
@@ -46,7 +56,22 @@ impl AgentHandler {
             shutdown,
             started,
             reply_timeout: ENGINE_REPLY_TIMEOUT,
+            engine: None,
         }
+    }
+
+    /// Serves EnqueueUrl and GetDownload through `engine`.
+    #[must_use]
+    pub fn with_engine(self, engine: Arc<dyn EngineControl>) -> Self {
+        Self {
+            engine: Some(engine),
+            ..self
+        }
+    }
+
+    /// The engine, or `not_implemented` for an engine-less handler.
+    fn engine(&self) -> Result<&Arc<dyn EngineControl>, AgentError> {
+        self.engine.as_ref().ok_or(AgentError::NotImplemented)
     }
 
     /// Overrides the reply bound (tests).
@@ -76,8 +101,8 @@ impl AgentHandler {
             B::ListDownloads(request) => query::list(self, request).await,
             B::Subscribe(request) => query::subscribe(self, conn, request).await,
             B::Unsubscribe(_) => query::unsubscribe(conn),
-            B::EnqueueUrl(request) => enqueue::enqueue_url(&request),
-            B::GetDownload(request) => enqueue::get_download(&request),
+            B::EnqueueUrl(request) => enqueue::enqueue_url(self, conn, request).await,
+            B::GetDownload(request) => query::get_download(self, request).await,
             B::Pause(request) => control::pause(&request),
             B::Resume(request) => control::resume(&request),
             B::Cancel(request) => control::cancel(&request),
@@ -245,7 +270,7 @@ mod tests {
         .unwrap() else {
             unreachable!("not a handshake result");
         };
-        assert_eq!(result.capabilities, ["subscribe_replay"]);
+        assert_eq!(result.capabilities, ["subscribe_replay", "checksum_sha256"]);
         assert_eq!(result.agent_instance_id, handler.hub.instance_id());
         assert_eq!(result.agent_pid, std::process::id());
         assert_eq!((result.protocol_version, result.protocol_minor), (1, 0));

@@ -2,7 +2,7 @@
 
 use std::path::{Path, PathBuf};
 
-use forgedm_ipc::{Client, ClientConfig, IpcError, pipe_name_for};
+use forgedm_ipc::{Client, ClientConfig, IpcError, ensure_agent, pipe_name_for};
 use forgedm_protocol::{ClientKind, HandshakeResult};
 
 use crate::error::CliError;
@@ -17,6 +17,7 @@ const CLIENT_NAME: &str = "forgedm-cli";
 pub struct Target {
     pipe_name: String,
     expected_agent: PathBuf,
+    data_dir: Option<PathBuf>,
 }
 
 impl Target {
@@ -35,6 +36,7 @@ impl Target {
         Ok(Self {
             pipe_name,
             expected_agent: sibling_agent(&exe),
+            data_dir: data_dir.map(Path::to_path_buf),
         })
     }
 
@@ -45,7 +47,23 @@ impl Target {
     /// or another transport error.
     pub async fn connect(&self) -> Result<(Client, HandshakeResult), CliError> {
         let config = ClientConfig::new(self.pipe_name.clone(), self.expected_agent.clone());
-        let mut client = Client::connect(config).await?;
+        let client = Client::connect(config).await?;
+        Self::hello(client).await
+    }
+
+    /// Connects, starting the agent first when it is not running (`ensure_agent`, ADR-005),
+    /// verifies the server and handshakes. The agent started is only ever the sibling
+    /// `forgedm-agent.exe`.
+    ///
+    /// # Errors
+    /// [`CliError::Bootstrap`] (exit 15) when the agent cannot be started or does not come
+    /// up in time; connection failures keep their own mapping.
+    pub async fn connect_or_start(&self) -> Result<(Client, HandshakeResult), CliError> {
+        let client = ensure_agent(&self.expected_agent, self.data_dir.as_deref()).await?;
+        Self::hello(client).await
+    }
+
+    async fn hello(mut client: Client) -> Result<(Client, HandshakeResult), CliError> {
         let hello = client
             .handshake(ClientKind::Cli, CLIENT_NAME, env!("CARGO_PKG_VERSION"))
             .await?;

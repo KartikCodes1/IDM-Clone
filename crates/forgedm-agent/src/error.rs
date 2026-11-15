@@ -4,9 +4,12 @@
 //! handler fails with; [`AgentError::to_wire`] is the only place internal failures become
 //! wire error codes. Internal details are logged with a correlation id, never sent.
 
+use forgedm_core::error::EngineError;
 use forgedm_ipc::IpcError;
 use forgedm_platform::PlatformError;
-use forgedm_protocol::{ErrorBody, ErrorCode, ErrorDetails};
+use forgedm_protocol::{
+    ErrorBody, ErrorCode, ErrorDetails, InvalidDestinationReason, InvalidUrlReason,
+};
 use forgedm_storage::StorageError;
 use uuid::Uuid;
 
@@ -90,9 +93,27 @@ pub enum AgentError {
     /// The agent is shutting down and refuses new mutating work.
     #[error("agent is shutting down")]
     ShuttingDown,
-    /// No reply from the state hub in time.
+    /// No reply from the state hub or the engine in time, or the engine channel is full.
     #[error("agent is busy")]
     Busy,
+    /// The queue holds the maximum number of downloads.
+    #[error("the download queue is full")]
+    LimitExceeded,
+    /// The URL was rejected.
+    #[error("url rejected: {}", .0.as_str())]
+    InvalidUrl(InvalidUrlReason),
+    /// The destination directory was rejected.
+    #[error("destination rejected: {}", .0.as_str())]
+    InvalidDestination(InvalidDestinationReason),
+    /// The requested file name is unusable.
+    #[error("file name rejected")]
+    InvalidFileName,
+    /// The expected checksum is not 64 hex characters.
+    #[error("checksum rejected")]
+    InvalidChecksum,
+    /// A field is not supported yet (it belongs to a later slice).
+    #[error("{0} is not supported yet")]
+    Unsupported(&'static str),
     /// The client's subscription position cannot be served; it must resynchronise.
     #[error("resynchronisation required: {0}")]
     ResyncRequired(&'static str),
@@ -102,9 +123,23 @@ pub enum AgentError {
     /// A database failure.
     #[error("storage error")]
     Storage(#[from] StorageError),
+    /// The engine's persistence failed.
+    #[error("engine storage error")]
+    Engine(#[from] forgedm_core::error::StoreError),
     /// A response could not be built.
     #[error("response encoding failed: {0}")]
     Encode(#[from] serde_json::Error),
+}
+
+impl From<EngineError> for AgentError {
+    fn from(err: EngineError) -> Self {
+        match err {
+            EngineError::Busy => Self::Busy,
+            EngineError::ShuttingDown => Self::ShuttingDown,
+            EngineError::LimitExceeded => Self::LimitExceeded,
+            EngineError::Store(store) => Self::Engine(store),
+        }
+    }
 }
 
 impl AgentError {
@@ -116,6 +151,18 @@ impl AgentError {
             Self::NotImplemented => ErrorBody::new(ErrorCode::NotImplemented),
             Self::ShuttingDown => ErrorBody::new(ErrorCode::ShuttingDown),
             Self::Busy => ErrorBody::new(ErrorCode::Busy),
+            Self::LimitExceeded => ErrorBody::new(ErrorCode::LimitExceeded),
+            Self::InvalidUrl(reason) => ErrorBody::invalid_url(*reason),
+            Self::InvalidDestination(reason) => ErrorBody::invalid_destination(*reason),
+            Self::InvalidFileName => ErrorBody::new(ErrorCode::InvalidFileName),
+            Self::InvalidChecksum => ErrorBody::new(ErrorCode::InvalidChecksum),
+            Self::Unsupported(field) => {
+                ErrorBody::new(ErrorCode::NotImplemented).with_details(ErrorDetails {
+                    field: Some((*field).to_owned()),
+                    reason: Some("not_supported_yet".to_owned()),
+                    ..ErrorDetails::default()
+                })
+            }
             Self::ResyncRequired(reason) => {
                 ErrorBody::new(ErrorCode::ResyncRequired).with_details(ErrorDetails {
                     reason: Some((*reason).to_owned()),
@@ -124,6 +171,7 @@ impl AgentError {
             }
             Self::Storage(err) => storage_to_wire(err),
             Self::HubGone(_) | Self::Encode(_) => self.internal(),
+            Self::Engine(err) => engine_store_to_wire(err),
         }
     }
 
@@ -134,6 +182,25 @@ impl AgentError {
             reason: Some(format!("correlation_id={correlation}")),
             ..ErrorDetails::default()
         })
+    }
+}
+
+fn engine_store_to_wire(err: &forgedm_core::error::StoreError) -> ErrorBody {
+    use forgedm_core::error::StoreError;
+    match err {
+        StoreError::NotFound => ErrorBody::new(ErrorCode::NotFound),
+        StoreError::Unavailable(_) => {
+            tracing::error!(error = %err, "storage unavailable while handling a request");
+            ErrorBody::new(ErrorCode::StorageUnavailable)
+        }
+        StoreError::Conflict { .. } | StoreError::SecretsUnavailable => {
+            let correlation = Uuid::now_v7();
+            tracing::error!(%correlation, error = %err, "engine storage error");
+            ErrorBody::new(ErrorCode::Internal).with_details(ErrorDetails {
+                reason: Some(format!("correlation_id={correlation}")),
+                ..ErrorDetails::default()
+            })
+        }
     }
 }
 

@@ -2,7 +2,8 @@
 
 use std::path::PathBuf;
 
-use clap::{Parser, Subcommand};
+use clap::{Args, Parser, Subcommand};
+use uuid::Uuid;
 
 /// ForgeDM command-line client.
 #[derive(Debug, Parser)]
@@ -17,9 +18,16 @@ pub struct Cli {
     pub command: Command,
 }
 
-/// Top-level commands. `add` and `watch` arrive with S1.7.
+/// Top-level commands.
 #[derive(Debug, Subcommand)]
 pub enum Command {
+    /// Add a download (starting the agent when it is not running) and optionally follow it.
+    Add(AddArgs),
+    /// Follow a download until it ends: bytes, speed and ETA, then the result.
+    Watch {
+        /// The download id printed by `add` or `list`.
+        id: Uuid,
+    },
     /// Show the agent's status without starting it.
     Status,
     /// List downloads.
@@ -31,6 +39,29 @@ pub enum Command {
     /// Control the background agent.
     #[command(subcommand)]
     Agent(AgentCommand),
+}
+
+/// `forgedm add <url|-> ...`.
+#[derive(Debug, Args)]
+pub struct AddArgs {
+    /// The URL to download, or `-` to read it from standard input (keeps a token-bearing
+    /// URL out of the process list and shell history).
+    pub url: String,
+    /// Destination directory (default: the Downloads folder).
+    #[arg(long, value_name = "DIR", value_parser = absolute_from_cwd)]
+    pub dir: Option<PathBuf>,
+    /// File name to use instead of the server's.
+    #[arg(long, value_name = "NAME")]
+    pub file_name: Option<String>,
+    /// Expected SHA-256 (64 hex characters); a mismatch fails the download.
+    #[arg(long, value_name = "HEX", value_parser = sha256_hex)]
+    pub sha256: Option<String>,
+    /// Follow the download until it ends; exit 13 if it fails or is cancelled.
+    #[arg(long)]
+    pub watch: bool,
+    /// Do not start the agent when it is not running (exit 10 instead).
+    #[arg(long)]
+    pub no_start: bool,
 }
 
 /// `forgedm agent ...`.
@@ -47,5 +78,67 @@ fn absolute_path(raw: &str) -> Result<PathBuf, String> {
         Ok(path)
     } else {
         Err("the data directory must be an absolute path".to_owned())
+    }
+}
+
+/// Resolves a relative `--dir` against the current directory, so the agent always gets an
+/// absolute path.
+fn absolute_from_cwd(raw: &str) -> Result<PathBuf, String> {
+    std::path::absolute(raw).map_err(|err| format!("cannot resolve the directory: {err}"))
+}
+
+/// Accepts exactly 64 hex digits and normalises them to lowercase.
+fn sha256_hex(raw: &str) -> Result<String, String> {
+    if raw.len() == 64 && raw.bytes().all(|b| b.is_ascii_hexdigit()) {
+        Ok(raw.to_ascii_lowercase())
+    } else {
+        Err("expected 64 hexadecimal characters".to_owned())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sha256_is_validated_and_lowercased() {
+        assert_eq!(sha256_hex(&"AB".repeat(32)).unwrap(), "ab".repeat(32));
+        assert!(sha256_hex("abc").is_err());
+        assert!(sha256_hex(&"g".repeat(64)).is_err());
+    }
+
+    #[test]
+    fn a_relative_directory_becomes_absolute() {
+        assert!(absolute_from_cwd("downloads").unwrap().is_absolute());
+    }
+
+    #[test]
+    fn add_parses_every_flag() {
+        let cli = Cli::try_parse_from([
+            "forgedm",
+            "add",
+            "-",
+            "--dir",
+            r"C:\d",
+            "--file-name",
+            "a.bin",
+            "--watch",
+            "--no-start",
+        ])
+        .unwrap();
+        let Command::Add(args) = cli.command else {
+            unreachable!("not add");
+        };
+        assert_eq!(args.url, "-");
+        assert!(args.watch && args.no_start);
+        assert_eq!(args.file_name.as_deref(), Some("a.bin"));
+    }
+
+    #[test]
+    fn watch_takes_a_download_id() {
+        let id = Uuid::nil().to_string();
+        let cli = Cli::try_parse_from(["forgedm", "watch", &id]).unwrap();
+        assert!(matches!(cli.command, Command::Watch { .. }));
+        assert!(Cli::try_parse_from(["forgedm", "watch", "not-a-uuid"]).is_err());
     }
 }

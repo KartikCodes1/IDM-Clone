@@ -1,6 +1,7 @@
 //! ForgeDM command-line client (`forgedm`).
 //!
-//! Commands: `status`, `list [--json]`, `agent stop`, with a global `--data-dir`.
+//! Commands: `add`, `watch`, `status`, `list [--json]`, `agent stop`, with a global
+//! `--data-dir`.
 //! Exit codes follow PHASE_0_1_PLAN Appendix A.8 (see [`error::CliError::exit_code`]).
 
 #![forbid(unsafe_code)]
@@ -52,6 +53,8 @@ fn main() -> ExitCode {
 async fn run(cli: Cli) -> Result<(), error::CliError> {
     let target = client::Target::resolve(cli.data_dir.as_deref())?;
     match cli.command {
+        Command::Add(args) => commands::add::run(&target, args).await,
+        Command::Watch { id } => commands::watch::run(&target, id).await,
         Command::Status => commands::status::run(&target).await,
         Command::List { json } => commands::list::run(&target, json).await,
         Command::Agent(action) => commands::agent::run(&target, action).await,

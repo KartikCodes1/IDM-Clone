@@ -16,9 +16,9 @@ use forgedm_ipc::IpcError;
 use forgedm_platform::instance_lock::InstanceLock;
 use forgedm_platform::pipe::{PipeSecurity, create_pipe_instance};
 use forgedm_protocol::{
-    AgentState, DownloadIdRequest, Empty, EnqueueUrlRequest, ErrorCode, LimitScope,
-    ListDownloadsRequest, PauseAllRequest, PauseRequest, Priority, ProxySource, RemoveRequest,
-    RequestBody, ResultBody, RetryRequest, UpdateLimitsRequest, UpdatePriorityRequest,
+    AgentState, DownloadIdRequest, Empty, ErrorCode, LimitScope, ListDownloadsRequest,
+    PauseAllRequest, PauseRequest, Priority, ProxySource, RemoveRequest, RequestBody, ResultBody,
+    RetryRequest, UpdateLimitsRequest, UpdatePriorityRequest,
 };
 use support::{AgentProc, WAIT, log_files};
 use tempfile::TempDir;
@@ -249,9 +249,8 @@ async fn unimplemented_actions_return_not_implemented() {
     let agent = AgentProc::start(dir.path(), &[]);
     let (mut client, _) = agent.connect().await;
     let id = Uuid::nil();
+    // EnqueueUrl and GetDownload are served since S1.7 (see tests/enqueue_e2e.rs).
     let requests = vec![
-        RequestBody::EnqueueUrl(EnqueueUrlRequest::new("https://example.com/f.bin")),
-        RequestBody::GetDownload(DownloadIdRequest { download_id: id }),
         RequestBody::Pause(PauseRequest {
             download_id: id,
             discard_progress: false,

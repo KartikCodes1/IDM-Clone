@@ -7,19 +7,21 @@
 //! and its `Subscribe` can be lost.
 //!
 //! The hub persists nothing. The engine publishes a change only after it is committed; the
-//! hub then assigns the next `seq`. This slice has no engine, so [`HubHandle::publish`] is
-//! driven by tests and, later, by the S1.7 engine.
+//! hub then assigns the next `seq`. While any download is in flight the hub also publishes
+//! `AgentStatus` every [`STATUS_INTERVAL`] (A.5), and folds each `ProgressSnapshot` into the
+//! summaries so lists and the status always show true bytes and speed.
 
 use std::collections::{HashMap, VecDeque};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use forgedm_ipc::{EventSink, OUTBOUND_QUEUE};
 use forgedm_protocol::{
     AgentState, AgentStatusInfo, DownloadState, DownloadSummary, Event, EventBody,
-    ListDownloadsResult, ProxySource, ResyncReason, SNAPSHOT_MAX, SnapshotResult, SubscribeRequest,
-    SubscribeResult,
+    ListDownloadsResult, ProgressSnapshotData, ProxySource, ResyncReason, SNAPSHOT_MAX,
+    SnapshotResult, SubscribeRequest, SubscribeResult,
 };
 use tokio::sync::{mpsc, oneshot};
+use tokio::time::{MissedTickBehavior, interval};
 use uuid::Uuid;
 
 use crate::summary::holds_active_slot;
@@ -28,6 +30,9 @@ use crate::summary::holds_active_slot;
 pub const EVENT_RING: usize = 1024;
 /// Capacity of the engine-to-hub channel (A.9 `ENGINE_TO_HUB`).
 pub const ENGINE_TO_HUB: usize = 1024;
+
+/// How often `AgentStatus` is published while downloads are in flight (A.5).
+pub const STATUS_INTERVAL: Duration = Duration::from_secs(1);
 
 /// The hub stopped; nothing more can be published or asked.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
@@ -214,6 +219,12 @@ pub fn spawn(init: HubInit, initial: Vec<DownloadSummary>) -> HubHandle {
     handle
 }
 
+/// States in which a download is working (the slot holders plus verifying and finalizing).
+const fn in_flight(state: DownloadState) -> bool {
+    holds_active_slot(state)
+        || matches!(state, DownloadState::Verifying | DownloadState::Finalizing)
+}
+
 struct StateHub {
     init: HubInit,
     state: AgentState,
@@ -236,8 +247,25 @@ impl StateHub {
     }
 
     async fn run(mut self, mut rx: mpsc::Receiver<Msg>) {
-        while let Some(msg) = rx.recv().await {
-            self.handle(msg);
+        let mut status_tick = interval(STATUS_INTERVAL);
+        // A stalled hub must not answer with a burst of catch-up statuses.
+        status_tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        status_tick.tick().await;
+        loop {
+            tokio::select! {
+                msg = rx.recv() => match msg {
+                    Some(msg) => self.handle(msg),
+                    None => break,
+                },
+                _ = status_tick.tick() => self.publish_status_if_busy(),
+            }
+        }
+    }
+
+    /// The periodic `AgentStatus`: only while something is in flight.
+    fn publish_status_if_busy(&mut self) {
+        if self.summaries.values().any(|d| in_flight(d.state)) {
+            self.record(EventBody::AgentStatus(self.status()));
         }
     }
 
@@ -307,12 +335,29 @@ impl StateHub {
             EventBody::DownloadRemoved(removed) => {
                 self.summaries.remove(&removed.id);
             }
+            EventBody::ProgressSnapshot(progress) => self.apply_progress(progress),
             EventBody::AgentStatus(_)
-            | EventBody::ProgressSnapshot(_)
             | EventBody::DownloadCompleted(_)
             | EventBody::DownloadFailed(_)
             | EventBody::QueueChanged(_)
             | EventBody::ResyncRequired(_) => {}
+        }
+    }
+
+    /// Folds live numbers into the summaries of downloads that hold an active slot.
+    fn apply_progress(&mut self, progress: &ProgressSnapshotData) {
+        for item in &progress.items {
+            let Some(summary) = self.summaries.get_mut(&item.id) else {
+                continue;
+            };
+            if !holds_active_slot(summary.state) {
+                continue;
+            }
+            summary.accepted_bytes = item.accepted_bytes;
+            summary.committed_bytes = item.committed_bytes;
+            summary.total_bytes = item.total_bytes.or(summary.total_bytes);
+            summary.speed_bps = item.speed_bps;
+            summary.eta_ms = item.eta_ms;
         }
     }
 
@@ -725,5 +770,75 @@ mod tests {
         assert_eq!(handle.snapshot().await.unwrap().seq, 1);
         assert!(handle.try_publish(added(3, DownloadState::Queued)));
         assert_eq!(handle.snapshot().await.unwrap().downloads.len(), 3);
+    }
+    #[test]
+    fn progress_updates_live_numbers_only_for_downloads_holding_a_slot() {
+        let mut hub = StateHub::new(init(), Vec::new());
+        hub.record(added(1, DownloadState::Downloading));
+        hub.record(added(2, DownloadState::Verifying));
+        let item = |n: u32| forgedm_protocol::ProgressItem {
+            id: summary(n, DownloadState::Queued).id,
+            accepted_bytes: 500,
+            committed_bytes: 400,
+            total_bytes: Some(1000),
+            speed_bps: Some(50),
+            eta_ms: Some(10_000),
+            active_connections: 1,
+        };
+
+        hub.record(EventBody::ProgressSnapshot(ProgressSnapshotData {
+            items: vec![item(1), item(2)],
+        }));
+
+        let live = &hub.summaries[&summary(1, DownloadState::Queued).id];
+        assert_eq!((live.accepted_bytes, live.committed_bytes), (500, 400));
+        assert_eq!(live.speed_bps, Some(50));
+        let waiting = &hub.summaries[&summary(2, DownloadState::Queued).id];
+        assert_eq!(
+            waiting.accepted_bytes, 0,
+            "a verifying download keeps its numbers"
+        );
+        assert_eq!(hub.status().total_speed_bps, 50);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn agent_status_is_published_every_second_only_while_downloads_are_active() {
+        let (sink, mut receiver) = event_channel();
+        let handle = spawn(init(), vec![summary(1, DownloadState::Queued)]);
+        let request = SubscribeRequest {
+            agent_instance_id: handle.instance_id(),
+            after_seq: 0,
+        };
+        handle.subscribe(request, sink).await.unwrap();
+
+        tokio::time::sleep(Duration::from_millis(3500)).await;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(1), receiver.recv())
+                .await
+                .is_err(),
+            "no status while everything is idle"
+        );
+
+        handle
+            .publish(EventBody::DownloadChanged(Box::new(summary(
+                1,
+                DownloadState::Downloading,
+            ))))
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(3100)).await;
+
+        let mut statuses = 0;
+        while let Ok(item) = tokio::time::timeout(Duration::from_millis(1), receiver.recv()).await {
+            if let SubscriptionItem::Event(event) = item
+                && matches!(event.body, EventBody::AgentStatus(_))
+            {
+                statuses += 1;
+            }
+        }
+        assert_eq!(
+            statuses, 3,
+            "one AgentStatus per second while a download is active"
+        );
     }
 }

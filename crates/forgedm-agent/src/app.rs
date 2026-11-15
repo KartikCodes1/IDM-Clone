@@ -6,15 +6,19 @@
 //!    retrying up to 3 s (3). The caller then starts the rolling file logs;
 //! 3. [`start`]: claim the pipe with `first_pipe_instance(true)`, retrying `NameInUse` up to
 //!    3 s, else a `forgedm::security` event (4). No connection is accepted yet;
-//! 4. open the database with the DPAPI sealer and migrate (5), reconcile, start the StateHub;
+//! 4. open the database with the DPAPI sealer and migrate (5), reconcile, start the StateHub
+//!    and the engine, and resume stored work (queued downloads run; interrupted ones restart
+//!    from zero);
 //! 5. start serving and announce `ready`.
 //!
 //! Shutdown (`ShutdownAgentSafely`, Ctrl+C or the external token) stops accepting, drains,
-//! settles active downloads, closes the database and releases the lock.
+//! stops the engine (running downloads become `interrupted`), settles what is left, closes
+//! the database and releases the lock.
 
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
+use forgedm_core::engine::EngineConfig;
 use forgedm_ipc::{Connection, HandlerFuture, IpcError, RequestHandler, Server, ServerOptions};
 use forgedm_platform::instance_lock::{InstanceLock, LockError};
 use forgedm_protocol::{AgentState, DownloadSummary, Request};
@@ -25,12 +29,13 @@ use tokio_util::sync::CancellationToken;
 
 use crate::config::{Config, effective_proxy_source, pipe_name};
 use crate::data_dir::DataPaths;
+use crate::detail::summary_of;
+use crate::engine_host::EngineHost;
 use crate::error::StartupError;
 use crate::events_hub::{self, HubHandle, HubInit};
 use crate::handlers::{AgentHandler, starting_response};
 use crate::reconcile;
 use crate::sealer::DpapiSealer;
-use crate::summary::summarize;
 
 /// How long the instance lock and the pipe name are retried at startup (A.9).
 pub const STARTUP_RETRY_TOTAL: Duration = Duration::from_secs(3);
@@ -158,29 +163,56 @@ pub async fn request_shutdown(hub: &HubHandle, shutdown: &CancellationToken) {
     shutdown.cancel();
 }
 
-/// Claims the pipe, opens storage, reconciles, starts the hub and begins serving.
-///
-/// Cancelling `shutdown` stops the agent gracefully.
+/// Claims the pipe, opens storage, reconciles, starts the hub and the engine and begins
+/// serving. Cancelling `shutdown` stops the agent gracefully.
 ///
 /// # Errors
-/// [`StartupError::PipeSecurity`] (4) or [`StartupError::Storage`] (5). The lock is
-/// released when this returns an error.
+/// [`StartupError::PipeSecurity`] (4), [`StartupError::Storage`] (5) or
+/// [`StartupError::Internal`] when the engine cannot start. The lock is released when this
+/// returns an error.
 pub async fn start(
     prepared: Prepared,
     shutdown: CancellationToken,
+) -> Result<RunningAgent, StartupError> {
+    start_with(prepared, shutdown, EngineConfig::default()).await
+}
+
+/// [`start`] with explicit engine tunables (tests use a small queue cap).
+///
+/// # Errors
+/// As [`start`].
+pub async fn start_with(
+    prepared: Prepared,
+    shutdown: CancellationToken,
+    engine_config: EngineConfig,
 ) -> Result<RunningAgent, StartupError> {
     let started = Instant::now();
     let deferred = Arc::new(Deferred::default());
     let server = claim_pipe(&prepared.pipe_name, deferred.clone()).await?;
     let storage = open_storage(&prepared).await?;
-    let hub = match start_hub(&prepared, &storage, started).await {
-        Ok(hub) => hub,
+    let (hub, existing) = match start_hub(&prepared, &storage, started).await {
+        Ok(started_hub) => started_hub,
         Err(err) => {
             storage.close().await;
             return Err(err);
         }
     };
-    let handler = AgentHandler::new(hub.clone(), shutdown.clone(), started);
+    let host = match EngineHost::start(
+        storage.clone(),
+        hub.clone(),
+        prepared.config.proxy,
+        engine_config,
+        existing,
+    ) {
+        Ok(host) => host,
+        Err(err) => {
+            storage.close().await;
+            return Err(StartupError::Internal(err.to_string()));
+        }
+    };
+    host.recover().await;
+    let handler = AgentHandler::new(hub.clone(), shutdown.clone(), started)
+        .with_engine(Arc::new(host.clone()));
     let ready = if deferred.inner.set(handler).is_err() {
         Err(StartupError::Internal("handler installed twice".to_owned()))
     } else {
@@ -189,12 +221,20 @@ pub async fn start(
             .map_err(|err| StartupError::Internal(err.to_string()))
     };
     if let Err(err) = ready {
+        host.shutdown().await;
         storage.close().await;
         return Err(err);
     }
     tracing::info!(pid = std::process::id(), "agent ready");
     let pipe_name = prepared.pipe_name.clone();
-    let task = tokio::spawn(supervise(server, shutdown, storage, hub.clone(), prepared));
+    let task = tokio::spawn(supervise(
+        server,
+        shutdown,
+        storage,
+        host,
+        hub.clone(),
+        prepared,
+    ));
     Ok(RunningAgent {
         hub,
         pipe_name,
@@ -235,8 +275,9 @@ async fn start_hub(
     prepared: &Prepared,
     storage: &Storage,
     started: Instant,
-) -> Result<HubHandle, StartupError> {
+) -> Result<(HubHandle, usize), StartupError> {
     let initial = load_summaries(storage).await?;
+    let existing = initial.len();
     let init = HubInit {
         instance_id: uuid::Uuid::now_v7(),
         proxy_source: effective_proxy_source(prepared.config.proxy, |name| {
@@ -246,7 +287,7 @@ async fn start_hub(
         started,
         pid: std::process::id(),
     };
-    Ok(events_hub::spawn(init, initial))
+    Ok((events_hub::spawn(init, initial), existing))
 }
 
 /// Loads stored downloads (newest first) for the hub, up to the queue cap.
@@ -257,7 +298,10 @@ async fn load_summaries(storage: &Storage) -> Result<Vec<DownloadSummary>, Stora
         let offset = u32::try_from(all.len()).unwrap_or(u32::MAX);
         let page = downloads.list(None, LOAD_PAGE, offset).await?;
         let last = page.len() < usize::try_from(LOAD_PAGE).unwrap_or(usize::MAX);
-        all.extend(page.iter().map(summarize));
+        for record in &page {
+            let events = restore_events(storage, record).await?;
+            all.push(summary_of(record, &events, None));
+        }
         if last {
             break;
         }
@@ -268,16 +312,31 @@ async fn load_summaries(storage: &Storage) -> Result<Vec<DownloadSummary>, Stora
     Ok(all)
 }
 
+/// The event log of a download whose summary needs its last failure; none for the rest.
+async fn restore_events(
+    storage: &Storage,
+    record: &forgedm_storage::DownloadRecord,
+) -> Result<Vec<forgedm_storage::EventRecord>, StorageError> {
+    use forgedm_protocol::DownloadState as S;
+    if matches!(record.state, S::Failed | S::NeedsCredentials | S::Paused) {
+        storage.events().list(record.id, 500).await
+    } else {
+        Ok(Vec::new())
+    }
+}
+
 /// Serves until shutdown, then settles downloads, closes the database and releases the lock.
 async fn supervise(
     server: Server,
     shutdown: CancellationToken,
     storage: Storage,
+    host: EngineHost,
     hub: HubHandle,
     prepared: Prepared,
 ) -> Result<(), StartupError> {
     let served = serve_until_shutdown(server, &shutdown).await;
     request_shutdown(&hub, &shutdown).await;
+    host.shutdown().await;
     if let Err(err) = reconcile::on_agent_shutdown(&storage).await {
         tracing::error!(error = %err, "could not settle downloads at shutdown");
     }

@@ -1,7 +1,9 @@
-//! GetSnapshot, ListDownloads, Subscribe and Unsubscribe (A.3, ADR-019).
+//! GetSnapshot, ListDownloads, GetDownload, Subscribe and Unsubscribe (A.3, ADR-019).
 
 use forgedm_ipc::Connection;
-use forgedm_protocol::{EmptyResult, ListDownloadsRequest, ResultBody, SubscribeRequest};
+use forgedm_protocol::{
+    DownloadIdRequest, EmptyResult, ListDownloadsRequest, ResultBody, SubscribeRequest,
+};
 
 use super::AgentHandler;
 use crate::error::AgentError;
@@ -53,4 +55,14 @@ pub(super) async fn subscribe(
 pub(super) fn unsubscribe(conn: &mut Connection) -> Result<ResultBody, AgentError> {
     conn.unsubscribe();
     Ok(ResultBody::Unsubscribe(EmptyResult {}))
+}
+
+/// The full view of one download, with live numbers while it runs. An unknown id is
+/// `not_found`.
+pub(super) async fn get_download(
+    handler: &AgentHandler,
+    request: DownloadIdRequest,
+) -> Result<ResultBody, AgentError> {
+    let detail = handler.engine()?.detail(request.download_id).await?;
+    Ok(ResultBody::GetDownload(Box::new(detail)))
 }
