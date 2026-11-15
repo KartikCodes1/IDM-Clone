@@ -10,6 +10,7 @@ members = [
     "crates/forgedm-agent",
     "crates/forgedm-cli",
     "tests/fixtures",
+    "apps/desktop/src-tauri",
 ]
 
 [workspace.package]
@@ -85,6 +86,10 @@ tempfile = "3.27.0"
 proptest = "1.12.0"
 rcgen = { version = "0.14.10", default-features = false, features = ["crypto", "pem", "aws_lc_rs"] }
 tokio-rustls = "0.26.6"
+
+# Desktop shell (S0.10). Default features (wry, compression, common-controls-v6); no plugins.
+tauri = "2.12.5"
+tauri-build = "2.7.4"
 
 [workspace.lints.rust]
 unsafe_code = "deny"

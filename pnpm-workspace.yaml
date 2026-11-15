@@ -1,0 +1,8 @@
+packages:
+  - apps/*
+
+# D5: supply-chain hardening (PHASE_0_1_PLAN GATE 1).
+minimumReleaseAge: 1440
+strictDepBuilds: true
+engineStrict: true
+onlyBuiltDependencies: []

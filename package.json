@@ -1,0 +1,9 @@
+{
+  "name": "forgedm",
+  "version": "0.1.0",
+  "private": true,
+  "packageManager": "pnpm@10.29.2",
+  "engines": {
+    "node": "^24.15.0 || ^26.0.0"
+  }
+}
