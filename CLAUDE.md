@@ -13,6 +13,10 @@ Source of truth:
 - `cargo test --workspace --locked`
 - `cargo clippy --workspace --all-targets --locked -- -D warnings`
 - `cargo fmt --all --check`. While other slices are in flight, format only your crate with `cargo fmt -p <crate>`.
+- Gate scripts:
+  - `powershell -NoProfile -ExecutionPolicy Bypass -File scripts\check-env.ps1`
+  - `... scripts\check.ps1` (named static checks)
+  - `... scripts\windows-smoke.ps1` (agent/CLI smoke)
 - Node for `apps/desktop`: `%LOCALAPPDATA%\nvm\v26.13.1`. Don't run `nvm use`; it changes the user's global Node. pnpm is 10.29.2.
 
 ## Invariants (release blockers; see THREAT_MODEL section 5)
