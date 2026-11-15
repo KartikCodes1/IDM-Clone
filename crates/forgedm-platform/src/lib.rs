@@ -12,3 +12,5 @@ pub mod peer;
 pub mod pipe;
 pub mod sid;
 pub mod wide;
+
+pub use error::PlatformError;
