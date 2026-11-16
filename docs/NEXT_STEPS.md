@@ -14,7 +14,7 @@ Updated 2026-11-16.
 
 ## Next
 1. **Done:** GATE 2 confirmed, commits `a47b9d5` (scaffold) and `b1e8727` (docs + specs). The user chose **one commit confirmation per wave**, with one commit per slice.
-   - Reusable wave workflow script: `~/.claude/projects/C--Users-karti-Desktop-IDM-Clone/<session>/workflows/scripts/forgedm-wave-*.js`
+   - Reusable wave workflow script: `~/.claude/projects/<project>/<session>/workflows/scripts/forgedm-wave-*.js`
    - It takes args `{wave, slices:[{id,title,crate,owns,refs,reviewers,notes}]}`.
 2. **W1 done and committed** (`02c4656`..`6af19d5`): S0.3, S0.4 and S0.5 tested; 67 workspace tests pass. PCR-03 and PCR-04 decided.
 3. **W2 done and committed** (`93c8bc9`..`d942573`): S0.4b, S0.6, S0.7, S1.1 and S1.2 are tested; 218 workspace tests pass. PCR-05 is decided.

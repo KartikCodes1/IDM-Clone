@@ -5,7 +5,7 @@ Status: ACCEPTED at GATE 1 (2026-11-15). Implementation is in progress; docs/IMP
 **Last updated:** 2026-11-15
 **Scope:** how to build, test and check the Phase 0/1 code. Commands are the ones defined in `docs/PHASE_0_1_PLAN.md` (sections 0, 8). A command listed here is not evidence that it passes. Real results go in `docs/TEST_EVIDENCE.md`.
 
-Repo root = Cargo workspace root: `C:\Users\karti\Desktop\IDM Clone`. The path contains a space: always quote it.
+Repo root = Cargo workspace root, written `<repo>` below. The maintainer's checkout path contains a space, so always quote paths.
 
 ---
 
@@ -107,13 +107,13 @@ Parallel slices run in the main checkout, not in git worktrees (`docs/ECC_WORKFL
 PowerShell:
 
 ```
-$env:CARGO_TARGET_DIR = "C:\Users\karti\Desktop\IDM Clone\target\<slice-id>"
+$env:CARGO_TARGET_DIR = "<repo>\target\<slice-id>"
 ```
 
 Bash:
 
 ```
-export CARGO_TARGET_DIR="C:/Users/karti/Desktop/IDM Clone/target/<slice-id>"
+export CARGO_TARGET_DIR="<repo>/target/<slice-id>"
 ```
 
 Rules:
@@ -148,7 +148,24 @@ Hooks are configured by the ECC plugin (`docs/ECC_WORKFLOW.md` section 2). Do no
 
 ---
 
-## 7. Related documents
+## 7. Releases
+
+GitHub Actions builds every release; nothing is uploaded from a developer PC.
+
+- **CI** (`.github/workflows/ci.yml`) runs on every push to `main` and every pull request: fmt, clippy, all tests, the crash matrix, `check.ps1`, `windows-smoke.ps1`, `phase1-proof.ps1`, the desktop lint, typecheck and tests, and cargo-deny.
+- **Audit** (`.github/workflows/audit.yml`) runs cargo-deny advisories and `pnpm audit --prod` every Monday against fresh advisory data.
+- **Release** (`.github/workflows/release.yml`) runs when a `vX.Y.Z` tag is pushed. It refuses a tag whose commit is not on `main` or has no green CI run, or whose versions do not match. It then runs the tests and `pnpm audit`, builds the per-user NSIS installer, installs and uninstalls it on the runner as a smoke test, writes `SHA256SUMS.txt`, records build provenance for both files, and opens a **draft** release (a pre-release while the version is 0.x).
+
+To cut a release:
+1. Move the `[Unreleased]` notes in `CHANGELOG.md` under a new `## [X.Y.Z] - YYYY-MM-DD` heading and update the compare links.
+2. Set the same version in `Cargo.toml` (`[workspace.package]`), `package.json`, `apps/desktop/package.json` and `apps/desktop/src-tauri/tauri.conf.json`.
+3. Commit, push `main` and wait for CI to pass.
+4. `git tag -a vX.Y.Z -m "ForgeDM vX.Y.Z"` then `git push origin vX.Y.Z`.
+5. When the Release run finishes, check the draft: the installer and `SHA256SUMS.txt` are attached, the checksum matches, and `gh attestation verify` passes (see SECURITY.md). Then publish it.
+
+The installer is not code-signed (no paid certificate), so SmartScreen warns on first run.
+
+## 8. Related documents
 
 - `docs/PHASE_0_1_PLAN.md`: slices, GATE 1 record, and Appendix A (canonical protocol, states, error codes, exit codes, constants, names). Appendix A changes only through a protocol-change request.
 - `docs/ARCHITECTURE.md`, `docs/THREAT_MODEL.md`: design and threat controls.

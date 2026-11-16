@@ -5,7 +5,7 @@ Status: ACCEPTED at GATE 1 (2026-11-15). Implementation is in progress; docs/IMP
 | Field | Value |
 |---|---|
 | Date | 2026-11-15 |
-| Repo root = Cargo workspace root | `C:\Users\karti\Desktop\IDM Clone` |
+| Repo root = Cargo workspace root | the checkout directory, `<repo>` (the maintainer's path contains a space; quote it) |
 | Scope | Master spec section 13 Phase 0-1, section 14, engine parts of section 12. Execution prompt sections 1, 3, 4, 6, 7. Phase 2+ only as interface constraints (section 9). |
 | Companion docs | `docs/ARCHITECTURE.md` (design, ADRs, versions), `docs/THREAT_MODEL.md` (threats, invariants), `docs/ECC_WORKFLOW.md` |
 | Canonical contract | **Appendix A of this file.** All crate, state, action, error-code, exit-code, constant and test names in the three docs follow it. A change to Appendix A is a serialized protocol-change request. |

@@ -1,7 +1,7 @@
 # ForgeDM Phase 0 Boundary Report
 
 **Date:** 2026-11-16
-**Scope:** Phase 0 at commit 18f48c0 (main branch), evaluated in the detached worktree C:\Users\karti\Desktop\forgedm-p0gate
+**Scope:** Phase 0 at commit 18f48c0 (main branch), evaluated in the detached worktree <repo>\..\forgedm-p0gate
 **Gate verdict:** PASSED WITH OPEN ITEMS
 
 Phase 0 is not marked complete on the strength of this report alone. Confirmed findings are NOT fixed yet; the coordinator schedules the fixes. The verdict assumes no confirmed CRITICAL or HIGH finding, and it depends on one open security item whose severity is not assigned in the input data (see section 7).
