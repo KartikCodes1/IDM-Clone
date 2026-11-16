@@ -10,7 +10,9 @@
 //! - [`data_dir`]: data directory layout and the reparse-point check.
 //! - [`logging`]: daily rolling JSON logs and the panic hook.
 //! - [`sealer`]: DPAPI implementation of the storage `SecretSealer` port.
-//! - [`reconcile`]: startup and shutdown settling of persisted states.
+//! - [`reconcile`]: startup and shutdown settling of persisted states, and the part-file
+//!   reconcile of `finalizing` downloads.
+//! - `fault` (feature `fault-injection` only): crash injection for the recovery tests.
 //! - [`events_hub`]: the StateHub actor (sequencing, replay, subscribers, periodic status).
 //! - [`engine_host`]: the core engine wired to storage, the hub and the platform services.
 //! - [`limits_store`]: the agent-wide limits kept in `settings`.
@@ -31,10 +33,13 @@ pub mod detail;
 pub mod engine_host;
 pub mod error;
 pub mod events_hub;
+#[cfg(feature = "fault-injection")]
+pub mod fault;
 pub mod handlers;
 pub mod limits_store;
 pub mod logging;
 pub mod reconcile;
+mod reconcile_parts;
 pub mod sealer;
 pub mod store_adapter;
 pub mod summary;

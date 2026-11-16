@@ -79,7 +79,11 @@ impl Prepared {
 /// 3 s, or an internal error (1).
 pub fn prepare(config: Config) -> Result<Prepared, StartupError> {
     let root = config.resolve_data_root().map_err(StartupError::Resolve)?;
-    let paths = DataPaths::prepare(&root)?;
+    let paths = if config.data_dir.is_some() {
+        DataPaths::prepare_explicit(&root)?
+    } else {
+        DataPaths::prepare(&root)?
+    };
     let explicit_root = config.data_dir.as_ref().map(|_| paths.root.as_path());
     let pipe_name = pipe_name(explicit_root).map_err(StartupError::Resolve)?;
     let lock = take_lock(&paths)?;
@@ -259,14 +263,22 @@ async fn claim_pipe(name: &str, handler: Arc<Deferred>) -> Result<Server, Startu
 
 async fn open_storage(prepared: &Prepared) -> Result<Storage, StartupError> {
     let storage = Storage::open(&prepared.paths.db, Arc::new(DpapiSealer)).await?;
-    match reconcile::on_agent_start(&storage).await {
-        Ok(settled) => {
-            tracing::info!(?settled, "startup reconcile finished");
-            Ok(storage)
-        }
+    let reconciled = async {
+        let settled = reconcile::on_agent_start(&storage).await?;
+        tracing::info!(?settled, "startup reconcile finished");
+        let parts = reconcile::finalizing_parts(&storage).await?;
+        tracing::info!(?parts, "finalizing downloads reconciled");
+        Ok::<(), reconcile::PartsError>(())
+    }
+    .await;
+    match reconciled {
+        Ok(()) => Ok(storage),
         Err(err) => {
             storage.clone().close().await;
-            Err(err.into())
+            Err(match err {
+                reconcile::PartsError::Storage(err) => err.into(),
+                other @ reconcile::PartsError::Motw(_) => StartupError::Internal(other.to_string()),
+            })
         }
     }
 }

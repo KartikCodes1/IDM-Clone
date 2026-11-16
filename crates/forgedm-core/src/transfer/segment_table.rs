@@ -287,6 +287,18 @@ impl SegmentTable {
         self.segs.iter().map(|s| s.committed).max().unwrap_or(0)
     }
 
+    /// The committed offset of the segment with the most committed data beyond its own start,
+    /// when that is at least `window` bytes: where a weak-validator sample takes its window.
+    /// `None` when no segment has `window` committed bytes (nothing can be sampled).
+    #[must_use]
+    pub fn sample_point(&self, window: u64) -> Option<u64> {
+        self.segs
+            .iter()
+            .filter(|s| s.committed - s.start >= window)
+            .max_by_key(|s| s.committed - s.start)
+            .map(|s| s.committed)
+    }
+
     fn find(&self, no: u32) -> Result<usize, TableError> {
         self.segs
             .iter()
@@ -328,6 +340,7 @@ impl SegmentTable {
         let mut fresh = Seg::fresh(no, mid, end, mid);
         fresh.owner = Some(worker);
         self.segs.insert(victim + 1, fresh);
+        crate::fault::hit(crate::fault::FaultPoint::MidSplit);
         Some(Assignment {
             seg_no: no,
             claim: mid,
@@ -532,6 +545,29 @@ mod tests {
 
     fn ranges(table: &SegmentTable) -> Vec<(u64, u64)> {
         table.segments().iter().map(|s| (s.start, s.end)).collect()
+    }
+
+    #[test]
+    fn the_sample_point_is_the_fullest_segment_with_a_whole_window() {
+        let snap = |no, start, end, committed| SegmentSnapshot {
+            seg_no: no,
+            start,
+            end,
+            committed,
+        };
+        let table = SegmentTable::from_snapshots(
+            &[
+                snap(0, 0, 1000, 600),
+                snap(1, 1000, 2000, 1900),
+                snap(2, 2000, 3000, 2000),
+            ],
+            3000,
+        )
+        .unwrap();
+
+        assert_eq!(table.sample_point(500), Some(1900));
+        assert_eq!(table.sample_point(901), None, "no segment has that much");
+        assert_eq!(table.sample_point(900), Some(1900));
     }
 
     #[test]

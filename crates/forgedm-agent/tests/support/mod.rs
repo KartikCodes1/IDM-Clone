@@ -15,6 +15,28 @@ pub fn agent_exe() -> PathBuf {
     std::fs::canonicalize(env!("CARGO_BIN_EXE_forgedm-agent")).expect("agent exe exists")
 }
 
+/// Restricts `dir` to the current user, SYSTEM and Administrators, the way the agent
+/// requires an explicit `--data-dir` to be. Temporary directories inherit machine-specific
+/// ACEs (sandbox groups, `Users:Modify`), so tests harden theirs before handing it over.
+pub fn harden(dir: &Path) {
+    let user = forgedm_platform::sid::Sid::current_user()
+        .expect("current user")
+        .to_sid_string()
+        .expect("sid text");
+    let out = Command::new("icacls")
+        .arg(dir)
+        .args(["/inheritance:r", "/grant:r"])
+        .arg(format!("*{user}:(OI)(CI)F"))
+        .args(["*S-1-5-18:(OI)(CI)F", "*S-1-5-32-544:(OI)(CI)F"])
+        .output()
+        .expect("run icacls");
+    assert!(
+        out.status.success(),
+        "icacls failed: {}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+}
+
 /// How long a test waits for the agent to come up or to exit.
 pub const WAIT: Duration = Duration::from_secs(20);
 
@@ -38,6 +60,14 @@ impl AgentProc {
 
     /// Starts the agent with exactly the given leading and trailing arguments.
     pub fn start_raw(head: &[&str], proxy: &[&str], extra: &[&str], data_dir: &Path) -> Self {
+        if data_dir.is_dir() {
+            harden(data_dir);
+        }
+        Self::start_as_is(head, proxy, extra, data_dir)
+    }
+
+    /// Like [`Self::start_raw`] but leaves the directory's ACL exactly as it is.
+    pub fn start_as_is(head: &[&str], proxy: &[&str], extra: &[&str], data_dir: &Path) -> Self {
         let child = Command::new(agent_exe())
             .args(head)
             .args(proxy)
@@ -55,6 +85,7 @@ impl AgentProc {
 
     /// Starts an agent with a custom environment edit (for the proxy-source test).
     pub fn start_with_env(data_dir: &Path, proxy: &str, env: &[(&str, &str)]) -> Self {
+        harden(data_dir);
         let mut cmd = Command::new(agent_exe());
         cmd.args(["--data-dir", data_dir.to_str().expect("utf-8 path")])
             .args(["--proxy", proxy]);

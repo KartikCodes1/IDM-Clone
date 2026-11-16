@@ -25,6 +25,10 @@ fn run() -> u8 {
         Err(err) => return fail(&StartupError::Usage(err)),
     };
     logging::install_panic_hook();
+    #[cfg(feature = "fault-injection")]
+    if let Err(err) = forgedm_agent::fault::install_from_env() {
+        return fail(&StartupError::Internal(err.to_string()));
+    }
     let prepared = match app::prepare(config) {
         Ok(prepared) => prepared,
         Err(err) => return fail(&err),

@@ -6,6 +6,8 @@
 //! server image.
 #![allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)] // test code
 
+mod support;
+
 use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -59,6 +61,7 @@ struct TestAgent {
 impl TestAgent {
     async fn start() -> Self {
         let dir = TempDir::new().unwrap();
+        support::harden(dir.path());
         let config = Config::new(dir.path().to_path_buf(), ProxyMode::None, "warn".to_owned());
         let prepared = app::prepare(config).expect("prepare");
         let token = CancellationToken::new();
@@ -288,7 +291,16 @@ async fn no_event_lost_between_snapshot_and_subscribe() {
             .await
             .expect("client in time")
             .unwrap();
-        assert_eq!(mirror.last_seq, final_snapshot.seq);
+        // The agent's periodic status event can be published after the final snapshot, and
+        // a client may read it before it sees publisher_done. Such events never touch the
+        // download map, so the map comparison below still proves that no download event was
+        // lost; the sequence must only have reached the snapshot.
+        assert!(
+            mirror.last_seq >= final_snapshot.seq,
+            "mirror stopped at {} before the final snapshot {}",
+            mirror.last_seq,
+            final_snapshot.seq
+        );
         let expected: BTreeMap<Uuid, DownloadSummary> = final_snapshot
             .downloads
             .iter()

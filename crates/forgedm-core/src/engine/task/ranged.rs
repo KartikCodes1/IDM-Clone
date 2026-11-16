@@ -70,6 +70,7 @@ impl DownloadTask {
             committed: 0,
             total,
             identity,
+            sample: false,
         };
         let final_url = self.ranged_transfer(staged.file, &from).await?;
         Ok(Landed {

@@ -349,7 +349,9 @@ function Invoke-SmokeSteps {
     $binDir = Join-Path $script:Stage 'bin'
     $script:DataDir = Join-Path $script:Stage 'data'
     [void](New-Item -ItemType Directory -Path $binDir -Force)
-    [void](New-Item -ItemType Directory -Path $script:DataDir -Force)
+    # The data directory is left for the agent to create: it gives a directory it creates a
+    # private DACL, and refuses an explicit --data-dir that inherits write access for other
+    # principals (as a folder made under %TEMP% can).
     Copy-Item -LiteralPath $srcCli -Destination $binDir
     Copy-Item -LiteralPath $srcAgent -Destination $binDir
     $script:Cli = Join-Path $binDir 'forgedm.exe'

@@ -41,7 +41,8 @@ use crate::ports::{DownloadStore, EngineEvent, EngineEventSink, StoreEvent, Stor
 use crate::probe::{Probed, probe};
 use crate::rate_limit::TokenBucket;
 use crate::resume::{
-    Continuation, RestartReason, ResumePlan, is_resumable_mode, open_valid_part, plan_resume,
+    Continuation, RestartReason, ResumePlan, SAMPLE_VERIFY_WINDOW, SampleError, is_resumable_mode,
+    open_valid_part, plan_resume, sample_verify_at,
 };
 use crate::retry::Phase;
 use crate::state::{Command, transition};
@@ -271,13 +272,23 @@ impl DownloadTask {
         self.stop_check()?;
         let table = if self.job.transfer_mode == Some(TransferMode::Segmented) {
             let Some(table) = self.restore_table(&from).await? else {
-                self.restart(RestartReason::PartFileInvalid).await?;
+                self.restart(RestartReason::MetadataCorrupt).await?;
                 return self.start_fresh().await;
             };
+            // Without a strong validator one segment's tail is sampled; with none of them
+            // holding a full window nothing proves the bytes, so start over (ARCHITECTURE 4.7).
+            if from.sample && table.sample_point(SAMPLE_VERIFY_WINDOW).is_none() {
+                self.restart(RestartReason::NoStrongValidator).await?;
+                return self.start_fresh().await;
+            }
             Some(table)
         } else {
             None
         };
+        let sample_end = table
+            .as_ref()
+            .and_then(|t| t.sample_point(SAMPLE_VERIFY_WINDOW))
+            .unwrap_or(from.committed);
         let job = self.job.clone();
         let committed = from.committed;
         let keep_len = table.as_ref().map(SegmentTable::max_committed);
@@ -319,6 +330,17 @@ impl DownloadTask {
         self.ctx.live.set_total(Some(from.total));
         self.ctx.live.resume_from(from.committed);
         self.advance(Command::ProbeSucceeded, None).await?;
+        // The volume may have filled up while the download was away: pause (`disk_full`)
+        // instead of failing halfway. Only `downloading` has that pause edge (A.6).
+        let remaining = from.total.saturating_sub(from.committed);
+        ensure_space(
+            self.ctx.budgets.space().as_ref(),
+            &self.job.target_dir,
+            remaining,
+        )?;
+        if from.sample {
+            self.sample(&file, &from, sample_end).await?;
+        }
         let final_url = match table {
             Some(table) => {
                 self.segmented_transfer(file, table, from.identity.clone())
@@ -332,6 +354,36 @@ impl DownloadTask {
             name,
             total: Some(from.total),
         })
+    }
+
+    /// Proves a download without a strong validator is still the same file: re-requests the
+    /// window before the committed offset and compares it with the disk. A difference is
+    /// `remote_changed`; retryable faults wait and try again like the probe.
+    async fn sample(&mut self, file: &File, from: &Continuation, end: u64) -> Result<(), TaskStop> {
+        let token = self.ctx.live.stop().token().clone();
+        loop {
+            self.stop_check()?;
+            if self.res.gate(&token).await.is_err() {
+                return Err(self.ctx.live.stop().stopped());
+            }
+            let permit = self.permit().await?;
+            let url = self.job.url.as_url().clone();
+            let outcome = sample_verify_at(&self.ctx.client, &url, file, from, end, &token).await;
+            drop(permit);
+            match outcome {
+                Ok(()) => return Ok(()),
+                Err(SampleError::Changed) => {
+                    return Err(Failure::new(DownloadErrorCode::RemoteChanged).into());
+                }
+                Err(SampleError::Stop(TaskStop::Stopped(_))) => {
+                    return Err(self.ctx.live.stop().stopped());
+                }
+                Err(SampleError::Stop(TaskStop::Retry(fault))) => {
+                    self.settle_fault(Phase::Probe, fault).await?;
+                }
+                Err(SampleError::Stop(other)) => return Err(other),
+            }
+        }
     }
 
     /// Throws away the stale staging file (only if it is provably ours) and every stored

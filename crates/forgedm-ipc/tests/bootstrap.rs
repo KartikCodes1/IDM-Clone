@@ -74,11 +74,18 @@ struct AgentGuard {
 }
 
 impl AgentGuard {
-    fn new(dir: &TempDir) -> Self {
+    fn new(data_dir: &Path) -> Self {
         Self {
-            data_dir: dir.path().to_path_buf(),
+            data_dir: data_dir.to_path_buf(),
         }
     }
+}
+
+/// A data directory that does not exist yet, so the agent creates it with its own private
+/// DACL. A directory made by `TempDir` inherits the %TEMP% ACL, which can grant other
+/// principals write access; the agent refuses such an explicit `--data-dir` (exit 6).
+fn fresh_data_dir(dir: &TempDir) -> PathBuf {
+    dir.path().join("data")
 }
 
 impl Drop for AgentGuard {
@@ -113,20 +120,21 @@ async fn agent_status(client: &mut Client) -> AgentStatusInfo {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn bootstraps_when_absent() {
     let dir = TempDir::new().unwrap();
-    let _guard = AgentGuard::new(&dir);
+    let data_dir = fresh_data_dir(&dir);
+    let _guard = AgentGuard::new(&data_dir);
     assert!(matches!(
-        Client::connect(config_for(dir.path())).await,
+        Client::connect(config_for(&data_dir)).await,
         Err(IpcError::NotRunning)
     ));
 
-    let mut client = ensure_agent(&agent_exe(), Some(dir.path()))
+    let mut client = ensure_agent(&agent_exe(), Some(&data_dir))
         .await
         .expect("bootstrap");
 
     let status = agent_status(&mut client).await;
     assert_ne!(status.agent_pid, 0);
-    assert!(dir.path().join("forgedm.db").is_file());
-    let mut again = ensure_agent(&agent_exe(), Some(dir.path()))
+    assert!(data_dir.join("forgedm.db").is_file());
+    let mut again = ensure_agent(&agent_exe(), Some(&data_dir))
         .await
         .expect("already running");
     assert_eq!(agent_status(&mut again).await.agent_pid, status.agent_pid);
@@ -135,13 +143,14 @@ async fn bootstraps_when_absent() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn five_concurrent_bootstraps_one_agent() {
     let dir = TempDir::new().unwrap();
-    let _guard = AgentGuard::new(&dir);
+    let root = fresh_data_dir(&dir);
+    let _guard = AgentGuard::new(&root);
     let agent = agent_exe();
 
     let mut tasks = Vec::new();
     for _ in 0..5 {
         let agent = agent.clone();
-        let data_dir = dir.path().to_path_buf();
+        let data_dir = root.clone();
         tasks.push(tokio::spawn(async move {
             let mut client = ensure_agent(&agent, Some(&data_dir)).await?;
             Ok::<_, BootstrapError>(agent_status(&mut client).await.agent_pid)
@@ -161,7 +170,7 @@ async fn five_concurrent_bootstraps_one_agent() {
 #[tokio::test]
 async fn missing_sibling_binary_errors_no_path_search() {
     let dir = TempDir::new().unwrap();
-    let _guard = AgentGuard::new(&dir);
+    let _guard = AgentGuard::new(dir.path());
     let missing = dir.path().join("forgedm-agent.exe");
 
     let absent = ensure_agent(&missing, Some(dir.path())).await;
@@ -195,16 +204,17 @@ async fn relative_data_dir_is_refused_before_spawning() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn bootstrap_timeout_reported() {
     let dir = TempDir::new().unwrap();
-    let _guard = AgentGuard::new(&dir);
+    let data_dir = fresh_data_dir(&dir);
+    let _guard = AgentGuard::new(&data_dir);
     let options = BootstrapOptions::default().with_timeout(Duration::from_millis(1));
 
-    let result = ensure_agent_with(&agent_exe(), Some(dir.path()), &options).await;
+    let result = ensure_agent_with(&agent_exe(), Some(&data_dir), &options).await;
 
     assert!(matches!(result, Err(BootstrapError::Timeout)), "{result:?}");
     // The agent that did not come up in time is killed, not left running.
-    wait_until_gone(dir.path()).await;
+    wait_until_gone(&data_dir).await;
     assert!(matches!(
-        Client::connect(config_for(dir.path())).await,
+        Client::connect(config_for(&data_dir)).await,
         Err(IpcError::NotRunning)
     ));
 }
@@ -212,7 +222,8 @@ async fn bootstrap_timeout_reported() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn bootstrapped_agent_does_not_inherit_proxy_env() {
     let dir = TempDir::new().unwrap();
-    let _guard = AgentGuard::new(&dir);
+    let data_dir = fresh_data_dir(&dir);
+    let _guard = AgentGuard::new(&data_dir);
     // The parent environment cannot be edited without unsafe code, so the options inject
     // proxy variables as if inherited; the spawn must remove them (both cases).
     let polluted: Vec<(String, String)> = [
@@ -230,7 +241,7 @@ async fn bootstrapped_agent_does_not_inherit_proxy_env() {
     .collect();
     let options = BootstrapOptions::default().with_simulated_parent_env(polluted);
 
-    let mut client = ensure_agent_with(&agent_exe(), Some(dir.path()), &options)
+    let mut client = ensure_agent_with(&agent_exe(), Some(&data_dir), &options)
         .await
         .expect("bootstrap");
 

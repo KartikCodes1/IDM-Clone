@@ -406,3 +406,64 @@ fn data_dir_with_reparse_point_exits_6() {
         "nothing is written through the reparse point"
     );
 }
+
+/// Grants Everyone full control of `dir`, inherited by its children.
+fn grant_everyone(dir: &std::path::Path) {
+    let out = std::process::Command::new("icacls")
+        .arg(dir)
+        .args(["/grant", "*S-1-1-0:(OI)(CI)F"])
+        .output()
+        .expect("run icacls");
+    assert!(
+        out.status.success(),
+        "icacls failed: {}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+}
+
+#[test]
+fn world_writable_explicit_data_dir_exits_6() {
+    let dir = TempDir::new().unwrap();
+    support::harden(dir.path());
+    grant_everyone(dir.path());
+
+    let mut agent = AgentProc::start_as_is(
+        &["--data-dir", dir.path().to_str().unwrap()],
+        &["--proxy", "none"],
+        &[],
+        dir.path(),
+    );
+
+    assert_eq!(exit_code(agent.wait_exit(WAIT)), EXIT_DATA_DIR);
+    assert!(
+        !dir.path().join("forgedm.db").exists(),
+        "nothing is created in a directory that others can write"
+    );
+}
+
+#[tokio::test]
+async fn fresh_user_data_dir_is_accepted_and_missing_one_is_created_private() {
+    let parent = TempDir::new().unwrap();
+    let data = parent.path().join("agent-data");
+    // The agent creates a missing directory itself, with a protected DACL.
+    let agent = AgentProc::start_as_is(
+        &["--data-dir", data.to_str().unwrap()],
+        &["--proxy", "none"],
+        &[],
+        &data,
+    );
+    let (_client, _hello) = agent.connect().await;
+    assert!(data.join("forgedm.db").is_file());
+    forgedm_platform::acl::verify_private_dir(&data).expect("the created directory is private");
+
+    // An existing directory that is already private is accepted too.
+    let fresh = TempDir::new().unwrap();
+    support::harden(fresh.path());
+    let second = AgentProc::start_as_is(
+        &["--data-dir", fresh.path().to_str().unwrap()],
+        &["--proxy", "none"],
+        &[],
+        fresh.path(),
+    );
+    let (_client, _hello) = second.connect().await;
+}

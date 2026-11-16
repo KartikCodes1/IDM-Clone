@@ -4,20 +4,36 @@
 //! A download resumes only when everything lines up: a resumable transfer mode, a known
 //! total, a strong validator (so `If-Range` can prove the bytes are still the same
 //! representation) and a staging file that is provably the one we created. Anything else
-//! restarts from zero: weak or missing validators never resume (S1.14 replaces this with
-//! sampling).
+//! restarts from zero. The exception is a ranged or segmented download with a weak or missing
+//! validator and at least [`SAMPLE_VERIFY_WINDOW`] committed bytes: [`sample_verify`]
+//! re-requests a window before a committed offset (for a segment table, the offset of the
+//! segment with the most committed data) and compares it with the disk, so a changed file is
+//! caught (`remote_changed`) without a strong validator (S1.14, ARCHITECTURE 4.7).
 
 use std::fs::File;
+use std::os::windows::fs::FileExt;
 
 use forgedm_platform::PlatformError;
 use forgedm_platform::fs::{ensure_within, file_id, open_part_file};
 use forgedm_protocol::{DownloadErrorCode, TransferMode};
 use thiserror::Error;
+use tokio_util::sync::CancellationToken;
+use url::Url;
 
-use crate::error::{Failure, TaskStop, stop_from_io, stop_from_platform};
+use crate::client::{
+    ClientError, FetchSpec, HttpClient, classify_reqwest, response_meta, retry_after_of,
+};
+use crate::engine::StopReason;
+use crate::error::{Failure, Fault, TaskStop, stop_from_io, stop_from_platform};
+use crate::http::content_range::RangeRequest;
+use crate::http::range_decision::{RangeDecision, RangedRequest, decide};
 use crate::http::validators::ResumeIdentity;
 use crate::ports::StoredJob;
 use crate::transfer::encode_file_id;
+
+/// Bytes before the committed offset that [`sample_verify`] re-requests (A.9
+/// `SAMPLE_VERIFY_WINDOW`, 64 KiB).
+pub const SAMPLE_VERIFY_WINDOW: u64 = 64 * 1024;
 
 /// Why a download restarts from zero instead of resuming.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -28,6 +44,8 @@ pub enum RestartReason {
     NoStrongValidator,
     /// The staging file is missing, replaced or shorter than what was committed.
     PartFileInvalid,
+    /// The stored segment rows overlap, leave a gap, exceed their end or cannot be read.
+    MetadataCorrupt,
 }
 
 impl RestartReason {
@@ -38,6 +56,7 @@ impl RestartReason {
             Self::NotResumable => "not_resumable",
             Self::NoStrongValidator => "no_strong_validator",
             Self::PartFileInvalid => "part_file_invalid",
+            Self::MetadataCorrupt => "metadata_corrupt",
         }
     }
 }
@@ -51,6 +70,9 @@ pub struct Continuation {
     pub total: u64,
     /// The stored remote identity.
     pub identity: ResumeIdentity,
+    /// No strong validator is stored: [`sample_verify`] must pass before the first byte of
+    /// the continuation is requested.
+    pub sample: bool,
 }
 
 /// The decision for a download that is about to run.
@@ -65,7 +87,7 @@ pub enum ResumePlan {
 }
 
 /// Whether a transfer mode can continue after an interruption: a verified 206 with a known
-/// total (a segmented plan resumes as one range stream until S1.11).
+/// total. A segmented plan resumes from its persisted segment table.
 #[must_use]
 pub const fn is_resumable_mode(mode: TransferMode) -> bool {
     matches!(mode, TransferMode::SingleRanged | TransferMode::Segmented)
@@ -90,7 +112,8 @@ pub fn plan_resume(job: &StoredJob) -> ResumePlan {
         stored.last_modified.as_deref(),
         stored.last_modified_strong,
     );
-    if !identity.has_strong_validator() {
+    let sample = !identity.has_strong_validator();
+    if sample && !can_sample(job.transfer_mode, stored.committed) {
         return ResumePlan::Restart(RestartReason::NoStrongValidator);
     }
     if !has_part {
@@ -100,7 +123,170 @@ pub fn plan_resume(job: &StoredJob) -> ResumePlan {
         committed: stored.committed,
         total,
         identity,
+        sample,
     })
+}
+
+/// Whether a download without a strong validator may continue after sampling: a ranged or
+/// segmented transfer with a full window committed. For a segment table the engine then picks
+/// the segment to sample ([`crate::transfer::SegmentTable::sample_point`]) and restarts from
+/// zero when no single segment has a full window.
+const fn can_sample(mode: Option<TransferMode>, committed: u64) -> bool {
+    matches!(
+        mode,
+        Some(TransferMode::SingleRanged | TransferMode::Segmented)
+    ) && committed >= SAMPLE_VERIFY_WINDOW
+}
+
+/// Why [`sample_verify`] did not pass.
+#[derive(Debug)]
+pub enum SampleError {
+    /// The server's bytes differ from the disk, or the server no longer serves the same
+    /// representation: the download fails with `remote_changed`.
+    Changed,
+    /// The sample could not be taken: a retryable fault, a stop or a failure.
+    Stop(TaskStop),
+}
+
+/// Re-requests the [`SAMPLE_VERIFY_WINDOW`] bytes before `from.committed` and compares them
+/// with the same bytes of `file`. No `If-Range` is sent: this is for downloads without a
+/// strong validator. The response is judged like any ranged response; anything but a 206
+/// that covers exactly the window with identical bytes is a change.
+///
+/// # Errors
+/// [`SampleError::Changed`] on any difference, [`SampleError::Stop`] when the request failed.
+pub async fn sample_verify(
+    client: &HttpClient,
+    url: &Url,
+    file: &File,
+    from: &Continuation,
+    cancel: &CancellationToken,
+) -> Result<(), SampleError> {
+    sample_verify_at(client, url, file, from, from.committed, cancel).await
+}
+
+/// Like [`sample_verify`], but samples the window that ends at `end` (a committed offset of
+/// one segment) instead of the continuation's aggregate offset.
+///
+/// # Errors
+/// [`SampleError::Changed`] on any difference, [`SampleError::Stop`] when the request failed.
+pub async fn sample_verify_at(
+    client: &HttpClient,
+    url: &Url,
+    file: &File,
+    from: &Continuation,
+    end: u64,
+    cancel: &CancellationToken,
+) -> Result<(), SampleError> {
+    let start = end.saturating_sub(SAMPLE_VERIFY_WINDOW);
+    let window = RangeRequest {
+        start,
+        end_excl: end,
+    };
+    let disk = read_window(file, start, end).await?;
+    let spec = FetchSpec::ranged(window, None);
+    let fetched = client
+        .fetch(url, &spec, cancel)
+        .await
+        .map_err(sample_stop)?;
+    let request = RangedRequest {
+        range: window,
+        if_range_sent: false,
+        segment_no: 0,
+        has_committed_data: true,
+    };
+    match decide(&request, &from.identity, &response_meta(&fetched.response)) {
+        RangeDecision::Accept {
+            start: s,
+            end_excl: e,
+            short: false,
+        } if (s, e) == (start, end) => {}
+        RangeDecision::OtherStatus { status }
+            if status >= 500 || status == 429 || status == 408 =>
+        {
+            let retry_after = retry_after_of(&fetched.response);
+            let fault = Fault::Status {
+                status,
+                retry_after,
+            };
+            return Err(SampleError::Stop(TaskStop::Retry(fault)));
+        }
+        RangeDecision::OtherStatus { status: 401 | 407 } => {
+            return Err(SampleError::Stop(TaskStop::NeedsCredentials));
+        }
+        other => {
+            tracing::warn!(decision = ?other, "sample response is not the requested window; treating the file as changed");
+            return Err(SampleError::Changed);
+        }
+    }
+    let remote = read_body(fetched.response, disk.len(), cancel).await?;
+    if remote == disk {
+        Ok(())
+    } else {
+        Err(SampleError::Changed)
+    }
+}
+
+fn sample_stop(err: ClientError) -> SampleError {
+    SampleError::Stop(match err {
+        ClientError::Cancelled => TaskStop::Stopped(StopReason::Cancel),
+        ClientError::Redirect(redirect) => TaskStop::Fail(Failure::new(redirect.code())),
+        ClientError::Transport(kind) => TaskStop::Retry(Fault::Transport(kind)),
+        ClientError::Build(_) => TaskStop::Fail(Failure::new(DownloadErrorCode::Internal)),
+    })
+}
+
+/// Reads `[start, end)` of `file` on a blocking thread.
+async fn read_window(file: &File, start: u64, end: u64) -> Result<Vec<u8>, SampleError> {
+    let file = file
+        .try_clone()
+        .map_err(|e| SampleError::Stop(stop_from_io(&e)))?;
+    let len = usize::try_from(end - start).unwrap_or(0);
+    let internal = || SampleError::Stop(TaskStop::Fail(Failure::new(DownloadErrorCode::Internal)));
+    tokio::task::spawn_blocking(move || {
+        let mut buf = vec![0u8; len];
+        let mut done = 0;
+        while done < len {
+            let n = file.seek_read(&mut buf[done..], start + done as u64)?;
+            if n == 0 {
+                return Err(std::io::ErrorKind::UnexpectedEof.into());
+            }
+            done += n;
+        }
+        Ok(buf)
+    })
+    .await
+    .map_err(|_| internal())?
+    .map_err(|e: std::io::Error| SampleError::Stop(stop_from_io(&e)))
+}
+
+/// Reads the body to its end; a body longer than `want` is a change.
+async fn read_body(
+    mut response: reqwest::Response,
+    want: usize,
+    cancel: &CancellationToken,
+) -> Result<Vec<u8>, SampleError> {
+    let mut body = Vec::with_capacity(want);
+    loop {
+        let chunk = tokio::select! {
+            biased;
+            () = cancel.cancelled() => return Err(sample_stop(ClientError::Cancelled)),
+            chunk = response.chunk() => chunk,
+        };
+        match chunk {
+            Ok(Some(bytes)) => {
+                body.extend_from_slice(&bytes);
+                if body.len() > want {
+                    return Err(SampleError::Changed);
+                }
+            }
+            Ok(None) => return Ok(body),
+            Err(err) => {
+                let kind = classify_reqwest(&err);
+                return Err(SampleError::Stop(TaskStop::Retry(Fault::Transport(kind))));
+            }
+        }
+    }
 }
 
 /// Why the recorded staging file cannot be used.
@@ -300,6 +486,44 @@ mod tests {
                 ResumePlan::Restart(why)
             );
         }
+    }
+
+    #[test]
+    fn a_weak_ranged_download_with_a_full_window_continues_with_sampling() {
+        let weak = |committed| StoredProgress {
+            total: Some(10 * SAMPLE_VERIFY_WINDOW),
+            committed,
+            etag: Some("W/\"x\"".to_owned()),
+            etag_strong: Some(false),
+            ..StoredProgress::default()
+        };
+        let ranged = Some(TransferMode::SingleRanged);
+
+        let plan = plan_resume(&job(ranged, weak(SAMPLE_VERIFY_WINDOW), true));
+        let ResumePlan::Continue(c) = plan else {
+            unreachable!("expected a continuation, got {plan:?}");
+        };
+        assert!(c.sample && c.identity.if_range().is_none());
+        assert_eq!(c.committed, SAMPLE_VERIFY_WINDOW);
+
+        assert_eq!(
+            plan_resume(&job(ranged, weak(SAMPLE_VERIFY_WINDOW - 1), true)),
+            ResumePlan::Restart(RestartReason::NoStrongValidator),
+            "less than one window restarts from zero"
+        );
+        let segmented = Some(TransferMode::Segmented);
+        let plan = plan_resume(&job(segmented, weak(SAMPLE_VERIFY_WINDOW), true));
+        assert!(
+            matches!(plan, ResumePlan::Continue(ref c) if c.sample),
+            "a segment table with a full window committed is sampled: {plan:?}"
+        );
+        assert_eq!(
+            plan_resume(&job(segmented, weak(SAMPLE_VERIFY_WINDOW - 1), true)),
+            ResumePlan::Restart(RestartReason::NoStrongValidator),
+            "a segmented download with less than one window restarts from zero"
+        );
+        let strong_plan = plan_resume(&job(ranged, strong(40), true));
+        assert!(matches!(strong_plan, ResumePlan::Continue(c) if !c.sample));
     }
 
     #[test]

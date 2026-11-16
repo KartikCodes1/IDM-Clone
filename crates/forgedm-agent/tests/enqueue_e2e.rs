@@ -556,6 +556,7 @@ async fn enqueue_over_queue_cap_limit_exceeded() {
     );
     let fixture = FixtureServer::start_on(0).await.unwrap();
     let (data, target) = (TempDir::new().unwrap(), TempDir::new().unwrap());
+    support::harden(data.path());
     let config = Config::new(
         data.path().to_path_buf(),
         ProxyMode::None,

@@ -20,6 +20,7 @@ use uuid::Uuid;
 use crate::clock::BoxFuture;
 use crate::engine::LiveDownload;
 use crate::error::{TaskStop, stop_from_store};
+use crate::fault::{self, FaultPoint};
 use crate::ports::DownloadStore;
 use crate::transfer::segment_table::SegmentTable;
 use crate::transfer::single::{Checkpointer, writer_stop};
@@ -37,6 +38,7 @@ pub async fn flush_then_commit(
     live: &LiveDownload,
 ) -> Result<u64, TaskStop> {
     let frontier = writer.flush().await.map_err(|e| writer_stop(&e))?;
+    fault::hit(FaultPoint::AfterFlushBeforeCommit);
     committer.checkpoint(frontier).await?;
     live.set_committed(frontier);
     Ok(frontier)
@@ -64,7 +66,9 @@ impl Checkpointer for StoreCommitter {
             self.store
                 .checkpoint(self.id, committed, self.total)
                 .await
-                .map_err(|e| stop_from_store(&e))
+                .map_err(|e| stop_from_store(&e))?;
+            fault::hit(FaultPoint::AfterFirstCommit);
+            Ok(())
         })
     }
 }
@@ -90,6 +94,7 @@ pub async fn commit_segments(
         .checkpoint_segments(id, view.records.clone())
         .await
         .map_err(|e| stop_from_store(&e))?;
+    fault::hit(FaultPoint::AfterFirstCommit);
     let committed = table
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
@@ -112,5 +117,6 @@ pub async fn flush_then_commit_segments(
     live: &LiveDownload,
 ) -> Result<u64, TaskStop> {
     writer.flush().await.map_err(|e| writer_stop(&e))?;
+    fault::hit(FaultPoint::AfterFlushBeforeCommit);
     commit_segments(store, id, table, live).await
 }

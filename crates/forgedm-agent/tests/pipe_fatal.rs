@@ -3,6 +3,8 @@
 //! in-process.
 #![allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)] // test code
 
+mod support;
+
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -36,6 +38,7 @@ const WAIT: Duration = Duration::from_secs(60);
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn post_startup_fatal_pipe_error_exits_4() {
     let data = TempDir::new().unwrap();
+    support::harden(data.path());
     let config = Config::new(
         data.path().to_path_buf(),
         ProxyMode::None,

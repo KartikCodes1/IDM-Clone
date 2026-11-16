@@ -237,17 +237,24 @@ async fn resumed_download_checksum_actual_matches_generator() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn weak_or_no_validator_restarts_from_zero() {
+    // Narrowed by S1.14: with a full SAMPLE_VERIFY_WINDOW committed such a download is
+    // sampled and continues (core `remote_change.rs`); only less than a window restarts.
     for (n, etag) in ["weak", "none"].into_iter().enumerate() {
         let h = Harness::new().await;
-        let size = 1_500_000u64;
+        let size = 60_000u64;
         let key = format!("restart_{etag}");
         let url = h.url(&format!(
-            "/f/{}/{size}?slow=500000&etag={etag}&t={key}",
+            "/f/{}/{size}?slow=15000&etag={etag}&t={key}",
             50 + n
         ));
         let id = h.enqueue(&url, "w.bin", None).await;
         h.wait_committed(id, 1).await;
         h.engine.control(id, pause()).await.unwrap();
+        assert!(
+            h.committed(id) < forgedm_core::resume::SAMPLE_VERIFY_WINDOW,
+            "{etag}: precondition, less than one sample window is committed (committed {})",
+            h.committed(id)
+        );
 
         h.engine.control(id, Control::Resume).await.unwrap();
         let (path, _) = completed(&h.sink.wait_terminal(id, WAIT).await);

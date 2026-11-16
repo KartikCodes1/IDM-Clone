@@ -18,6 +18,7 @@ use forgedm_protocol::{DownloadErrorCode, MotwStatus};
 use url::Url;
 
 use crate::error::{Failure, TaskStop, stop_from_platform};
+use crate::fault::{self, FaultPoint};
 
 /// Total time spent retrying a locked destination (A.9 `FINALIZE_LOCK_RETRY`).
 pub const FINALIZE_LOCK_RETRY: Duration = Duration::from_secs(10);
@@ -119,8 +120,10 @@ pub fn finalize(
 ) -> Result<Finalized, TaskStop> {
     let zone = zone_info(source).map_err(|e| stop_from_platform(&e))?;
     let marked_part = mark_part(part, &zone).map_err(|e| stop_from_platform(&e))?;
+    fault::hit(FaultPoint::FinalizingBeforeRename);
     let final_path =
         move_into_place(part, dir, name, on_candidate).map_err(|e| stop_from_platform(&e))?;
+    fault::hit(FaultPoint::AfterRenameBeforeCompleted);
     let motw_status = if marked_part {
         apply_motw(motw, &final_path, &zone)?
     } else {

@@ -3,13 +3,15 @@
 //!
 //! Both directions use the pure mapping [`forgedm_core::state::on_startup`]:
 //! `probing`, `downloading`, `verifying` become `interrupted`; `pausing` becomes `paused`;
-//! `finalizing` is left for the part-file reconcile of S1.14; everything else is kept.
+//! `finalizing` is settled by the part-file reconcile ([`finalizing_parts`]); everything
+//! else is kept.
 //! The only difference is the recorded reason: `crash` at startup (the previous agent did not
 //! settle its downloads), `agent_shutdown` at a graceful shutdown. Each change is a
 //! compare-and-set on the stored state with a `download_events` row.
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
+pub use crate::reconcile_parts::{PartsError, PartsReport, finalizing_parts};
 use forgedm_core::state::on_startup;
 use forgedm_protocol::DownloadState;
 use forgedm_storage::{NewEvent, Storage, StorageError};

@@ -289,7 +289,9 @@ try {
     $bin = Join-Path $Temp 'bin'
     $data = Join-Path $Temp 'data'
     $dl = Join-Path $Temp 'downloads'
-    foreach ($d in @($bin, $data, $dl)) { [void](New-Item -ItemType Directory -Path $d -Force) }
+    # $data is left for the agent to create with its own private DACL; it refuses an explicit
+    # --data-dir that inherits write access for other principals (as %TEMP% folders can).
+    foreach ($d in @($bin, $dl)) { [void](New-Item -ItemType Directory -Path $d -Force) }
     foreach ($name in @('forgedm.exe', 'forgedm-agent.exe', 'forgedm-fixture.exe')) {
         $src = Join-Path $BinDir $name
         if (-not (Test-Path -LiteralPath $src)) { throw ($src + ' is missing; build first or pass -Build / -BinDir') }

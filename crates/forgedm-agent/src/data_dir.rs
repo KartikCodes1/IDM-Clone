@@ -4,9 +4,18 @@
 //! created or opened under the root, the root and each fixed child that already exists must
 //! not be a name-surrogate reparse point (symbolic link or junction): the agent must never
 //! write its database, lock or logs through a redirect.
+//!
+//! An explicit `--data-dir` gets a stricter check ([`DataPaths::prepare_explicit`]): it must
+//! be owned by the current user and no ACE may grant write access to anyone but the
+//! current user, SYSTEM or Administrators. A directory the agent creates itself is created
+//! with an explicit protected DACL. The default `%LOCALAPPDATA%\ForgeDM` keeps the ACL it
+//! inherits from the user profile (the profile is already restricted to those principals),
+//! so it only gets the reparse-point check.
 
 use std::io;
 use std::path::{Path, PathBuf};
+
+use forgedm_platform::acl::{DirAclError, create_private_dir, verify_private_dir};
 
 const DB_FILE: &str = "forgedm.db";
 const LOGS_DIR: &str = "logs";
@@ -39,6 +48,15 @@ pub enum DataDirError {
         /// The redirected path.
         path: PathBuf,
     },
+    /// An explicit data directory is not private to the current user.
+    #[error("{path} is not private to the current user: {source}")]
+    Acl {
+        /// The directory that failed the check.
+        path: PathBuf,
+        /// What is wrong with it.
+        #[source]
+        source: DirAclError,
+    },
 }
 
 /// Resolved locations under a validated data root.
@@ -62,6 +80,28 @@ impl DataPaths {
     /// [`DataDirError::Io`].
     pub fn prepare(root: &Path) -> Result<Self, DataDirError> {
         std::fs::create_dir_all(root).map_err(|e| io_error(root, e))?;
+        Self::finish(root)
+    }
+
+    /// [`Self::prepare`] for an explicit `--data-dir`: a missing root is created with a
+    /// protected DACL (its parents are created normally), and the root must then pass the
+    /// owner and DACL check.
+    ///
+    /// # Errors
+    /// [`DataDirError::Acl`] when the directory is not private, otherwise as
+    /// [`Self::prepare`].
+    pub fn prepare_explicit(root: &Path) -> Result<Self, DataDirError> {
+        if let Some(parent) = root.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| io_error(parent, e))?;
+        }
+        reject_reparse_point(root)?;
+        create_private_dir(root).map_err(|e| acl_error(root, e.into()))?;
+        reject_reparse_point(root)?;
+        verify_private_dir(root).map_err(|e| acl_error(root, e))?;
+        Self::finish(root)
+    }
+
+    fn finish(root: &Path) -> Result<Self, DataDirError> {
         reject_reparse_point(root)?;
         for name in GUARDED_CHILDREN {
             reject_reparse_point(&root.join(name))?;
@@ -78,6 +118,13 @@ impl DataPaths {
             lock: root.join(RUN_DIR).join(LOCK_FILE),
             root,
         })
+    }
+}
+
+fn acl_error(path: &Path, source: DirAclError) -> DataDirError {
+    DataDirError::Acl {
+        path: path.to_path_buf(),
+        source,
     }
 }
 
@@ -159,6 +206,28 @@ mod tests {
         let err = DataPaths::prepare(dir.path()).unwrap_err();
         assert!(matches!(err, DataDirError::ReparsePoint { .. }), "{err}");
         assert_eq!(std::fs::read_dir(other.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn an_explicit_missing_root_is_created_private_and_accepted() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("data");
+
+        let paths = DataPaths::prepare_explicit(&root).unwrap();
+
+        assert!(paths.logs.is_dir() && paths.lock.parent().unwrap().is_dir());
+        verify_private_dir(&paths.root).unwrap();
+        // A second start over the directory it created passes the check as well.
+        assert_eq!(DataPaths::prepare_explicit(&root).unwrap(), paths);
+    }
+
+    #[test]
+    fn an_explicit_root_that_is_a_file_is_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("not-a-dir");
+        std::fs::write(&file, b"x").unwrap();
+        let err = DataPaths::prepare_explicit(&file).unwrap_err();
+        assert!(!matches!(err, DataDirError::ReparsePoint { .. }), "{err}");
     }
 
     #[test]

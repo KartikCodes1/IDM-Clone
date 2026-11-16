@@ -10,6 +10,32 @@ use std::time::{Duration, Instant};
 /// How long a test waits for the agent to come up or to exit.
 pub const WAIT: Duration = Duration::from_secs(20);
 
+/// Restricts an existing `dir` to the current user, SYSTEM and Administrators, as the agent
+/// requires of an explicit `--data-dir` (S1.14). Temporary directories inherit
+/// machine-specific ACEs, so tests harden theirs before an agent can be started on it.
+pub fn harden(dir: &Path) {
+    if !dir.is_dir() {
+        return;
+    }
+    let user = format!(
+        r"{}\{}",
+        std::env::var("USERDOMAIN").expect("USERDOMAIN"),
+        std::env::var("USERNAME").expect("USERNAME")
+    );
+    let out = Command::new("icacls")
+        .arg(dir)
+        .args(["/inheritance:r", "/grant:r"])
+        .arg(format!("{user}:(OI)(CI)F"))
+        .args(["*S-1-5-18:(OI)(CI)F", "*S-1-5-32-544:(OI)(CI)F"])
+        .output()
+        .expect("run icacls");
+    assert!(
+        out.status.success(),
+        "icacls failed: {}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+}
+
 /// The CLI binary built for this test run.
 pub fn cli_exe() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_forgedm"))
@@ -28,6 +54,7 @@ pub fn agent_exe() -> PathBuf {
 
 /// Runs `forgedm --data-dir <dir> <args...>` to completion.
 pub fn run_cli(data_dir: &Path, args: &[&str]) -> Output {
+    harden(data_dir);
     Command::new(cli_exe())
         .arg("--data-dir")
         .arg(data_dir)
@@ -60,6 +87,7 @@ pub struct AgentProc {
 impl AgentProc {
     /// Starts the agent with `--data-dir <dir> --proxy none`.
     pub fn start(data_dir: &Path) -> Self {
+        harden(data_dir);
         let child = Command::new(agent_exe())
             .arg("--data-dir")
             .arg(data_dir)
@@ -202,6 +230,7 @@ impl Drop for FixtureProc {
 
 /// Runs `forgedm --data-dir <dir> <args...>` with `stdin_text` on standard input.
 pub fn run_cli_with_stdin(data_dir: &Path, args: &[&str], stdin_text: &str) -> Output {
+    harden(data_dir);
     let mut child = Command::new(cli_exe())
         .arg("--data-dir")
         .arg(data_dir)
@@ -270,6 +299,7 @@ pub struct FileRun {
 /// so with pipes `Command::output` would wait for the agent to exit (see the open issue
 /// recorded for S1.7 about `ipc::bootstrap`).
 pub fn run_cli_to_files(data_dir: &Path, args: &[&str], scratch: &Path) -> FileRun {
+    harden(data_dir);
     let out_path = scratch.join("cli-stdout.txt");
     let err_path = scratch.join("cli-stderr.txt");
     let status = Command::new(cli_exe())

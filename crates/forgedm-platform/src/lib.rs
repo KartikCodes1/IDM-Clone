@@ -2,6 +2,7 @@
 //!
 //! Unsafe is denied by the workspace lints; FFI modules opt in locally with a justification.
 
+pub mod acl;
 pub mod dpapi;
 pub mod error;
 pub mod fs;
