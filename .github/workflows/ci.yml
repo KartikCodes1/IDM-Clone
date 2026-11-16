@@ -1,0 +1,137 @@
+# Continuous integration: every push to main and every pull request.
+# Actions are pinned to full commit SHAs (supply-chain hygiene); Dependabot keeps them current.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  # Superseded pull-request runs are cancelled; every push to main is tested to the end.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  RUST_BACKTRACE: "1"
+
+jobs:
+  rust:
+    name: Rust (fmt, clippy, tests, smoke, first proof)
+    runs-on: windows-2025
+    timeout-minutes: 90
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install the pinned Rust toolchain (rust-toolchain.toml)
+        run: |
+          rustup toolchain install
+          rustup show active-toolchain
+
+      - name: Set up Node
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 26.13.1
+
+      - name: Set up pnpm (version from package.json packageManager)
+        uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+
+      - name: Install JS dependencies
+        run: pnpm install --frozen-lockfile
+
+      # tauri::generate_context!() embeds apps/desktop/dist, so it must exist before cargo
+      # compiles the desktop crate.
+      - name: Build the desktop frontend
+        run: pnpm --filter @forgedm/desktop build
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+
+      - name: Format
+        run: cargo fmt --all --check
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      - name: Tests
+        run: cargo test --workspace --locked --no-fail-fast
+
+      - name: Crash matrix (fault injection)
+        run: cargo test -p forgedm-agent --features fault-injection --test crash_matrix --locked
+
+      - name: Build binaries for the scripts
+        run: cargo build --workspace --bins --locked
+
+      - name: Static checks
+        shell: powershell
+        run: powershell -NoProfile -ExecutionPolicy Bypass -File scripts\check.ps1
+
+      - name: Agent and CLI smoke test
+        shell: powershell
+        run: powershell -NoProfile -ExecutionPolicy Bypass -File scripts\windows-smoke.ps1
+
+      - name: First proof (kill mid-download, resume, identical SHA-256)
+        shell: powershell
+        run: powershell -NoProfile -ExecutionPolicy Bypass -File scripts\phase1-proof.ps1
+
+  desktop:
+    name: Desktop (lint, types, tests, audit)
+    runs-on: windows-2025
+    timeout-minutes: 30
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Node
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 26.13.1
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+
+      - name: Install
+        run: pnpm install --frozen-lockfile
+
+      - name: Lint
+        run: pnpm -r lint
+
+      - name: Typecheck
+        run: pnpm -r typecheck
+
+      - name: Unit tests
+        run: pnpm -r test
+
+      # Live advisory data can change without any code change, so this does not fail PRs.
+      # The weekly Audit workflow and the Release workflow run it as a blocking check.
+      - name: Audit production dependencies (informational)
+        continue-on-error: true
+        run: pnpm audit --prod
+
+  deny:
+    name: Dependency policy (cargo-deny)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Advisories, licences, bans and sources
+        uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
+        with:
+          arguments: --all-features --locked
+          command: check
+          command-arguments: advisories licenses bans sources

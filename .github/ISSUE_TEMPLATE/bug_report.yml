@@ -1,0 +1,45 @@
+name: Bug report
+description: Something in ForgeDM does not work as expected
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the report. Please do not paste full download URLs that contain tokens or signatures; replace them with `<redacted>`.
+  - type: input
+    id: version
+    attributes:
+      label: ForgeDM version
+      description: Shown in the installer name or by `forgedm --version`.
+      placeholder: "0.1.0"
+    validations:
+      required: true
+  - type: input
+    id: windows
+    attributes:
+      label: Windows version
+      placeholder: "Windows 11 24H2"
+    validations:
+      required: true
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened, and what did you expect?
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. Add a download from ...
+        2. Pause it at ...
+        3. ...
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant log lines
+      description: From %LOCALAPPDATA%\ForgeDM\logs (agent.log*, desktop.*). URLs there are already redacted.
+      render: text

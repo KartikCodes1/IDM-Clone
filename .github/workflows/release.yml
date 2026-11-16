@@ -1,0 +1,168 @@
+# Release: pushing a tag vX.Y.Z builds the Windows installer from that commit on a clean
+# GitHub runner, records build provenance, and opens a DRAFT GitHub Release with the
+# installer and SHA256SUMS.txt. A maintainer checks the draft and publishes it by hand.
+name: Release
+
+on:
+  push:
+    tags:
+      - "v[0-9]+.[0-9]+.[0-9]+"
+      - "v[0-9]+.[0-9]+.[0-9]+-*"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  installer:
+    name: Build installer and draft release
+    runs-on: windows-2025
+    timeout-minutes: 120
+    permissions:
+      contents: write # create the draft release and upload its assets
+      id-token: write # sign the build provenance (Sigstore)
+      attestations: write # store the build provenance
+      actions: read # confirm the tagged commit passed CI
+    env:
+      TAG: ${{ github.ref_name }}
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      # A release is cut only from a commit that is on main and already passed CI.
+      - name: Check the tagged commit is on main and passed CI
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          git fetch --no-tags origin main
+          git merge-base --is-ancestor $env:GITHUB_SHA origin/main
+          if ($LASTEXITCODE -ne 0) { throw "tagged commit $($env:GITHUB_SHA) is not on main" }
+          $ok = gh run list --repo $env:GITHUB_REPOSITORY --workflow ci.yml --commit $env:GITHUB_SHA --status success --json databaseId --jq 'length'
+          if ([int]$ok -lt 1) { throw "no successful CI run for $($env:GITHUB_SHA); push main, wait for CI to pass, then tag" }
+
+      - name: Check the tag matches every version field
+        shell: pwsh
+        run: |
+          $version = $env:TAG -replace '^v', ''
+          $tauri = (Get-Content -Raw apps/desktop/src-tauri/tauri.conf.json | ConvertFrom-Json).version
+          $pkg = (Get-Content -Raw apps/desktop/package.json | ConvertFrom-Json).version
+          $cargo = [regex]::Match((Get-Content -Raw Cargo.toml), '(?ms)^\[workspace\.package\].*?^version\s*=\s*"([^"]+)"').Groups[1].Value
+          foreach ($pair in @(@('tauri.conf.json', $tauri), @('apps/desktop/package.json', $pkg), @('Cargo.toml [workspace.package]', $cargo))) {
+            if ($pair[1] -ne $version) { throw "$($pair[0]) has version '$($pair[1])' but the tag is $env:TAG" }
+          }
+          if (-not (Select-String -Path CHANGELOG.md -SimpleMatch "## [$version]" -Quiet)) { throw "CHANGELOG.md has no section for $version" }
+          "VERSION=$version" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Install the pinned Rust toolchain
+        run: |
+          rustup toolchain install
+          rustup show active-toolchain
+
+      - name: Set up Node
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 26.13.1
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+
+      - name: Install JS dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Audit production JS dependencies
+        run: pnpm audit --prod
+
+      - name: Build the desktop frontend
+        run: pnpm --filter @forgedm/desktop build
+
+      - name: Tests on the tagged commit
+        run: cargo test --workspace --locked --no-fail-fast
+
+      # Builds release forgedm-agent and forgedm (sidecars), the desktop app and the
+      # per-user NSIS installer (Tauri fetches NSIS itself).
+      - name: Build the installer
+        run: pnpm --filter @forgedm/desktop run package
+
+      - name: Collect the installer and checksums
+        shell: pwsh
+        run: |
+          $name = "ForgeDM_$($env:VERSION)_x64-setup.exe"
+          $src = Join-Path 'target/release/bundle/nsis' $name
+          if (-not (Test-Path -LiteralPath $src)) { throw "expected installer $src was not built" }
+          New-Item -ItemType Directory -Path release-assets | Out-Null
+          Copy-Item -LiteralPath $src -Destination release-assets/
+          $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath (Join-Path release-assets $name)).Hash.ToLowerInvariant()
+          "$hash  $name" | Out-File -FilePath release-assets/SHA256SUMS.txt -Encoding ascii
+          Get-Content release-assets/SHA256SUMS.txt
+
+      # Install silently on this clean runner, check the installed CLI runs, then uninstall.
+      # Per-user NSIS installs into %LOCALAPPDATA%\ForgeDM (Tauri's currentUser default).
+      - name: Smoke-test the installer
+        shell: pwsh
+        run: |
+          $setup = Join-Path release-assets "ForgeDM_$($env:VERSION)_x64-setup.exe"
+          $p = Start-Process -FilePath $setup -ArgumentList '/S' -Wait -PassThru
+          if ($p.ExitCode -ne 0) { throw "installer exited $($p.ExitCode)" }
+          $dir = Join-Path $env:LOCALAPPDATA 'ForgeDM'
+          foreach ($f in 'forgedm.exe', 'forgedm-agent.exe', 'uninstall.exe') {
+            if (-not (Test-Path -LiteralPath (Join-Path $dir $f))) { throw "$f was not installed in $dir" }
+          }
+          Get-ChildItem -LiteralPath $dir -Filter *.exe | Format-Table Name, Length
+          $out = & (Join-Path $dir 'forgedm.exe') --version
+          if ($LASTEXITCODE -ne 0 -or "$out" -ne "forgedm $($env:VERSION)") { throw "forgedm --version printed '$out' (exit $LASTEXITCODE)" }
+          $u = Start-Process -FilePath (Join-Path $dir 'uninstall.exe') -ArgumentList '/S', "_?=$dir" -Wait -PassThru
+          if ($u.ExitCode -ne 0) { throw "uninstaller exited $($u.ExitCode)" }
+          if (Test-Path -LiteralPath (Join-Path $dir 'forgedm.exe')) { throw 'uninstall left forgedm.exe behind' }
+
+      - name: Record build provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: |
+            release-assets/ForgeDM_*_x64-setup.exe
+            release-assets/SHA256SUMS.txt
+
+      - name: Release notes from CHANGELOG.md
+        shell: pwsh
+        run: |
+          $lines = @(Get-Content CHANGELOG.md)
+          $header = "## [$($env:VERSION)]"
+          $start = -1
+          for ($i = 0; $i -lt $lines.Count; $i++) { if ($lines[$i].StartsWith($header)) { $start = $i; break } }
+          if ($start -lt 0) { throw "no CHANGELOG section for $($env:VERSION)" }
+          $end = $lines.Count
+          for ($i = $start + 1; $i -lt $lines.Count; $i++) { if ($lines[$i].StartsWith('## [')) { $end = $i; break } }
+          if ($end -le $start + 1) { throw "the CHANGELOG section for $($env:VERSION) is empty" }
+          $body = ($lines[($start + 1)..($end - 1)] -join "`n").Trim()
+          if ([string]::IsNullOrWhiteSpace($body)) { throw "the CHANGELOG section for $($env:VERSION) is empty" }
+          $exe = "ForgeDM_$($env:VERSION)_x64-setup.exe"
+          $verify = @(
+            '',
+            '## Verify the download',
+            '',
+            ('1. Checksum: `(Get-FileHash .\' + $exe + ').Hash.ToLower()` must equal the value in `SHA256SUMS.txt`.'),
+            ('2. Provenance: `gh attestation verify .\' + $exe + ' --repo ' + $env:GITHUB_REPOSITORY + ' --signer-workflow ' + $env:GITHUB_REPOSITORY + '/.github/workflows/release.yml --source-ref refs/tags/' + $env:TAG + ' --deny-self-hosted-runners` checks it was built by this repository''s release workflow from tag ' + $env:TAG + ' on a GitHub-hosted runner.'),
+            '',
+            'The installer is not code-signed, so Windows SmartScreen may warn on first run ("More info", then "Run anyway").'
+          ) -join "`n"
+          ($body + "`n" + $verify + "`n") | Out-File -FilePath release-notes.md -Encoding utf8
+          Get-Content release-notes.md
+
+      - name: Create the draft release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $flags = @('--draft', '--verify-tag', '--title', "ForgeDM $($env:TAG)", '--notes-file', 'release-notes.md')
+          if ($env:VERSION -like '0.*' -or $env:VERSION -like '*-*') { $flags += '--prerelease' }
+          gh release create $env:TAG (Get-ChildItem release-assets).FullName @flags
