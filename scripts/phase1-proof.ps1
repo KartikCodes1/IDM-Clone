@@ -1,27 +1,30 @@
 <#
 .SYNOPSIS
-    ForgeDM FIRST PROOF (PHASE_0_1_PLAN S1.9, milestone M1): kill the agent mid-download and
-    prove the restarted agent resumes and finishes with byte-identical content.
+    ForgeDM FIRST PROOF (PHASE_0_1_PLAN S1.9, milestone M1), segment-aware: kill the agent
+    mid-download of a segmented file and prove the restarted agent resumes every segment and
+    finishes with byte-identical content.
 
 .DESCRIPTION
     1. Copies forgedm.exe, forgedm-agent.exe and forgedm-fixture.exe from <target>\debug (or
        -BinDir) into a fresh temp directory and starts the fixture and the agent from there.
-    2. forgedm add: a 256 MiB (default) file that is fast for most of its length and then
-       crawls at 640 KiB/s (the fixture's slow cap), so the kill lands mid-download.
-    3. Waits (forgedm get --json) until at least 30% is committed, then Stop-Process -Force on
-       the agent (a crash, not a shutdown).
-    4. Before the restart: the .part file's committed prefix is compared with the generator
-       (forgedm-fixture verify-prefix).
-    5. Restarts the agent. The first look at the database's committed offset must be at least
-       the one seen before the kill and its prefix must match the generator too. Auto-resume
-       finishes the download.
-    6. From the fixture request log (/__log): every resumed GET starts at or after the offset
-       that was committed before the kill and sends If-Range; the bytes the server handed out
-       stay within size + (bytes accepted but uncommitted before the kill) + a slack for bytes
-       in flight; far less than a second full download.
-    7. Get-FileHash SHA-256 of the finished file equals "forgedm-fixture hash" and the agent's
-       own recorded digest. A matching hash alone does not pass: every check above must hold.
-    8. Prints PASS or FAIL per check and overall; exit code 1 on any FAIL. Always kills the
+    2. forgedm add --connections 8: a fixed-seed 256 MiB (default) file, throttled over its
+       WHOLE length per connection (fixture slow=<bytes per second>), so the download takes
+       roughly 10-25 s and is split into several segments (files of 8 MiB or more are
+       segmented since S1.11).
+    3. Polls forgedm get --json; as soon as committed_bytes is at least 30% of the size it
+       Stop-Process -Force's the agent (a crash, not a shutdown). The exact kill percentage is
+       reported. The proof is only valid if the kill lands between 30% and 70%.
+    4. Before the restart: exactly one .forgedm.part exists and every committed segment range
+       [start, start+committed) in it matches the generator. The generator side of that range
+       check is a plain unthrottled range GET against the fixture; those requests are
+       excluded from the agent checks by their /__log seq.
+    5. Restarts the agent; auto-resume finishes the download. Then: the DB kept at least the
+       pre-kill committed bytes per segment; every GET the agent sent after the kill starts at
+       or after its segment's pre-kill committed end and sends If-Range; served bytes stay
+       within size + accepted-but-uncommitted + in-flight slack (one chunk per connection) and
+       far below 2x the size; Get-FileHash equals "forgedm-fixture hash"; the agent recorded
+       the same digest; no staging file is left.
+    6. Prints PASS or FAIL per check and overall; exit code 1 on any FAIL. Always kills the
        processes it started and removes its temp directory (unless -KeepTemp).
 
     It does not build anything unless -Build is given. Build first with:
@@ -39,6 +42,12 @@
 .PARAMETER Seed
     Generator seed of the test file.
 
+.PARAMETER SlowBps
+    Per-connection throttle in bytes per second (default 3000000; 8 connections ~ 11 s total).
+
+.PARAMETER Connections
+    Connections requested from the agent (default 8).
+
 .PARAMETER BinDir
     Directory holding the three executables (default <CARGO_TARGET_DIR or repo\target>\debug).
 
@@ -55,6 +64,8 @@
 param(
     [int] $SizeMiB = 256,
     [uint64] $Seed = 77,
+    [int] $SlowBps = 3000000,
+    [int] $Connections = 8,
     [string] $BinDir = '',
     [switch] $Build,
     [switch] $KeepTemp
@@ -66,11 +77,10 @@ Set-StrictMode -Version 2.0
 $RepoRoot = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot '..')).ProviderPath
 $MiB = [uint64]1048576
 $Size = [uint64]$SizeMiB * $MiB
-# Throttled tail: 12 MiB at the fixture's 640 KiB/s cap is about 19 s.
-$TailBytes = [uint64]12 * $MiB
-$SlowBps = 655360
-$CommittedFraction = 30
-$InFlightSlack = [uint64]6 * $MiB
+$KillMinPercent = 30
+$KillMaxPercent = 70
+# One in-flight chunk (1 MiB) per connection may be served but not yet accepted at the kill.
+$InFlightSlack = [uint64]$Connections * $MiB
 $ReadyTimeoutSec = 30
 $CommitTimeoutSec = 120
 $FinishTimeoutSec = 300
@@ -92,7 +102,7 @@ function Write-Check {
 
 function Quote-Arg {
     param([string] $Arg)
-    if ($Arg.Length -gt 0 -and $Arg -notmatch '\s') { return $Arg }
+    if ($Arg.Length -gt 0 -and $Arg -notmatch '[\s&]') { return $Arg }
     return '"' + $Arg + '"'
 }
 
@@ -123,6 +133,7 @@ function Start-Tracked {
     $argText = (($Arguments | ForEach-Object { Quote-Arg $_ }) -join ' ')
     $proc = Start-Process -FilePath $Exe -ArgumentList $argText -PassThru -WindowStyle Hidden `
         -RedirectStandardOutput $OutFile -RedirectStandardError $ErrFile
+    [void]$proc.Handle   # keep the handle so ExitCode stays readable
     $script:Started.Add($proc)
     return $proc
 }
@@ -164,10 +175,95 @@ function Wait-AgentReady {
     })
 }
 
-function Get-RangeStart {
-    param([string] $Range)
-    if ($Range -match '^bytes=(\d+)-') { return [uint64]$Matches[1] }
-    throw ('not a byte range: ' + $Range)
+# Segments of a download detail as @{ Start; Committed; End } (End = start + committed).
+function Get-SegmentRanges {
+    param($Detail)
+    $list = @()
+    foreach ($s in @($Detail.segments)) {
+        $start = [uint64]$s.start
+        $committed = [uint64]$s.committed
+        $list += ,@{ Start = $start; Committed = $committed; End = ($start + $committed) }
+    }
+    return ,$list
+}
+
+function Format-Segments {
+    param($Detail)
+    return (@($Detail.segments | ForEach-Object { '{0}+{1}' -f $_.start, $_.committed }) -join ' ')
+}
+
+# SHA-256 (upper hex) of FILE[Start, Start+Len).
+function Get-FileRangeHash {
+    param([string] $Path, [uint64] $Start, [uint64] $Len)
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    $fs = [System.IO.File]::Open($Path, 'Open', 'Read', 'ReadWrite')
+    try {
+        [void]$fs.Seek([int64]$Start, 'Begin')
+        $buf = New-Object byte[] 1048576
+        $left = [int64]$Len
+        while ($left -gt 0) {
+            $n = $fs.Read($buf, 0, [int][Math]::Min([int64]$buf.Length, $left))
+            if ($n -le 0) { throw 'short read of the .part file' }
+            [void]$sha.TransformBlock($buf, 0, $n, $null, 0)
+            $left -= $n
+        }
+        [void]$sha.TransformFinalBlock($buf, 0, 0)
+        return ([BitConverter]::ToString($sha.Hash) -replace '-', '')
+    } finally { $fs.Dispose() }
+}
+
+# SHA-256 (upper hex) of the generator's bytes [Start, Start+Len), via an unthrottled range GET.
+function Get-GeneratorRangeHash {
+    param([string] $Base, [uint64] $Start, [uint64] $Len)
+    $req = [System.Net.HttpWebRequest]::Create(('{0}/f/{1}/{2}' -f $Base, $Seed, $Size))
+    $req.Proxy = $null
+    $req.AddRange([int64]$Start, [int64]($Start + $Len - 1))
+    $resp = $req.GetResponse()
+    try {
+        $sha = [System.Security.Cryptography.SHA256]::Create()
+        $stream = $resp.GetResponseStream()
+        $buf = New-Object byte[] 1048576
+        $total = [uint64]0
+        while (($n = $stream.Read($buf, 0, $buf.Length)) -gt 0) {
+            [void]$sha.TransformBlock($buf, 0, $n, $null, 0)
+            $total += [uint64]$n
+        }
+        [void]$sha.TransformFinalBlock($buf, 0, 0)
+        if ($total -ne $Len) { throw ('the fixture returned {0} of {1} bytes' -f $total, $Len) }
+        return ([BitConverter]::ToString($sha.Hash) -replace '-', '')
+    } finally { $resp.Close() }
+}
+
+# One request to the unthrottled fixture URL; returns @{ Status; ETag; LastModified; Length }.
+function Invoke-FixtureProbe {
+    param([string] $Base, [string] $Method, [string] $IfRange = '', [int64] $RangeStart = -1, [int64] $RangeEnd = -1)
+    $req = [System.Net.HttpWebRequest]::Create(('{0}/f/{1}/{2}' -f $Base, $Seed, $Size))
+    $req.Proxy = $null
+    $req.Method = $Method
+    if ($RangeStart -ge 0) { $req.AddRange($RangeStart, $RangeEnd) }
+    if ($IfRange -ne '') { $req.Headers.Add('If-Range', $IfRange) }
+    $resp = $req.GetResponse()
+    try {
+        $len = [int64]0
+        if ($Method -eq 'GET') {
+            $stream = $resp.GetResponseStream()
+            $buf = New-Object byte[] 65536
+            while (($n = $stream.Read($buf, 0, $buf.Length)) -gt 0) { $len += $n }
+        }
+        return @{
+            Status = [int]$resp.StatusCode
+            ETag = [string]$resp.Headers['ETag']
+            LastModified = [string]$resp.Headers['Last-Modified']
+            Length = $len
+        }
+    } finally { $resp.Close() }
+}
+
+function Get-MaxSeq {
+    param($Requests)
+    $max = [uint64]0
+    foreach ($r in $Requests) { if ([uint64]$r.seq -gt $max) { $max = [uint64]$r.seq } }
+    return $max
 }
 
 # ---------------------------------------------------------------------------------------------
@@ -205,8 +301,8 @@ try {
 
     # 1. The fixture server.
     $fixtureOut = Join-Path $Temp 'fixture.out.txt'
-    $fixture = Start-Tracked -Exe $fixtureExe -Arguments @('serve', '--port', '0') `
-        -OutFile $fixtureOut -ErrFile (Join-Path $Temp 'fixture.err.txt')
+    [void](Start-Tracked -Exe $fixtureExe -Arguments @('serve', '--port', '0') `
+        -OutFile $fixtureOut -ErrFile (Join-Path $Temp 'fixture.err.txt'))
     $baseUrl = Wait-Until -What 'the fixture to print its URL' -TimeoutSec $ReadyTimeoutSec -Done {
         if (Test-Path -LiteralPath $fixtureOut) {
             $first = Get-Content -LiteralPath $fixtureOut -TotalCount 1 -ErrorAction SilentlyContinue
@@ -214,56 +310,82 @@ try {
         }
         return $null
     }
-    $slowFrom = $Size - $TailBytes
-    $url = '{0}/f/{1}/{2}?slow={3}&slow_from={4}' -f $baseUrl, $Seed, $Size, $SlowBps, $slowFrom
-    Write-Host ('fixture {0}, file {1} MiB (seed {2}), throttled from byte {3}' -f $baseUrl, $SizeMiB, $Seed, $slowFrom)
+    $url = '{0}/f/{1}/{2}?slow={3}' -f $baseUrl, $Seed, $Size, $SlowBps
+    Write-Host ('fixture {0}, file {1} MiB (seed {2}), {3} B/s per connection over the whole file, {4} connections' -f $baseUrl, $SizeMiB, $Seed, $SlowBps, $Connections)
 
     # 2. The agent and the download.
     $agentArgs = @('--data-dir', $data, '--proxy', 'none')
     $agent = Start-Tracked -Exe $agentExe -Arguments $agentArgs `
         -OutFile (Join-Path $Temp 'agent1.out.txt') -ErrFile (Join-Path $Temp 'agent1.err.txt')
     Wait-AgentReady -Cli $cli -DataDir $data
-    $add = Invoke-Native -Exe $cli -Arguments @('--data-dir', $data, 'add', $url, '--dir', $dl, '--file-name', 'proof.bin')
+    $add = Invoke-Native -Exe $cli -Arguments @('--data-dir', $data, 'add', $url, '--dir', $dl, '--file-name', 'proof.bin', '--connections', "$Connections")
     $addOk = ($add.Code -eq 0) -and ($add.Out -match '(?m)^added (\S+) ')
     Write-Check 'forgedm add queued the download' $addOk ('exit ' + $add.Code)
-    if (-not $addOk) { throw ('add failed: ' + $add.Err) }
+    if (-not $addOk) { throw ('add failed: ' + $add.Err + $add.Out) }
     $id = $Matches[1]
 
-    # 3. Wait for at least 30% committed, then kill the agent.
-    $needed = [uint64]($Size * $CommittedFraction / 100)
-    $last = $null
-    [void](Wait-Until -What ('{0}% committed' -f $CommittedFraction) -TimeoutSec $CommitTimeoutSec -Done {
+    # 3. Poll until at least 30% is committed, then kill the agent.
+    $needed = [uint64]($Size * $KillMinPercent / 100)
+    [void](Wait-Until -What ('{0}% committed' -f $KillMinPercent) -TimeoutSec $CommitTimeoutSec -PollMs 20 -Done {
         $script:snap = Get-Download -Cli $cli -DataDir $data -Id $id
+        if ($script:snap.state -in @('failed', 'cancelled', 'completed')) { throw ('the download reached ' + $script:snap.state + ' before the kill') }
         ([uint64]$script:snap.committed_bytes) -ge $needed
     })
-    $last = $script:snap
-    $committedBefore = [uint64]$last.committed_bytes
-    $acceptedBefore = [uint64]$last.accepted_bytes
-    Write-Check 'the kill lands mid-download' ($last.state -ne 'completed') ('state ' + $last.state)
+    $pre = $script:snap
     Stop-Process -Id $agent.Id -Force
     [void]$agent.WaitForExit(10000)
-    Write-Host ('killed the agent at committed={0} accepted={1} of {2}' -f $committedBefore, $acceptedBefore, $Size)
+    $committedBefore = [uint64]$pre.committed_bytes
+    $acceptedBefore = [uint64]$pre.accepted_bytes
+    $killPercent = [Math]::Round(100.0 * $committedBefore / $Size, 2)
+    Write-Host ('killed the agent at committed={0} accepted={1} of {2}: KILL AT {3}%' -f $committedBefore, $acceptedBefore, $Size, $killPercent)
+    Write-Host ('pre-kill segments (start+committed): ' + (Format-Segments $pre))
+    $killOk = ($killPercent -ge $KillMinPercent) -and ($killPercent -le $KillMaxPercent)
+    Write-Check ('the kill landed between {0}% and {1}%' -f $KillMinPercent, $KillMaxPercent) $killOk ('kill at ' + $killPercent + '%')
+    if (-not $killOk) { throw ('invalid proof: the kill landed at {0}%, past {1}%; lower -SlowBps so the download is slower' -f $killPercent, $KillMaxPercent) }
 
-    # 4. The committed prefix of the .part matches the generator.
+    $preSeg = Get-SegmentRanges $pre
+    $segCount = @($preSeg).Count
+    Write-Check 'the file was downloaded in several segments' ($segCount -ge 2) ('segments ' + $segCount)
+    $preSum = [uint64]0
+    foreach ($s in $preSeg) { $preSum += $s.Committed }
+    Write-Check 'pre-kill segment committed bytes sum to committed_bytes' ($preSum -eq $committedBefore) ('sum ' + $preSum)
+
+    # 4. Exactly one .part, and every committed segment range matches the generator.
     $parts = @(Get-ChildItem -LiteralPath $dl -Filter '*.forgedm.part')
     Write-Check 'exactly one staging file after the kill' ($parts.Count -eq 1) ('count ' + $parts.Count)
-    if ($parts.Count -ne 1) { throw 'no staging file to verify' }
+    if ($parts.Count -ne 1) { throw 'no single staging file to verify' }
     $part = $parts[0].FullName
-    $v1 = Invoke-Native -Exe $fixtureExe -Arguments @('verify-prefix', '--file', $part, '--seed', "$Seed", '--len', "$committedBefore")
-    Write-Check 'committed prefix of the .part matches the generator' ($v1.Code -eq 0) ($v1.Out.Trim() + $v1.Err.Trim())
+    $bad = @()
+    $verifyBytes = [uint64]0
+    $checked = 0
+    foreach ($s in $preSeg) {
+        if ($s.Committed -eq 0) { continue }
+        $checked++
+        $verifyBytes += $s.Committed
+        $a = Get-FileRangeHash -Path $part -Start $s.Start -Len $s.Committed
+        $b = Get-GeneratorRangeHash -Base $baseUrl -Start $s.Start -Len $s.Committed
+        if ($a -ne $b) { $bad += ('{0}-{1}' -f $s.Start, ($s.End - 1)) }
+    }
+    Write-Check 'every committed segment range of the .part matches the generator' (($bad.Count -eq 0) -and ($checked -ge 1)) ('ranges ' + $checked + '; mismatched: ' + ($bad -join ','))
 
-    # 5. Restart: the database's committed offset, then auto-resume to completion.
-    $agent2 = Start-Tracked -Exe $agentExe -Arguments $agentArgs `
-        -OutFile (Join-Path $Temp 'agent2.out.txt') -ErrFile (Join-Path $Temp 'agent2.err.txt')
+    # Everything in the log up to here (the agent's pre-kill GETs and the script's own
+    # verification fetches) is at or below this seq; the agent's resumed GETs are above it.
+    $resumeSeq = Get-MaxSeq @((Invoke-RestMethod -Uri ($baseUrl + '/__log')).requests)
+
+    # 5. Restart: the database's per-segment committed offsets, then auto-resume to completion.
+    [void](Start-Tracked -Exe $agentExe -Arguments $agentArgs `
+        -OutFile (Join-Path $Temp 'agent2.out.txt') -ErrFile (Join-Path $Temp 'agent2.err.txt'))
     Wait-AgentReady -Cli $cli -DataDir $data
-    $restarted = Get-Download -Cli $cli -DataDir $data -Id $id
-    $segment = @($restarted.segments)[0]
-    $dbCommitted = [uint64]$segment.start + [uint64]$segment.committed
-    Write-Check 'the database kept at least what was committed before the kill' ($dbCommitted -ge $committedBefore) ("db committed $dbCommitted")
-    $v2 = Invoke-Native -Exe $fixtureExe -Arguments @('verify-prefix', '--file', $part, '--seed', "$Seed", '--len', "$dbCommitted")
-    Write-Check 'every database committed range matches the generator' ($v2.Code -eq 0) ($v2.Out.Trim() + $v2.Err.Trim())
+    $post = Get-Download -Cli $cli -DataDir $data -Id $id
+    Write-Host ('after restart: committed_bytes={0}, segments: {1}' -f $post.committed_bytes, (Format-Segments $post))
+    $postSeg = Get-SegmentRanges $post
+    $lost = @()
+    foreach ($s in $preSeg) {
+        $match = @($postSeg | Where-Object { $_.Start -eq $s.Start })
+        if ($match.Count -ne 1 -or $match[0].Committed -lt $s.Committed) { $lost += [string]$s.Start }
+    }
+    Write-Check 'the database kept at least the pre-kill committed bytes of every segment' (($lost.Count -eq 0) -and ([uint64]$post.committed_bytes -ge $committedBefore)) ('segments short or missing: ' + ($lost -join ','))
 
-    $done = $null
     [void](Wait-Until -What 'the download to complete' -TimeoutSec $FinishTimeoutSec -PollMs 250 -Done {
         $script:snap = Get-Download -Cli $cli -DataDir $data -Id $id
         if ($script:snap.state -in @('failed', 'cancelled')) { throw ('the download ended ' + $script:snap.state) }
@@ -271,25 +393,62 @@ try {
     })
     $done = $script:snap
 
-    # 6. The request log: resumed GETs start at or after the committed offset; served bytes bounded.
+    # 6. The request log, the agent's own requests only.
     $log = Invoke-RestMethod -Uri ($baseUrl + '/__log')
-    $transfers = @($log.requests | Where-Object { $_.method -eq 'GET' -and $_.range -ne 'bytes=0-0' })
-    Write-Check 'a transfer before and after the kill' ($transfers.Count -ge 2) ('transfers ' + $transfers.Count)
-    $startsOk = ($transfers.Count -ge 2) -and ((Get-RangeStart $transfers[0].range) -eq 0)
-    $resumedOk = $transfers.Count -ge 2
-    for ($i = 1; $i -lt $transfers.Count; $i++) {
-        $s = Get-RangeStart $transfers[$i].range
-        if ($s -lt $committedBefore) { $resumedOk = $false }
-        if (-not $transfers[$i].if_range) { $resumedOk = $false }
-        Write-Host ('  resumed GET {0} range {1} if-range {2}' -f $i, $transfers[$i].range, $transfers[$i].if_range)
+    $reqs = @($log.requests)
+    $isTransfer = { $_.method -eq 'GET' -and $_.range -ne 'bytes=0-0' }
+    $preGets = @($reqs | Where-Object { [uint64]$_.seq -le $resumeSeq } | Where-Object $isTransfer)
+    $postGets = @($reqs | Where-Object { [uint64]$_.seq -gt $resumeSeq } | Where-Object $isTransfer)
+    Write-Host ('GETs up to the restart (agent + verification fetches): {0}; after the restart: {1}' -f $preGets.Count, $postGets.Count)
+    $firstRange = 'none'
+    if ($preGets.Count -ge 1) { $firstRange = [string]$preGets[0].range }
+    Write-Check 'the first GET started at byte 0' ($firstRange -match '^bytes=0-') $firstRange
+    Write-Check 'the agent sent GETs after the restart' ($postGets.Count -ge 1) ('count ' + $postGets.Count)
+
+    # The validator the fixture issues for this file; a conditional range GET is only honoured
+    # (206) when If-Range carries exactly this value.
+    $head = Invoke-FixtureProbe -Base $baseUrl -Method 'HEAD'
+    $validator = $head.ETag
+    if ([string]::IsNullOrEmpty($validator)) { $validator = $head.LastModified }
+    Write-Host ('fixture validator for the file: ' + $validator)
+    $resumedOk = $true
+    $ifRangeOk = $true
+    $ifRangeValueOk = $true
+    foreach ($g in $postGets) {
+        $note = ''
+        if ([string]$g.range -notmatch '^bytes=(\d+)-(\d*)$') {
+            $resumedOk = $false
+            $note = '  NOT A BYTE RANGE'
+        } else {
+            $start = [uint64]$Matches[1]
+            # The segment owning this offset: the last pre-kill segment starting at or before it.
+            $owner = $null
+            foreach ($s in $preSeg) { if ($s.Start -le $start) { $owner = $s } }
+            if ($null -eq $owner -or $start -lt $owner.End) {
+                $resumedOk = $false
+                $note = '  STARTS BEFORE ITS SEGMENT PRE-KILL COMMITTED END'
+            }
+        }
+        if (-not $g.if_range) { $ifRangeOk = $false; $note += '  NO If-Range' }
+        elseif ([string]$g.if_range -ne $validator) { $ifRangeValueOk = $false; $note += '  If-Range IS NOT THE FIXTURE VALIDATOR' }
+        Write-Host ('  post conn {0,-3} range {1,-28} if-range {2}{3}' -f $g.conn_id, $g.range, $g.if_range, $note)
     }
-    Write-Check 'the first transfer started at byte 0' $startsOk
-    Write-Check 'every resumed GET starts at or after the committed offset and sends If-Range' $resumedOk
-    $served = [uint64]$log.served_bytes
+    Write-Check 'every GET after the kill starts at or after its segment pre-kill committed end' ($resumedOk -and ($postGets.Count -ge 1))
+    Write-Check 'every GET after the kill sends If-Range' ($ifRangeOk -and ($postGets.Count -ge 1))
+    Write-Check 'every If-Range equals the validator the fixture issued' ($ifRangeValueOk -and ($postGets.Count -ge 1) -and (-not [string]::IsNullOrEmpty($validator))) $validator
+
+    $served = [uint64]$log.served_bytes - $verifyBytes
     $uncommitted = $acceptedBefore - $committedBefore
     $bound = $Size + $uncommitted + $InFlightSlack
+    Write-Host ('fixture served {0}, minus {1} verification bytes = {2} served to the agent' -f $log.served_bytes, $verifyBytes, $served)
     Write-Check 'served bytes <= size + accepted-but-uncommitted + in-flight slack' ($served -le $bound) ("served $served, bound $bound")
     Write-Check 'far less than a second full download' ($served -lt ($Size + [uint64]($Size / 2))) ("served $served of size $Size")
+
+    # Probes (after the served-bytes numbers were taken): the fixture really enforces If-Range.
+    $good = Invoke-FixtureProbe -Base $baseUrl -Method 'GET' -IfRange $validator -RangeStart 10 -RangeEnd 19
+    Write-Check 'a GET with the issued If-Range validator is answered 206 (range honoured)' (($good.Status -eq 206) -and ($good.Length -eq 10)) ('status ' + $good.Status + ', bytes ' + $good.Length)
+    $bogus = Invoke-FixtureProbe -Base $baseUrl -Method 'GET' -IfRange '"bogus-validator"' -RangeStart 10 -RangeEnd 19
+    Write-Check 'a GET with a bogus If-Range is answered 200 with the full body (validator enforced)' (($bogus.Status -eq 200) -and ([uint64]$bogus.Length -eq $Size)) ('status ' + $bogus.Status + ', bytes ' + $bogus.Length)
 
     # 7. Identical content.
     $finalPath = [string]$done.final_path
