@@ -807,3 +807,158 @@ NOT RUN:
 - Not in this gate's command list: cargo-llvm-cov coverage (no coverage figure is recorded for S1.13), cargo-deny, and the tauri build.
 - Ignored in the gate run and not run: full_5gib_segmented_exact_size_stream_compare, connect_timeout_15s_blackhole, iae_from_sta_writes_zone_identifier.
 - plan_tests_missing for S1.13: none reported.
+
+### S1.14 Recovery hardening, weak-validator sampling, secret canary audit, data-dir ACL (2026-11-15)
+
+RED: not recorded as a single run. The slice notes say RED output was captured for the platform ACL tests (compile error), the agent reconcile tests (compile error) and disk_full_injected_pauses_then_resumes (timeout), but no exit codes were reported. The sampling tests were written after the sampling code; they were checked by forcing can_sample to false (both failed), then the change was reverted. The crash_matrix, secret_canary, data-dir ACL process tests and core restart tests passed on their first run, except mid_split, which first failed because the 32 MiB scenario never split (it is now 48 MiB).
+
+| Command | Exit | Result |
+|---|---|---|
+| `cargo test -p forgedm-platform --locked` | 0 | all suites green; acl lib has 6 new unit tests; tests/acl.rs has 8 (new foreign-owner test) and 1 pre-existing ignored |
+| `cargo clippy -p forgedm-platform --all-targets --locked -- -D warnings` | 0 | clean |
+| `cargo test -p forgedm-core --locked` | 0 | all suites pass; lib 86; remote_change 14 (3 new segmented-sampling tests); recovery and resume green; 0 failed |
+| `cargo test -p forgedm-agent --locked --test recovery --test secret_canary` | 0 | recovery 5 passed (2 new); secret_canary 2 passed |
+| `cargo fmt -p forgedm-core -- --check` (and `-p forgedm-agent`) | 0 | clean |
+| `cargo clippy -p forgedm-core -p forgedm-agent --all-targets --locked -- -D warnings` | 0 | clean |
+| `git diff --exit-code Cargo.lock` | 0 | Cargo.lock unchanged |
+
+Slice counts: the structured tests field is 0 passed, 0 failed, 0 ignored; the implementer did not sum the per-suite counts above. The gate runs of crash_matrix (4 passed) and of the full workspace are in "W10a wave gate".
+
+NOT RUN (plan_tests_missing): none reported.
+
+Deviations:
+- Not strict test-first for everything; see RED.
+- Reconcile scope: ARCHITECTURE 6.3 step 2 runs at startup, before any request is served, only for downloads in finalizing (reconcile_parts.rs and core recovery.rs). Missing, replaced, truncated and corrupt-segment-row cases are handled by the engine on resume and tested in core remote_change.rs. RestartReason::MetadataCorrupt was added so corrupt segment rows record metadata_corrupt, not part_file_invalid.
+- disk_full_injected_pauses_then_resumes injects through the FreeSpace seam, not an OS write error. DownloadTask::resume gained ensure_space, so a volume that filled up while the download was away pauses it with disk_full. The mid-transfer recheck still runs every 1 GiB, which cannot be tested within the 64 MiB test-file limit.
+- device_gone_injected_pauses tests only the error-classification seam: stop_from_io for OS errors 21, 55, 67 and 1167, and stop_from_platform for DestinationUnavailable, give destination_unavailable; error 112 gives disk_full. There is no engine-level run, because no honest way to remove a volume was found here.
+- reresolve_capped_3_per_hour is a Resilience-level test on a paused tokio clock. signed_expiring_reresolved_once uses a scripted server that models a CDN link expiring after one transfer request, because the fixture's redirect=signed_expiring alone never triggers a mid-transfer expiry. A second test shows a persistent 403 ends in needs_url_refresh after exactly one re-resolve.
+- Edits outside the listed paths, for the data-dir ACL: the agent test support (tests/support/mod.rs) and the in-process agent tests (hub.rs, pipe_fatal.rs, enqueue_e2e.rs) harden their temp data dir with icacls. The CLI test support (crates/forgedm-cli/tests/support/mod.rs) gained the same harden() helper with four call sites. On this machine %TEMP% and the repo tree carry inherited ACEs, so a tempfile directory fails the check; that is the intended behaviour.
+- secret_canary_absent captures IPC frames as decoded Response and Event values serialised to JSON, not raw pipe bytes (no pipe tap exists). The outgoing EnqueueUrl request necessarily contains the URL and is not scanned.
+- The motw_status column is never written by any code (pre-existing), so reconcile re-applies the shell attachment check when it adopts an already-renamed file (idempotent). Adoption hashes the whole file before completing, which delays startup on very large files.
+- Inconclusive finalizing inspections fail with finalize_locked (listed in Appendix A for finalizing), so startup cannot loop; the .part and progress are kept for a user retry.
+- Line counts: crates/forgedm-core/tests/remote_change.rs (595) and crates/forgedm-core/src/resume.rs (616) exceed 500 lines but stay under 800; engine/task.rs is 769. All source files are under the 800-line ceiling.
+- Conflicting statements in the record, not reconciled: the deviation note says segmented downloads without a strong validator are never sampled and restart from zero. The outcome for S1.14-code-reviewer-4 says segment-aware sampling was implemented, and the old resume.rs assertion was changed to match. This is treated as open until someone checks the code path.
+
+Open:
+- S1.14-silent-failure-hunter-12 (LOW, outside slice): engine recover() and apply_saved_limits() only log storage errors, and the agent still reports Ready. Not changed; recorded for a separate hardening slice.
+- Segmented sampling samples one segment only, as ARCHITECTURE 4.7 specifies; other segments are not individually verified.
+- The full workspace run and crash_matrix were not rerun inside the slice. The W10a gate ran both (see below).
+
+### S1.10b Desktop controls for limits, pause-all, priorities and new states (2026-11-15)
+
+RED: Rust: `cargo test -p forgedm-desktop --locked --test limits_requests` failed to compile with 17 errors (E0425/E0432: request::pause_all, resume_all, get_limits, update_limits, update_priority, LimitsChange and RateLimitChoice not found). TS: `vitest run` gave "Test Files 3 failed | 10 passed", with App.controls.test.tsx, limits.test.ts and messages.test.ts failing "Failed to resolve import ./limit". The record gives no exit code for these runs.
+
+| Command | Exit | Result |
+|---|---|---|
+| `npx tsc --noEmit` (apps/desktop) | 0 | no type errors, empty output. Caveat: the recorded 0 is the exit of a pipe to tail, not tsc's own status. The gate's `pnpm -r typecheck` (exit 0) is the independent check |
+| `npx vitest run` (apps/desktop) | 0 | 13 files, 125 tests passed |
+| `cargo fmt -p forgedm-desktop -- --check` | 0 | clean |
+| `cargo clippy -p forgedm-desktop --all-targets --locked -- -D warnings` | 0 | no warnings |
+| `cargo test -p forgedm-desktop --locked` | 0 | all result lines ok, 0 failed (Rust counts not tallied in the record) |
+| `git diff --exit-code Cargo.lock` | 0 | unchanged |
+
+Slice counts: the structured tests field is 125 passed, 0 failed, 0 ignored, which is the vitest count.
+
+NOT RUN (plan_tests_missing): none reported. Not run by the slice: `pnpm -r lint`. The W10a gate ran it and it failed (see "W10a wave gate").
+
+Deviations:
+- The PLAN has no S1.10b section and no tests-first list, so the implementer chose the test names. Rust: tests/limits_requests.rs (for example pause_all_defaults_to_keeping_progress_and_can_discard, get_limits_is_a_global_update_that_changes_nothing, off_sends_null_to_clear_the_cap_and_a_number_sets_it). TS: App.controls.test.tsx (toolbar_*, limits_*, row_*, retry_waiting_*).
+- No dedicated read command exists in the CLI. get_limits sends the same bare global UpdateLimits that `forgedm limits` uses.
+- Tauri cannot tell an absent argument from null for Option<u64>, so update_limits takes rate_limit as the word "off" (sent to the agent as null) or a number of bytes per second.
+- DownloadSummary has no next_retry_at_ms (it is only in DownloadDetail). The retry_waiting row uses last_error.details.retry_at_ms when the list carries it, otherwise calls get_download once per entry, otherwise shows "Retrying soon".
+- The per-row connections selector shows a "Connections" placeholder, because the summary carries no current value. After a change it toasts the effective value the engine returned.
+- KB/s and MB/s are 1024-based, matching the KiB/MiB formatting elsewhere. The minimum cap is 1 KB/s.
+- Pause all always sends discard_progress=false from the UI. The command supports the flag. When non-resumable downloads are skipped, a toast explains how to pause them one by one.
+- No RED run exists for the fixes made after the first round: the new tests were added together with the fixes and were run green only.
+- Post-review fixes (no separate RED): useRetryAt clears the fetched time when the row leaves retry_waiting and re-fetches 2 s after it passes (regression test retry_waiting_asks_again_once_the_fetched_time_has_passed, which uses a real 2 s timer); Apply is disabled until the first get_limits succeeds; retryAtOf ignores invalid Dates (test in messages.test.ts using 8.7e15).
+
+Open:
+- Per-row get_download fetches are still unbounded in concurrency (security-reviewer-11 of S1.10b). The fix needs the agent to put next_retry_at_ms in the summary, which is outside this slice.
+- Not done (LOW, optional): KB/s rounding, aria-describedby and aria-live, per-row connections select label.
+- The 'asks again' test relies on a real 2 s timer and a 4 s waitFor timeout, so it may be slow or flaky under load.
+
+### W10a wave gate (2026-11-15)
+
+RED: not applicable. This is the gate run over the workspace after S1.14 and S1.10b; their RED notes are in the sections above.
+
+Shell for the gate runs: Git Bash, `export PATH="$HOME/.cargo/bin:$PATH"`, CARGO_BUILD_JOBS=6, RUST_TEST_THREADS=6, CARGO_TARGET_DIR unset.
+
+| Command | Exit | Result |
+|---|---|---|
+| `cargo fmt --all -- --check` (default target dir) | 0 | no formatting differences |
+| `cargo clippy --workspace --all-targets --locked -- -D warnings` | 0 | finished with no warnings or errors |
+| `cargo test --workspace --locked` (fail-fast) | 101 | stopped at forgedm-ipc tests/bootstrap.rs: 3 passed, 3 failed (bootstraps_when_absent, bootstrapped_agent_does_not_inherit_proxy_env, five_concurrent_bootstraps_one_agent), each with AgentExited { code: Some(6) }. The later crates did not run in this run |
+| `cargo test --workspace --locked --no-fail-fast` | 101 | 95 result lines: 795 passed, 3 failed, 3 ignored. Per package (passed/failed/ignored): agent 122/0/0, cli 55/0/0, core 328/0/2, desktop 49/0/0, fixture 65/0/0, ipc 41/3/0, platform 84/0/1, protocol 21/0/0, storage 30/0/0. The only failures are the 3 forgedm-ipc bootstrap tests. Agent recovery 5/5, secret_canary 2/2, core remote_change 14/14, core recovery 4/4 and platform acl all passed |
+| diagnostic: `target\debug\forgedm-agent.exe --data-dir <new empty dir in the session scratchpad> --proxy none` (timeout 15 s; dir deleted afterwards) | 6 | stderr: "data directory: <dir> is not private to the current user: data directory grants write access to" a sandbox-users group and another S-1-5-21 account SID. icacls shows inherited (I)(OI)(CI)(M) ACEs from %TEMP% |
+| `git diff --exit-code Cargo.lock` (rechecked at the end) | 0 | Cargo.lock unchanged; pnpm-lock.yaml also unchanged (exit 0) |
+| `cargo test -p forgedm-agent --features fault-injection --test crash_matrix --locked` | 0 | 4 passed, 0 failed in 29.25 s: crash_matrix_each_fault_point_recovers_exact_sha, zone_identifier_present_at_finalizing_before_rename, zone_identifier_on_all_completed_files, multi_segment_force_kill_x3_no_corruption_no_inflation. The first test loops over all 5 FaultPoint values (after_first_commit, after_flush_before_commit, mid_split, finalizing_before_rename, after_rename_before_completed); each reached Completed with the exact SHA-256 and no .part left |
+| `cargo build --workspace --bins --locked` | 0 | dev profile finished in 15.70 s |
+| `powershell -NoProfile -ExecutionPolicy Bypass -File 'scripts\check.ps1'` (first run; global Node v25.5.0 first on PATH) | 0 | 13 PASS, 0 FAIL, 0 NOT RUN. The eslint-bans probe ran under Node 25 in this run |
+| `powershell -NoProfile -ExecutionPolicy Bypass -File 'scripts\windows-smoke.ps1'` | 1 | 7 PASS, 1 FAIL. FAIL agent-starts: "agent exited with code 6 ... is not private to the current user". The checks after the agent starts were not reached (no-tcp-listener, second agent exits 3, peak working set, stop, restart). W9 recorded 22 checks; this run recorded 8 |
+| `powershell -NoProfile -ExecutionPolicy Bypass -File 'scripts\phase1-proof.ps1'` | 1 | "FAIL the proof ran to the end: timed out after 30 s waiting for the agent to answer"; "FIRST PROOF: 1 check(s) failed" |
+| `powershell -NoProfile -ExecutionPolicy Bypass -File 'scripts\phase1-proof.ps1' -KeepTemp` (diagnostic rerun) | 1 | same FAIL. The kept agent1.err.txt shows the exit-6 data-directory refusal. The kept temp dir was then deleted |
+| `pnpm install --frozen-lockfile` (Node v26.13.1 and nvm directory first on PATH; pnpm 10.29.2) | 0 | lockfile up to date |
+| `pnpm -r lint` | 1 | 1 error, 0 warnings: apps/desktop/src/hooks/useRetryAt.ts:24:7 react-hooks/set-state-in-effect ("Calling setState synchronously within an effect"), on setFetched(undefined) inside the `if (!waiting)` branch of the first effect |
+| `pnpm -r typecheck` | 0 | tsc --noEmit clean |
+| `pnpm -r test` | 0 | vitest 5.1.0: 13 test files, 125 tests passed |
+| `pnpm audit --prod` | 0 | No known vulnerabilities found |
+| `pnpm --filter @forgedm/desktop tauri build --debug --no-bundle` | 0 | beforeBuildCommand passed; built target\debug\forgedm-desktop.exe. No installer built |
+| `powershell -NoProfile -ExecutionPolicy Bypass -File 'scripts\check.ps1'` (rerun; Node v26.13.1 first on PATH) | 0 | 13 PASS, 0 FAIL, 0 NOT RUN. The eslint-bans probe flagged innerHTML, eval, new Function and dangerouslySetInnerHTML under Node 26 (as recorded). manifest-asinvoker passed, including the new debug forgedm-desktop.exe |
+| `tasklist //FI "IMAGENAME eq forgedm*"`; `tasklist \| grep -ic forgedm` | 0 | "No tasks are running which match the specified criteria"; count 0. Note: grep -c normally exits 1 when it counts zero matches, so the recorded exit 0 is not grep's own status; the tasklist output is the evidence. No forgedm-smoke-* or forgedm-phase1-proof-* temp dirs left in %TEMP% |
+
+Gate all_green: false, as recorded by the coordinator. Workspace tests: 795 passed, 3 failed, 3 ignored (the --no-fail-fast run). Fixes applied during the gate: none.
+
+Problems and notes:
+- REGRESSION from S1.14: the explicit --data-dir ACL check in crates/forgedm-agent/src/data_dir.rs (prepare_explicit) now exits 6 when an existing explicit --data-dir grants write access to anyone other than the current user, SYSTEM or Administrators. A directory created under %TEMP% on this machine inherits Modify ACEs, so it is refused. The agent and CLI test supports were adapted with icacls harden() helpers. These consumers were not adapted: forgedm-ipc tests/bootstrap.rs (passes a bare TempDir to ensure_agent), windows-smoke.ps1 and phase1-proof.ps1 all fail on this. Each lives outside every W10a slice's ownership, so none was changed. The record lists options (for example icacls hardening of the test directory, or pointing the agent at a not-yet-created subdirectory); none was applied, and a coordinator decision is needed.
+- The three forgedm-ipc bootstrap failures are the same root cause as the windows-smoke and phase1-proof FAILs.
+- `pnpm -r lint` fails on a file changed by S1.10b (useRetryAt.ts). The S1.10b slice did not run lint.
+- check.ps1 ran twice: once under Node 25.5.0 (global shim first on PATH) and once under Node 26.13.1. Both were 13/13 PASS.
+- The windows-smoke and phase1-proof runs stopped before most of their checks, so they do not evidence the remaining behaviour.
+
+NOT RUN:
+- `cargo deny --locked check` and coverage (cargo-llvm-cov) are not in the gate command list, so not run. The 80% coverage target is therefore not verified for this wave.
+- Remaining windows-smoke checks after the agent-starts failure, and the phase1-proof checks after the timeout, were not reached.
+- plan_tests_missing: none reported for S1.14 or S1.10b.
+- The S1.10b tsc exit in the slice record is a pipe exit (see the S1.10b table); the gate's pnpm typecheck is the valid run.
+
+### W10a coordinator fixes and re-run (2026-11-16)
+
+The W10a gate above was not all_green. The coordinator fixed the causes and re-ran the gate. Shell: Git Bash (cargo, pnpm with Node v26.13.1 first on PATH) and Windows PowerShell 5.1 (scripts). CARGO_BUILD_JOBS=6, RUST_TEST_THREADS=6, default target dir.
+
+Fixes:
+- Data-dir consumers (the S1.14 regression). The agent behaviour is unchanged and intended (THREAT_MODEL FS-02): an explicit `--data-dir` that already exists and grants write access to another principal is refused with exit 6, and a missing one is created with a private protected DACL. The consumers now let the agent create the directory instead of pre-creating it under %TEMP%:
+  - `crates/forgedm-ipc/tests/bootstrap.rs`: a `fresh_data_dir()` helper gives `<tempdir>\data`, which does not exist yet. The four agent-spawning tests use it.
+  - `scripts/windows-smoke.ps1` and `scripts/phase1-proof.ps1` no longer `New-Item` the data directory.
+- `apps/desktop/src/hooks/useRetryAt.ts` (lint `react-hooks/set-state-in-effect`): the reset of the fetched retry time when a row leaves retry_waiting moved from an effect into render, using React's adjust-state-on-prop-change pattern. Behaviour is unchanged. New regression test `src/hooks/useRetryAt.test.ts` a_new_wait_never_shows_the_previous_wait_time. RED: with the reset line disabled the test fails ("expected 1794852900000 to be undefined"); with it restored it passes.
+- Two pre-existing tests failed in the first re-run only, under load. Both passed in the W10a gate run. Both are now deterministic:
+  - `crates/forgedm-core/tests/segment_table_props.rs` stress_shrunk_worker_never_writes_past_end ("the stress run must have split"). Whether threads 5-8 overlapped the first four depended on scheduling. Every worker now takes its first assignment and waits at a `Barrier` before claiming bytes, so workers beyond the 4 planned segments always split one. 15/15 repeated runs passed.
+  - `crates/forgedm-agent/tests/hub.rs` no_event_lost_between_snapshot_and_subscribe (left 3004, right 3003). The hub's periodic AgentStatus event (events_hub.rs publish_status_if_busy) can be published after the final snapshot and read by a client before it sees publisher_done. The sequence assertion is now `mirror.last_seq >= final_snapshot.seq`. The download-map equality check, which proves no download event was lost, is unchanged. 5/5 repeated runs passed.
+
+| Command | Exit | Result |
+|---|---|---|
+| `cargo fmt --all -- --check` | 0 | clean (after `cargo fmt -p forgedm-core` on the stress-test edit) |
+| `cargo clippy --workspace --all-targets --locked -- -D warnings` | 0 | no warnings; re-run for core, agent and ipc after the test fixes: 0 |
+| `cargo test --workspace --locked --no-fail-fast` (first re-run, before the two test fixes) | 101 | 2 failures: hub no_event_lost_between_snapshot_and_subscribe, segment_table_props stress_shrunk_worker_never_writes_past_end (both explained above); the 3 forgedm-ipc bootstrap tests passed |
+| `cargo test -p forgedm-core --locked --test segment_table_props` x15 | 0 | 3 passed each time |
+| `cargo test -p forgedm-agent --locked --test hub` x5 | 0 | 2 passed each time |
+| `cargo test -p forgedm-ipc --locked --test bootstrap` | 0 | 6 passed |
+| `cargo test --workspace --locked --no-fail-fast` (final) | 0 | **798 passed, 0 failed, 3 ignored** |
+| `cargo test -p forgedm-agent --features fault-injection --test crash_matrix --locked` | 0 | 4 passed (all 5 fault points) |
+| `cargo build --workspace --bins --locked` | 0 | finished |
+| `powershell -NoProfile -ExecutionPolicy Bypass -File scripts\check.ps1` | 0 | 13 PASS, 0 FAIL, 0 NOT RUN |
+| `powershell -NoProfile -ExecutionPolicy Bypass -File scripts\windows-smoke.ps1` | 0 | 22 PASS, 0 FAIL, 0 NOT RUN |
+| `powershell -NoProfile -ExecutionPolicy Bypass -File scripts\phase1-proof.ps1` | 0 | PASS. Kill at 31.88% (85,590,016 of 268,435,456 bytes), 9 segments, the DB kept every segment's pre-kill committed bytes, every GET after the kill started at or after its segment's committed end and sent If-Range, identical SHA-256 |
+| `pnpm -r lint` | 0 | clean |
+| `pnpm -r typecheck` | 0 | clean |
+| `pnpm -r test` | 0 | 14 files, 126 tests passed |
+| `pnpm --filter @forgedm/desktop tauri build --debug --no-bundle` | 0 | built target\debug\forgedm-desktop.exe |
+| `git diff --exit-code --stat Cargo.lock pnpm-lock.yaml` | 0 | both unchanged |
+| `tasklist /FI "IMAGENAME eq forgedm*"` | 0 | no forgedm process left |
+
+Note on an earlier runner slip: the coordinator's first scripted run of check, windows-smoke and phase1-proof did not start (a path-quoting error in the runner, exit 127). The scripts were then run directly from PowerShell with the results above.
+
+Gate all_green: **true** after the fixes.
+
+Record reconciliation for S1.14: the S1.14 deviation that says segmented downloads without a strong validator are never sampled is out of date. The code samples them: `crates/forgedm-core/src/resume.rs` can_sample accepts `SingleRanged | Segmented` once committed >= SAMPLE_VERIFY_WINDOW, as the S1.14-code-reviewer-4 outcome states.
+
+Not re-reviewed yet: the four S1.14 Medium fixes, the S1.10b Medium fix and the coordinator fixes above. The S1.15 Phase 1 gate's phase-wide review covers this code.

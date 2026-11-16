@@ -83,6 +83,14 @@ This log records the reviews that actually ran: the reviewer, the scope, each fi
 | 2026-11-15 | S1.13 | ecc:rust-reviewer | 0 | 0 | 0 | 4 (1 verified, 3 passed to fixer unverified; all not fixed) | 0 |
 | 2026-11-15 | S1.13 | ecc:security-reviewer | 0 | 0 | 0 | 0 | 0 |
 | 2026-11-15 | S1.13 | ecc:code-reviewer | 0 | 0 | 0 | 2 (1 fixed in part, 1 not fixed) | 0 |
+| 2026-11-15 | S1.14 | ecc:rust-reviewer | 0 | 0 | 1 (fixed) | 1 (fixed) | 0 |
+| 2026-11-15 | S1.14 | ecc:security-reviewer | 0 | 0 | 0 | 1 (fixed) | 0 |
+| 2026-11-15 | S1.14 | ecc:code-reviewer | 0 | 0 | 1 (fixed) | 2 (fixed) | 0 |
+| 2026-11-15 | S1.14 | ecc:silent-failure-hunter | 0 | 0 | 2 (fixed; 1 Medium rejected by verifier) | 5 (4 fixed, 1 no change needed) | 0 |
+| 2026-11-15 | S1.10b | ecc:typescript-reviewer | 0 | 0 | 0 | 4 (3 fixed, 1 not fixed; 1 Medium rejected by verifier) | 0 |
+| 2026-11-15 | S1.10b | ecc:react-reviewer | 0 | 0 | 1 (fixed, not re-reviewed) | 3 (1 fixed, 2 not fixed) | 0 |
+| 2026-11-15 | S1.10b | ecc:security-reviewer | 0 | 0 | 0 | 2 (1 fixed, 1 not fixed) | 0 |
+| 2026-11-15 | S1.10b | ecc:code-reviewer | 0 | 0 | 0 | 1 (not fixed) | 0 |
 
 Process: each Medium or higher finding went to an independent verifier asked to refute it, and was fixed only if confirmed. Low findings were passed to the fixer unverified.
 
@@ -563,9 +571,63 @@ Reviewer scope notes:
 Verifier-rejected: none.
 Re-review: none recorded (re-review null). The reviewers read code only, so their counts come from code reading; the coordinator's cargo results are in TEST_EVIDENCE "S1.13" and "W9 wave gate".
 
+### S1.14 Recovery hardening, weak-validator sampling, secret canary audit, data-dir ACL (0 Critical/High; 4 Medium, all fixed; 9 Low: 8 fixed, 1 no change needed)
+
+Reviewer scope: ecc:security-reviewer read only acl.rs and data_dir.rs (plus a skim of the canary list), so this is not a clean bill for the whole slice. ecc:rust-reviewer read only the Win32 ACL helper and its callers. ecc:code-reviewer did a spec-completeness check. None of the reviewers ran cargo.
+
+Confirmed (verified) findings:
+- S1.14-rust-reviewer-2 (MEDIUM): the ACL tests skipped the fail-closed branches (NullDacl, foreign owner, object ACE). **Fixed**: tests added for NullDacl, unparsed, object and callback-object ACEs, deny and audit ignored, GENERIC_WRITE and GENERIC_ALL masks, read-only accepted, and a foreign-owned directory (SystemRoot) giving NotOwnedByCurrentUser.
+- S1.14-code-reviewer-4 (MEDIUM): segmented downloads without a strong validator were never sampled and restarted from zero. **Fixed**: segment-aware sampling per ARCHITECTURE 4.7 (can_sample accepts Segmented; sample_point picks the fullest segment; sample_verify_at samples its tail). Engine tests for pass, changed file and restart, and a sample_point unit test. The old resume.rs assertion was changed to the new behaviour. Open: the TEST_EVIDENCE S1.14 deviation note states the opposite for segmented downloads without a strong validator; the record does not reconcile the two.
+- S1.14-silent-failure-hunter-8 (MEDIUM): has_file_id turned every I/O error into "file not there", so a transient error permanently failed a finalizing download. **Fixed**: tri-state IdCheck (Match, NoMatch, Unknown). Only a proven mismatch or not-found fails with part_file_invalid; a locked or denied candidate gives Inconclusive, recorded as failed(finalize_locked) with the .part kept. Tests: locked part (core unit and agent integration).
+- S1.14-silent-failure-hunter-10 (MEDIUM): source_url discarded the URL validation error and the missing-source case, so failures were misreported as part_file_invalid. **Fixed**: per-row Failure; unseal or invalid-value errors become secrets_unavailable, a URL failing policy becomes internal, both logged without the URL; only real DB errors still abort. Test with a sealer whose unseal fails: startup succeeds and the row is failed(secrets_unavailable). Appendix A was not changed.
+- S1.14-rust-reviewer-1 (LOW): the ACE-type list was wrong: callback-object allow ACE (11) was accepted and the audit-object ACE (7) was listed. **Fixed**: deny-by-default; only known never-grant types are ignored, so 4, 5, 11 and unknown types are refused. Unit test with a synthetic type-11 ACE.
+- S1.14-silent-failure-hunter-7 (LOW in the verified record; the reviewer's summary said HIGH): the DACL check failed open on ACCESS_ALLOWED_CALLBACK_OBJECT_ACE (type 11) and any other unknown ACE type. **Fixed**: same root cause and fix as rust-reviewer-1. The table uses the verified record (LOW).
+- S1.14-silent-failure-hunter-12 (LOW): engine recovery failure is only logged; the agent still reports Ready. **No change needed in this slice**: pre-existing from W7-W9 in engine_host.rs; making recover() fallible is a separate hardening. Open issue.
+
+Other LOW findings (not verified, per the process above):
+- S1.14-security-reviewer-3: the ACE type table did not fail closed for all unparsed allow ACE types (FS-02). **Fixed**: same fix as rust-reviewer-1.
+- S1.14-code-reviewer-5: stale doc comment on is_resumable_mode. **Fixed**: rewritten; module doc updated for segmented sampling.
+- S1.14-code-reviewer-6: assertion message with a run of literal spaces, and response_id probed three speculative JSON paths. **Fixed**: response_id decodes the typed ResultBody::EnqueueUrl.
+- S1.14-silent-failure-hunter-11: failure-detail serialisation error discarded with .ok(). **Fixed**: logged at warn.
+- S1.14-silent-failure-hunter-13: sample_verify mapped every non-206 response to remote_changed. **Fixed**: the unexpected decision is logged at warn; 408 is retried; 200, 416 and mismatches stay Changed.
+- S1.14-silent-failure-hunter-14: the canary scan of raw DB files could be vacuous, because unreadable files became empty bytes. **Fixed**: forgedm.db is read strictly; only NotFound is tolerated for -wal and -shm; the test asserts the -shm and the post-stop db were really read.
+
+Verifier-rejected:
+- S1.14-silent-failure-hunter-9 (reported MEDIUM): blocking-task panic and join errors swallowed with no log and mapped to a permanent failure. Rejected by the verifier.
+
+Re-review: none recorded (re-review null). The four MEDIUM fixes have not been re-reviewed.
+Not a reviewer finding, recorded for completeness: the explicit --data-dir ACL check now refuses temp data dirs on this machine, which breaks forgedm-ipc bootstrap tests and the windows-smoke and phase1-proof scripts. See TEST_EVIDENCE "W10a wave gate".
+Coordinator resolution (2026-11-16): the refusal is the intended FS-02 behaviour and stays. The ipc bootstrap tests and both scripts now let the agent create the data directory itself, with its private protected DACL; gate re-run green (TEST_EVIDENCE "W10a coordinator fixes and re-run"). The S1.14-code-reviewer-4 sampling record conflict is resolved in favour of the outcome: resume.rs can_sample accepts Segmented.
+
+### S1.10b Desktop controls for limits, pause-all, priorities and new states (0 Critical/High; 1 Medium, fixed; 10 Low: 5 fixed, 5 not fixed)
+
+Reviewer scope: ecc:typescript-reviewer did a partial review (it did not read Toolbar.tsx, DownloadRow.tsx, DownloadList.tsx, fakeAgent.ts or the test files, and did not re-run vitest, tsc or eslint). ecc:react-reviewer read the new hooks and components and the App.tsx diff, and ran no commands. ecc:code-reviewer did a partial, static review (it did not read LimitsPanel.tsx, Toolbar.tsx, commands.rs, agent_client.rs or the test files, and did not run cargo or vitest).
+
+Confirmed (verified) findings:
+- S1.10b-react-reviewer-6 (MEDIUM): a fetched next_retry_at_ms went stale across consecutive retry_waiting periods. **Fixed**: useRetryAt clears the fetched time when the row leaves retry_waiting, and re-fetches 2 s after the fetched time passes. Regression test retry_waiting_asks_again_once_the_fetched_time_has_passed. Not re-reviewed. Note: the W10a gate's `pnpm -r lint` now fails on this changed code (react-hooks/set-state-in-effect at useRetryAt.ts:24:7); the slice did not run lint.
+- S1.10b-typescript-reviewer-1 (LOW): a failed get_limits left the form on defaults, so Apply could silently remove an existing speed cap. **Fixed**: Apply is disabled until the first get_limits succeeds; a dirty ref stops a late response overwriting input. No test added.
+
+Other LOW findings:
+- S1.10b-typescript-reviewer-3: KB/s display rounds to 2 decimals, so re-applying can change the cap. **Not fixed** (optional).
+- S1.10b-typescript-reviewer-4: the fetched retry time was never cleared, so a stale time could show briefly. **Fixed**: cleared when the row is no longer waiting.
+- S1.10b-typescript-reviewer-5: unchecked cast of the select value to SpeedUnit. **Fixed**: isSpeedUnit type guard.
+- S1.10b-react-reviewer-7: role="toolbar" without the toolbar keyboard pattern; the disclosure button lacked aria-controls. **Fixed**: role="group"; aria-controls points at the panel.
+- S1.10b-react-reviewer-8: validation errors not associated with their inputs; apply result not announced. **Not fixed** (optional; the late-response overwrite part is fixed by the dirty ref).
+- S1.10b-react-reviewer-9: the connections select does not show the current value. **Not fixed** (optional): the summary carries no per-download connection count.
+- S1.10b-security-reviewer-10: out-of-range retry_at_ms could throw in render. **Fixed**: retryAtOf and retryMessage ignore values that are not valid Dates; test with 8.7e15.
+- S1.10b-security-reviewer-11: unbounded per-row pipe connections for retry_waiting rows. **Not fixed** (optional): needs next_retry_at_ms in the agent summary, which is outside this slice.
+- S1.10b-code-reviewer-12: per-row connections select never shows the current value. **Not fixed** (optional); same subject as react-reviewer-9.
+
+Verifier-rejected:
+- S1.10b-typescript-reviewer-2 (reported MEDIUM): a malformed optional field in last_error.details rejects the whole snapshot. Rejected by the verifier.
+
+Re-review: none recorded (re-review null). The MEDIUM fix has not been re-reviewed.
+
 ## Not run
 
 ## Not run
 
 - AgentShield: not installed.
 - cargo-audit: not installed (cargo-deny advisories used instead).
+
+Coordinator follow-up (2026-11-16): the react-reviewer-6 fix tripped `react-hooks/set-state-in-effect` in the W10a gate. The reset now runs during render (adjust-state-on-prop-change pattern) with the same behaviour, pinned by the regression test useRetryAt.test.ts (RED shown). Not re-reviewed; the S1.15 phase review covers it.

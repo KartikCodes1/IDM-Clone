@@ -1,6 +1,6 @@
 # Next Steps (source of truth for resuming)
 
-Updated 2026-11-15.
+Updated 2026-11-16.
 
 ## Where we are
 - GATE 1 was approved on 2026-11-15, accepting all recommendations. The record is in PLAN section 1 and ECC_WORKFLOW section 4.
@@ -44,7 +44,10 @@ Updated 2026-11-15.
      - `SegmentInfo.active` reports every segment as active.
      - UpdateLimits max_connections is not persisted (needs a storage method).
      - The S1.9 deviations: 403/404/410 resolve to `needs_url_refresh`, and RangeUnsupported/Reprobe should trigger a re-probe and re-plan instead of failing.
-7. **Re-sequenced for "usable ASAP"** (PLAN section 6, 2026-11-16):
+7. **W8, W9 and W10a are committed** (2026-11-16). W10a (S1.14 recovery hardening, crash matrix, secret canary, data-dir ACL; S1.10b desktop limits, Pause all, priorities and state messages) went green after coordinator fixes: workspace 798 passed, 0 failed, 3 ignored; check 13/13; smoke 22/22; first proof PASS.
+   - **Next: S1.15 Phase 1 gate**, run alone. It covers deny.toml, removing unused dependencies (coordinator lock change), the section 8.1 and 8.2 command sets incl. the slow tier and coverage (core, protocol and storage at 80% or more), working-set and throughput measurements, a phase-wide review with adversarial verification, fixes, the final installer rebuild (`pnpm --filter @forgedm/desktop run package`) and `docs/PHASE_1_REPORT.md`.
+   - Test data dirs: let the agent create an explicit `--data-dir` itself. Folders made under %TEMP% inherit write ACEs for other principals on this machine and are refused (exit 6, intended).
+8. **Re-sequenced for "usable ASAP"** (PLAN section 6, 2026-11-16):
    - W5: S0.11 in parallel with S1.7
    - W6: S1.9
    - W7: S1.10+ (desktop add-URL, controls, live progress, per-user NSIS setup exe) in parallel with S1.11
