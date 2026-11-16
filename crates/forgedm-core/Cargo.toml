@@ -35,6 +35,5 @@ forgedm-fixture.workspace = true
 tokio = { workspace = true, features = ["test-util"] }
 tempfile.workspace = true
 proptest.workspace = true
-futures-util.workspace = true
 rcgen.workspace = true
 tokio-rustls.workspace = true

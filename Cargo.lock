@@ -211,52 +211,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "axum"
-version = "0.8.9"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "31b698c5f9a010f6573133b09e0de5408834d0c82f8d7475a89fc1867a71cd90"
-dependencies = [
- "axum-core",
- "bytes",
- "futures-util",
- "http",
- "http-body",
- "http-body-util",
- "hyper",
- "hyper-util",
- "itoa",
- "matchit",
- "memchr",
- "mime",
- "percent-encoding",
- "pin-project-lite",
- "serde_core",
- "sync_wrapper",
- "tokio",
- "tower",
- "tower-layer",
- "tower-service",
-]
-
-[[package]]
-name = "axum-core"
-version = "0.5.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "08c78f31d7b1291f7ee735c1c6780ccde7785daae9a9206026862dab7d8792d1"
-dependencies = [
- "bytes",
- "futures-core",
- "http",
- "http-body",
- "http-body-util",
- "mime",
- "pin-project-lite",
- "sync_wrapper",
- "tower-layer",
- "tower-service",
-]
-
-[[package]]
 name = "base64"
 version = "0.21.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1292,7 +1246,6 @@ checksum = "aa9a19cbb55df58761df49b23516a86d432839add4af60fc256da840f66ed35b"
 name = "forgedm-agent"
 version = "0.1.0"
 dependencies = [
- "anyhow",
  "forgedm-core",
  "forgedm-fixture",
  "forgedm-ipc",
@@ -1300,9 +1253,7 @@ dependencies = [
  "forgedm-protocol",
  "forgedm-storage",
  "hex",
- "serde",
  "serde_json",
- "sha2 0.11.1",
  "tempfile",
  "thiserror 2.0.21",
  "tokio",
@@ -1317,7 +1268,6 @@ dependencies = [
 name = "forgedm-cli"
 version = "0.1.0"
 dependencies = [
- "anyhow",
  "clap",
  "forgedm-fixture",
  "forgedm-ipc",
@@ -1326,7 +1276,6 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.21",
  "tokio",
- "tracing",
  "uuid",
 ]
 
@@ -1338,7 +1287,6 @@ dependencies = [
  "forgedm-fixture",
  "forgedm-platform",
  "forgedm-protocol",
- "futures-util",
  "hex",
  "httpdate",
  "proptest",
@@ -1378,8 +1326,6 @@ dependencies = [
 name = "forgedm-fixture"
 version = "0.1.0"
 dependencies = [
- "anyhow",
- "axum",
  "bytes",
  "clap",
  "futures-util",
@@ -1443,7 +1389,6 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.21",
  "tokio",
- "tracing",
  "uuid",
 ]
 
@@ -2585,12 +2530,6 @@ checksum = "d1525a2a28c7f4fa0fc98bb91ae755d1e2d1505079e05539e35bc876b5d65ae9"
 dependencies = [
  "regex-automata",
 ]
-
-[[package]]
-name = "matchit"
-version = "0.8.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "47e1ffaa40ddd1f3ed91f717a33c8c0ee23fff369e3aa8772b9605cc1d22f4c3"
 
 [[package]]
 name = "md-5"

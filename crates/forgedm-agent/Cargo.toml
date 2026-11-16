@@ -31,15 +31,12 @@ forgedm-protocol.workspace = true
 forgedm-platform.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "fs", "io-util", "sync", "time", "signal"] }
 tokio-util.workspace = true
-serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
-anyhow.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 tracing-appender.workspace = true
 hex.workspace = true
-sha2.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
