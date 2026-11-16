@@ -1,0 +1,65 @@
+# cargo-deny configuration (S1.15, Phase 1 gate). Target: cargo-deny 0.20.2.
+# Run from the repo root: cargo deny --locked check advisories licenses bans sources
+# Schema reference: https://embarkstudios.github.io/cargo-deny/
+
+[graph]
+# ForgeDM is Windows-only; only crates that build for this target are checked.
+targets = ["x86_64-pc-windows-msvc"]
+all-features = false
+no-default-features = false
+
+[output]
+feature-depth = 1
+
+[advisories]
+# Vulnerability advisories always fail the check. The other levels keep the
+# cargo-deny 0.20.2 defaults: unmaintained = "all" (deny for every crate in the
+# graph), unsound = "workspace" (deny for direct dependencies), yanked = "warn".
+ignore = [
+    { id = "RUSTSEC-2026-0459", reason = "libsqlite3-sys via sqlx 0.9; risk accepted in docs/SECURITY_REVIEW.md; review by 2027-02-16" },
+]
+
+[licenses]
+# Explicit allow list: only permissive licences that are present in the graph.
+# Copyleft (GPL, AGPL, LGPL) is never allowed. MPL-2.0 is file-level copyleft and
+# reaches the graph only through the desktop shell (cssparser, cssparser-macros,
+# dtoa-short, selectors, option-ext), used unmodified.
+allow = [
+    "0BSD",
+    "Apache-2.0",
+    "BSD-3-Clause",
+    "CC0-1.0",
+    "ISC",
+    "MIT",
+    "MIT-0",
+    "MPL-2.0",
+    "Unicode-3.0",
+    "Unlicense",
+    "Zlib",
+]
+confidence-threshold = 0.8
+exceptions = []
+
+[licenses.private]
+# Workspace crates are publish = false and carry license = "UNLICENSED".
+ignore = true
+registries = []
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+# Workspace path dependencies carry no version; allowed only for private crates.
+allow-wildcard-paths = true
+highlight = "all"
+workspace-default-features = "allow"
+external-default-features = "allow"
+allow = []
+deny = []
+skip = []
+skip-tree = []
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []
