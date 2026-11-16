@@ -76,6 +76,10 @@ This log records the reviews that actually ran: the reviewer, the scope, each fi
 | 2026-11-15 | S1.11 | ecc:rust-reviewer | 0 | 0 | 1 (fixed) | 1 (fixed) | 0 |
 | 2026-11-15 | S1.11 | ecc:security-reviewer | 0 | 0 | 0 | 0 | 0 |
 | 2026-11-15 | S1.11 | ecc:code-reviewer | 0 | 0 | 0 | 6 (2 fixed, 4 no change needed) | 0 |
+| 2026-11-15 | S1.12 | ecc:rust-reviewer | 0 | 0 | 1 (fixed, not re-reviewed) | 5 (2 fixed, 3 not fixed) | 0 |
+| 2026-11-15 | S1.12 | ecc:security-reviewer | 0 | 0 | 0 | 3 (not fixed) | 0 |
+| 2026-11-15 | S1.12 | ecc:code-reviewer | 0 | 0 | 0 | 3 (1 no change needed, 2 not fixed) | 0 |
+| 2026-11-15 | S1.12 | ecc:silent-failure-hunter | 0 | 0 | 1 (fixed, not re-reviewed) | 4 (2 fixed, 1 no change needed, 1 not fixed) | 0 |
 
 Process: each Medium or higher finding went to an independent verifier asked to refute it, and was fixed only if confirmed. Low findings were passed to the fixer unverified.
 
@@ -509,6 +513,32 @@ Other Low findings:
 Verifier-rejected: none.
 Reviewer reports were read-only. The rust, security and code reviewers stated that they did not run cargo or the tests.
 Re-review: none recorded (re-review null). The MEDIUM fix has not been re-reviewed.
+
+### S1.12 Retries, Retry-After, host cooldown, redirects, network hardening (0 Critical/High; 2 Medium, both fixed; 15 Low: 4 fixed, 2 no change needed, 9 not fixed)
+
+Confirmed (verified) findings:
+- S1.12-rust-reviewer-1 (MEDIUM): stale retry timers could requeue a retry_waiting download before its new due time, which breaks Retry-After. **Fixed**: retry_due reads next_retry_at and re-arms for the remainder if it is still in the future. Test `stale_timer_does_not_requeue_before_the_new_due_time` failed without the fix and passes with it. Not re-reviewed.
+- S1.12-silent-failure-hunter-13 (MEDIUM): a failed retry-due requeue was logged and dropped, so a download could stay in retry_waiting forever. **Fixed**: retry_due logs load errors and re-arms with a growing delay on load, next_retry_at or transition errors (bounded to 5 attempts, then an error log). Not covered by a test, because MemoryStore cannot inject faults. Not re-reviewed.
+- S1.12-rust-reviewer-4 (LOW): is_wrapped_tls_error is a heuristic that can turn non-TLS connect errors into a fatal tls_failure. **Not fixed** (optional); a more precise classification is deferred.
+- S1.12-silent-failure-hunter-14 (LOW): a failed next_retry_at write was only a warn, and the download was parked anyway. **Fixed in part**: now logged at error level. The park still happens, because the host cooldown covers the early wake-up.
+- S1.12-silent-failure-hunter-15 (LOW): arm_if_waiting swallowed store errors and defaulted a missing due time to 0. **Fixed**: load errors are logged at error level; if the stored time cannot be read, a 30 s fallback is armed instead of 0.
+
+Other Low findings:
+- S1.12-rust-reviewer-2: timer JoinSet was never reaped, and the due channel was unbounded without justification. **Fixed**: finished timers are reaped with try_join_next on each arming; the unbounded channel has a justifying comment.
+- S1.12-rust-reviewer-3: failure to persist next_retry_at was only logged, then the download was parked anyway. **Fixed in part**: error-level log only. The host cooldown prevents an early request while the agent keeps running.
+- S1.12-rust-reviewer-5: gate() waits once and does not re-check an extended cooldown. **Not fixed** (optional); a re-check loop would spin forever under the non-advancing test sleeper.
+- S1.12-rust-reviewer-6: tls_handshake test bound is loose. **Not fixed** (optional).
+- S1.12-security-reviewer-7: tls_untrusted_cert_fatal and tls_handshake_failure_fatal_not_retried can pass without proving certificate validation (Inv-08, NET-03). **Not fixed** (optional); the TLS cert test stays NOT RUN.
+- S1.12-security-reviewer-8: is_wrapped_tls_error treats any connect-phase io::Error of kind Other with a source as a TLS failure. **Not fixed** (optional); same subject as rust-reviewer-4.
+- S1.12-security-reviewer-9: https_to_http_rejected (Inv-10, NET-04) is a pure-function unit test, not an end-to-end test. **Not fixed**; the downgrade e2e needs TLS and is recorded as NOT RUN.
+- S1.12-code-reviewer-10: the 429 cooldown no-storm assertion is loose and one assertion is misnamed. **Not fixed** (optional).
+- S1.12-code-reviewer-11: https_to_http_rejected does not run the plan's end-to-end TLS form. **Not fixed** (optional).
+- S1.12-code-reviewer-12: test file is exactly at the 800-line soft ceiling. **No change needed**: segmented.rs was not extended this round; the new test went into retry_e2e.rs.
+- S1.12-silent-failure-hunter-16: unix_ms falls back to 0 on clock error or overflow. **Not fixed** (optional).
+- S1.12-silent-failure-hunter-17: engine_cell.set result discarded. **No change needed**: the cell is private to the function and already carries a comment that setting it cannot fail.
+
+Verifier-rejected: none.
+Re-review: none recorded (re-review null). The two MEDIUM fixes have not been re-reviewed. The reviewers read code only and ran no cargo, so their counts come from code reading; the coordinator's gate run is in TEST_EVIDENCE "W8 wave gate".
 
 ## Not run
 

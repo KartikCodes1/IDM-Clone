@@ -674,3 +674,72 @@ NOT RUN:
 | `git diff --stat Cargo.lock pnpm-lock.yaml` | 0 | no changes |
 
 NOT RUN: installing the setup exe on this machine, and the manual run of the installed app. Both are left to the user. The installer is unsigned, so SmartScreen will warn.
+
+### S1.12 Retries, Retry-After, host cooldown, redirects, network hardening (2026-11-15)
+
+RED: partial. The TDD order was not clean: the core wiring (resilience, worker, engine, task) was written before the new e2e tests, so there is no RED output for the core retry tests. RED evidence exists for three items, all as reported by the implementer (exit codes not reported):
+- (a) a mutation restoring the old completion rule failed with `completion waited for staggered workers: 1.1495s`; the fixed code passes in 0.18 s.
+- (b) detail.rs tests failed to compile (E0425, `is_transferring` not found).
+- (c) storage half: downloads tests failed to compile (E0599, no method `set_max_connections`).
+
+| Command | Exit | Result |
+|---|---|---|
+| `cargo fmt -p forgedm-core -- --check` | 0 | clean |
+| `cargo clippy -p forgedm-core --all-targets --locked -- -D warnings` | 0 | clean |
+| `cargo test -p forgedm-core --locked` | 0 | all suites ok: 278 passed, 0 failed, 2 ignored (slow tier) |
+| `git diff --exit-code Cargo.lock` | 0 | unchanged |
+| `cargo test -p forgedm-core --locked --test retry_e2e stale_timer` (with the fix temporarily disabled) | 101 | new regression test FAILED without the fix. Fix restored; the implementer reports the test then passes (that passing run is not listed as a separate command here; the W8 gate run below includes retry_e2e) |
+
+NOT RUN (plan_tests_missing):
+- `connect_timeout_15s_blackhole` stays `#[ignore]` (slow tier); not run in this round.
+- `tls_untrusted_cert_fatal` and the https_to_http e2e over TLS remain NOT RUN (unchanged). The implementer reports TLS tests in forgedm-core that use the existing rcgen and tokio-rustls dev-dependencies, and the fixture TLS mode (D9) was not added. The reviewers disagree on whether the untrusted-cert test proves certificate validation (SECURITY_REVIEW S1.12-security-reviewer-7, LOW, open), so these entries are not counted as passing TLS e2e evidence.
+
+Deviations:
+- Storage ownership: besides `set_max_connections`, `Downloads::set_next_retry_at` was added in crates/forgedm-storage/src/downloads.rs. The plan requires `retry_waiting{next_retry_at_ms}` to be persisted and the existing transition() cannot store it. Coordinator to confirm.
+- New DownloadStore trait methods, all with defaults: `set_max_connections`, `schedule_retry`, `next_retry_at`. New public API: `engine::start_with(config, deps, RetryEnv)`, `transfer::resilience::{Resilience, RetryEnv, Verdict}`, `engine::hosts::{HostRegistry, HostHandle}`, `client::{ClientOptions, HttpClient::with_options, retry_after_of, content_disposition_of}`, `error::{Fault, TaskStop::{Retry, RetryWait, NeedsUrlRefresh, Reprobe}}`, `ProgressSample.active_ranges`, `LiveDownload::set_active_ranges`, `SharedInit`. Other slices should know about these.
+- The Retry-After per-host cooldown is waited through `Resilience::gate` before each request. Waits use the injected Sleeper, so a recording sleeper does not hold requests back. "No storm" is asserted by request counts and recorded wait durations, not by wall-clock spacing.
+- Existing tests changed because behaviour changed. segmented.rs `ranges_ignored_mid_download_no_misplaced_writes`: the validator-less 200 now ends in a re-probe, a plain single-stream restart and a byte-exact completion, instead of failed(range_protocol_violation). single_stream.rs `drop_after_with_cl_is_incomplete_not_completed` now uses `ranges=0`, because with ranges the engine retries from the claim and completes (covered by `mid_chunk_drop_resumes_from_claim_no_overlap`). segmented.rs is exactly 800 lines.
+- Failure behaviour changes: malformed framing now carries reason `malformed_response`. A reprobe after a broken range contract is restart-from-zero plus a fresh plan, at most once per run, not continue-with-progress.
+- `classify_reqwest` treats a connect-phase io::Error of kind Other with a payload (how rustls errors arrive) or UnexpectedEof as Tls. rustls cannot be downcast because forgedm-core has no rustls dependency. retry.rs gained `HostState::extend_cooldown`.
+- DNS (permanent NXDOMAIN) and connect timeout or refused get 3 limited retries, then the specific error code, not retry_budget_exhausted. `classify_transfer(DnsFailure)` stays Fatal for the pure S1.3 tests; Resilience overrides it.
+- `SegmentInfo.active` is derived from the engine's live active byte ranges, which refresh within about 250 ms. It is not exact per-worker state.
+- The stale-timer test seeds a RetryWaiting row and calls recover() twice rather than driving a real 130 s Retry-After, so it stays fast (about 1.8 s).
+
+Open:
+- LOW findings not addressed (optional): rust-reviewer-4 and security-reviewer-8 (is_wrapped_tls_error heuristic); rust-reviewer-5 (gate loop; a loop would spin under the fake sleeper); rust-reviewer-6; security-reviewer-7 and -9; code-reviewer-10, -11 and -12 (test tightening); silent-failure-hunter-16 (unix_ms fallback); silent-failure-hunter-17 (engine_cell.set, already commented as infallible).
+- The two MEDIUM fixes (rust-reviewer-1 and silent-failure-hunter-13) have not been re-reviewed (re-review null). The silent-failure-hunter-13 fix has no test, because MemoryStore cannot inject faults.
+- The reviewers read code only and ran no cargo. Their cargo results are the implementer's; the coordinator's own runs are in the W8 wave gate below.
+
+### W8 wave gate (2026-11-15)
+
+RED: not applicable. This is the gate run over the workspace after S1.12; its RED notes are in the section above.
+
+| Command | Exit | Result |
+|---|---|---|
+| `cargo fmt --all -- --check` (Git Bash; PATH=$HOME/.cargo/bin; CARGO_BUILD_JOBS=6; RUST_TEST_THREADS=6; CARGO_TARGET_DIR unset, shared default target dir) | 0 | no formatting differences |
+| `cargo clippy --workspace --all-targets --locked -- -D warnings` | 0 | clean, no warnings; finished in 11.46 s (forgedm-core, forgedm-storage and forgedm-agent rechecked) |
+| `cargo test --workspace --locked` (output kept in the session scratchpad as test.log) | 0 | 85 test-result lines including doc-tests: 694 passed, 0 failed, 3 ignored (full_5gib_segmented_exact_size_stream_compare, connect_timeout_15s_blackhole, iae_from_sta_writes_zone_identifier). W8 suites: core network_hardening 7 (16.4 s), redirects 6, retry_e2e 15 passed and 1 ignored, w7_followups 2 (21.1 s); agent persisted_limits 2. Changed suites: resume 13, segmented 15 (56.8 s), single_stream 17, recovery 4. Also green: cli e2e_first_proof 2, e2e_single_stream 5, cli_basic 11; agent unit 72, control_e2e 3, enqueue_e2e 9, process 13 |
+| `git diff --exit-code Cargo.lock` (checked after the tests and again at the end) | 0 | unchanged. No diff in root Cargo.toml, clippy.toml, rust-toolchain.toml, .cargo, docs or tests/fixtures. `git status` lists the same 33 entries as at the start |
+| `cargo build --workspace --bins --locked` | 0 | dev profile finished in 11.65 s; target\debug holds forgedm.exe, forgedm-agent.exe, forgedm-desktop.exe and forgedm-fixture.exe |
+| `powershell -NoProfile -ExecutionPolicy Bypass -File scripts\check.ps1` (first attempt, Git Bash quoting error) | 127 | invocation error, not a gate result: Bash stripped the backslash and PowerShell reported that 'scriptscheck.ps1' does not exist |
+| `powershell -NoProfile -ExecutionPolicy Bypass -File 'scripts\check.ps1'` (rerun, path single-quoted) | 0 | 13 PASS, 0 FAIL, 0 NOT RUN: no-tls-bypass, no-assert-sql-safe, unsafe-only-in-platform (65 inside platform, 0 outside), command-new-allowlist, layering (9 packages, 17 edges), no-fixture-in-shipped, no-fault-injection-in-release, no-reqwest-compression, tauri-versions-match, no-loose-versions, lockfiles-committed, manifest-asinvoker, eslint-bans |
+| `powershell -NoProfile -ExecutionPolicy Bypass -File 'scripts\windows-smoke.ps1'` | 0 | 22 PASS, 0 FAIL, 0 NOT RUN: build-bins (its own build step passed), agent-starts (pid 7272), agent-has-no-tcp-listener (0/0/0 rows, 0 UDP endpoints), second-agent-same-data-dir-exits-3, agent-peak-working-set-under-1gb (30.7 MB), agent-stop-exits-0, restart-after-stop, no-leftover-processes; temp dir removed |
+| `powershell -NoProfile -ExecutionPolicy Bypass -File 'scripts\phase1-proof.ps1'` (output kept as proof.log in the session scratchpad) | 1 | 11 PASS, 3 FAIL. The run killed the agent at committed=257949696 of 268435456. FAIL: committed prefix of the .part matches the generator (fixture reported a content mismatch at byte offset 256901120). FAIL: the database kept at least what was committed before the kill (db committed 254541824). FAIL: every resumed GET starts at or after the committed offset and sends If-Range (the list included the pre-kill segment GETs). PASS: Get-FileHash equals the fixture hash (b2130714...8f96), agent digest, served 270860289 within bound 274726912, no staging file left. The implementer attributes the three FAILs to the script, which assumes one stream (contiguous committed prefix, segments[0] as the DB offset, every GET after the first as a resumed GET). The script was not changed. |
+| ad hoc `scratchpad\seg-proof.ps1 -BinDir target\debug -Work scratchpad\segproof1` (segment-aware copy of the same check: same URL, seed, kill rule and bounds) | 1 | harness bug in the ad hoc script: three verification range fetches (conn 3, no If-Range) came after the kill sequence and were counted as resumed GETs. Every product check passed. Script fixed and rerun |
+| ad hoc `scratchpad\seg-proof.ps1 -BinDir target\debug -Work scratchpad\segproof2` (output kept as segproof2.log) | 0 | PASS, segment-aware. Killed at committed_bytes=257949696 in segmented mode. Pre-kill segments 0+239599616, 239599616+17301504, 262209536+1048576; all 3 committed ranges match the generator. After restart the DB has the same segments, committed 257949696 >= 257949696. Six GETs before the kill. The only two agent GETs after the restart were bytes=256901120-262209535 and bytes=263258112-268435455, each starting at its segment's committed end, sending If-Range "77-268435456", and overlapping no pre-kill committed byte. Served 269877249 bytes, under bound 274726912. SHA-256 equals the fixture hash and the agent digest. No .part left; agent stop exit 0 |
+| `forgedm-agent.exe --data-dir smoke1\data --proxy none`; `forgedm list --json`; `forgedm get <id> --json`; `forgedm agent stop` (retry smoke attempt 1, agent events read) | 0 | attempt-1 download: queued to probing at +3 ms, probing to downloading at +1007 ms, completed at +1064 ms; retry_count 0; checksum match; agent stop exit 0 |
+| `powershell ... -File scratchpad\retry-smoke.ps1 -BinDir target\debug -Work scratchpad\smoke1` (retry smoke attempt 1) | 1 | harness bug: the script read test_key and at_unix_ms, which the fixture's /__log JSON does not export. The product part passed: `add --sha256 --watch` exited 0 in 1.1 s; the 4 MiB SHA-256 matched (bf5b8245...d888); fixture and agent were killed in finally |
+| `powershell ... -File scratchpad\retry-smoke.ps1 -BinDir target\debug -Work scratchpad\smoke2` (retry smoke attempt 2) | 1 | harness bugs: on PS 5.1, Start-Process ExitCode was blank because the handle was not cached, so three exit checks showed blank; the stall "claimed offset" was read from committed_bytes, which stays 0 during a stall. The downloads completed with matching hashes. Script fixed and rerun |
+| `powershell ... -File scratchpad\retry-smoke.ps1 -BinDir target\debug -Work scratchpad\smoke3` (retry smoke attempt 3; output kept as smoke3.log; request arrival timed by polling /__log every 25 ms) | 0 | PASS, retry smoke. (1) `/f/4242/4194304?status=503&retry_after=1&fail_first=2&t=retry503`: `add --sha256 --watch` exited 0 after 1.1 s; SHA-256 bf5b8245...d888 equals the fixture hash; checksum match. Request log: seq 0 HEAD conn 1 (503); seq 1 GET bytes=0-0 (503); seq 2 HEAD at +982 ms; seq 3 GET bytes=0-0; seq 4 GET bytes=0-4194303 with If-Range "4242-4194304". One roughly 1 s Retry-After wait after the failed probe; the agent events show probing to downloading at +1014 ms. (2) `/f/4343/4194304?stall_after=3145728&t=stall`: during the stall the agent reported accepted_bytes 3145728 and committed_bytes 0. Request log: seq 7 GET bytes=0-4194303 with If-Range "4343-4194304" (stalls after 3 MiB); seq 8 GET on conn 2 for bytes=3145728-4194303 at +30844 ms. The record was cut off in the middle of case (2), so its remaining detail is not recorded here and the script's exit 0 is not independently verified for that case |
+
+Gate all_green: false. The gate command `scripts\phase1-proof.ps1` exited 1 with 3 FAILs, the script was not changed, and the gate is therefore not green. The gate record given to the coordinator is cut off in the middle of the retry-smoke stall case and has no all_green field; this status is set from the exit codes. Workspace tests: 694 passed, 0 failed, 3 ignored. No product code was changed during the gate. Harness scripts in the scratchpad were fixed and rerun; the failing runs are recorded above and are not counted as results.
+
+Problems and notes:
+- The phase1-proof.ps1 exit 1 (3 FAILs) is the blocker for this gate. The implementer's segment-aware re-check with the same kill rule and bounds passed, which supports the script-assumption explanation. That is the implementer's diagnosis, not a gate pass.
+- The ad hoc and retry smoke harness bugs (segproof1, smoke1, smoke2) were corrected before the passing reruns.
+- The stall case (2) of the retry smoke is incomplete in the record (see above).
+
+NOT RUN:
+- `cargo deny --locked check` and coverage (cargo-llvm-cov) are not in the gate command list, so not run. The 80% coverage target is therefore not verified for this wave.
+- Ignored in the gate run and not run: full_5gib_segmented_exact_size_stream_compare, connect_timeout_15s_blackhole, iae_from_sta_writes_zone_identifier.
+- plan_tests_missing for S1.12: the connect_timeout_15s_blackhole slow tier; tls_untrusted_cert_fatal and the https_to_http e2e over TLS (see the S1.12 section).
