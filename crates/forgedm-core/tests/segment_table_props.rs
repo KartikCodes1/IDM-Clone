@@ -3,7 +3,7 @@
 //! never take a byte past its end, even with many threads splitting at once.
 #![allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)] // test code
 
-use std::sync::Mutex;
+use std::sync::{Barrier, Mutex};
 
 use forgedm_core::transfer::segment_table::{
     MAX_SEGMENTS, MIN_SPLIT, SPLIT_ALIGN, SegmentTable, WorkerId,
@@ -152,14 +152,21 @@ impl XorShift {
 
 /// One thread's loop: take a segment, claim chunks until it ends or shrinks, repeat.
 /// Returns every `(position, length)` it claimed (and sent immediately).
-fn hammer(table: &Mutex<SegmentTable>, worker: WorkerId, seed: u64) -> Vec<(u64, u64)> {
+///
+/// Every worker takes its first assignment and then waits at `start`, so no byte is claimed
+/// until all workers hold a segment. Workers beyond the planned segment count therefore
+/// always split one, however the threads are scheduled.
+fn hammer(
+    table: &Mutex<SegmentTable>,
+    worker: WorkerId,
+    seed: u64,
+    start: &Barrier,
+) -> Vec<(u64, u64)> {
     let mut rng = XorShift(seed);
     let mut claimed = Vec::new();
-    loop {
-        let assignment = table.lock().unwrap().assign(worker);
-        let Some(assignment) = assignment else {
-            return claimed;
-        };
+    let mut next = table.lock().unwrap().assign(worker);
+    start.wait();
+    while let Some(assignment) = next {
         let mut pos = assignment.claim;
         loop {
             let n = 1 + rng.next() % (MIB / 2);
@@ -181,7 +188,9 @@ fn hammer(table: &Mutex<SegmentTable>, worker: WorkerId, seed: u64) -> Vec<(u64,
             }
         }
         table.lock().unwrap().release(assignment.seg_no, worker);
+        next = table.lock().unwrap().assign(worker);
     }
+    claimed
 }
 
 #[test]
@@ -189,12 +198,14 @@ fn stress_shrunk_worker_never_writes_past_end() {
     const THREADS: u64 = 8;
     let total = 384 * MIB + 4321;
     let table = Mutex::new(SegmentTable::plan(total, 4));
+    let start = Barrier::new(usize::try_from(THREADS).unwrap());
 
     let mut claimed: Vec<(u64, u64)> = std::thread::scope(|scope| {
         let handles: Vec<_> = (1..=THREADS)
             .map(|w| {
                 let table = &table;
-                scope.spawn(move || hammer(table, u32::try_from(w).unwrap(), 0x9E37 * w + 1))
+                let start = &start;
+                scope.spawn(move || hammer(table, u32::try_from(w).unwrap(), 0x9E37 * w + 1, start))
             })
             .collect();
         handles
