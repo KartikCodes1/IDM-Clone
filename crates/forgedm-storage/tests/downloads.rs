@@ -659,3 +659,30 @@ async fn max_connections_and_retry_time_are_persisted() {
     let still = db.storage.downloads().get(id).await.unwrap().unwrap();
     assert_eq!(still.max_connections, 3, "a refused value changes nothing");
 }
+
+#[tokio::test]
+async fn priority_is_persisted_and_an_unknown_download_is_not_found() {
+    let db = open_temp().await;
+    let id = new_id();
+    db.storage
+        .downloads()
+        .insert(&new_download(id, URL))
+        .await
+        .unwrap();
+
+    db.storage
+        .downloads()
+        .set_priority(id, forgedm_protocol::Priority::High, 20)
+        .await
+        .unwrap();
+
+    let record = db.storage.downloads().get(id).await.unwrap().unwrap();
+    assert_eq!(record.priority, forgedm_protocol::Priority::High);
+    assert_eq!(record.updated_at_ms, 20);
+    let missing = db
+        .storage
+        .downloads()
+        .set_priority(new_id(), forgedm_protocol::Priority::Low, 21)
+        .await;
+    assert!(matches!(missing, Err(StorageError::NotFound { .. })));
+}

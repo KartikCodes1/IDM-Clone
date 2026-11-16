@@ -1,7 +1,8 @@
 //! ForgeDM command-line client (`forgedm`).
 //!
 //! Commands: `add`, `watch`, `status`, `list [--json]`, `get|show <id> [--json]`, `pause`,
-//! `resume`, `cancel`, `retry`, `remove`, `agent stop`, with a global `--data-dir`.
+//! `resume`, `cancel`, `retry`, `remove`, `limits`, `pause-all`, `resume-all`, `priority`,
+//! `agent stop`, with a global `--data-dir`.
 //! Exit codes follow PHASE_0_1_PLAN Appendix A.8 (see [`error::CliError::exit_code`]).
 
 #![forbid(unsafe_code)]
@@ -74,6 +75,14 @@ async fn run(cli: Cli) -> Result<(), error::CliError> {
             delete_partial,
             yes,
         } => commands::control::remove(&target, id, delete_partial, yes).await,
+        Command::Limits(args) => commands::limits::limits(&target, args).await,
+        Command::PauseAll { discard_progress } => {
+            commands::limits::pause_all(&target, discard_progress).await
+        }
+        Command::ResumeAll => commands::limits::resume_all(&target).await,
+        Command::Priority { id, priority } => {
+            commands::limits::priority(&target, id, priority).await
+        }
         Command::Agent(action) => commands::agent::run(&target, action).await,
     }
 }

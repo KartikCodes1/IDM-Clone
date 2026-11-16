@@ -12,7 +12,8 @@ use std::io::{self, Write};
 use std::sync::atomic::{AtomicU8, Ordering};
 
 use forgedm_protocol::{
-    AgentStatusInfo, DownloadDetail, DownloadState, DownloadSummary, HandshakeResult, ProgressItem,
+    AgentStatusInfo, DownloadDetail, DownloadState, DownloadSummary, EffectiveLimits,
+    HandshakeResult, ProgressItem,
 };
 use uuid::Uuid;
 
@@ -237,6 +238,55 @@ pub fn progress(item: &ProgressItem) {
 /// Prints the state a control command left a download in.
 pub fn state_result(id: Uuid, state: DownloadState) {
     line(&format!("{} {id}", enum_text(serde_json::to_value(state))));
+}
+
+/// Prints the agent-wide limits in force.
+pub fn limits(limits: &EffectiveLimits) {
+    for text in limits_lines(limits) {
+        line(&text);
+    }
+}
+
+/// The lines [`limits`] prints.
+fn limits_lines(limits: &EffectiveLimits) -> [String; 3] {
+    let count = |value: Option<u32>| value.map_or_else(|| "unknown".to_owned(), |v| v.to_string());
+    let speed = limits.rate_limit_bps.map_or_else(
+        || "off".to_owned(),
+        |bps| format!("{} ({bps} B/s)", format_speed(Some(bps))),
+    );
+    [
+        format!(
+            "max active downloads {}",
+            count(limits.max_active_downloads)
+        ),
+        format!("speed limit {speed}"),
+        format!("connections per download {}", count(limits.max_connections)),
+    ]
+}
+
+/// Prints what `pause-all` did.
+pub fn paused_all(paused: &[Uuid], skipped: &[Uuid]) {
+    for id in paused {
+        line(&format!("paused {id}"));
+    }
+    for id in skipped {
+        line(&format!(
+            "skipped {id} (cannot resume; use --discard-progress)"
+        ));
+    }
+    line(&format!(
+        "{} paused, {} skipped",
+        paused.len(),
+        skipped.len()
+    ));
+}
+
+/// Prints what `resume-all` did.
+pub fn resumed_all(resumed: &[Uuid]) {
+    for id in resumed {
+        line(&format!("queued {id}"));
+    }
+    line(&format!("{} resumed", resumed.len()));
 }
 
 /// Prints the download detail as text.

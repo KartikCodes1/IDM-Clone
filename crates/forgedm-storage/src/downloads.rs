@@ -1,7 +1,7 @@
 //! Download repository. Every write is a `BEGIN IMMEDIATE` transaction; state changes are
 //! compare-and-set on the previous state.
 
-use forgedm_protocol::{DownloadState, LIST_PAGE_MAX};
+use forgedm_protocol::{DownloadState, LIST_PAGE_MAX, Priority};
 use uuid::Uuid;
 
 use crate::convert::to_i64;
@@ -179,6 +179,32 @@ impl Downloads {
         .execute(&mut *tx)
         .await?
         .rows_affected();
+        if changed != 1 {
+            return Err(StorageError::NotFound { id });
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Persist a new scheduling priority, so a reordering survives an agent restart.
+    ///
+    /// # Errors
+    /// [`StorageError::NotFound`] or a database error.
+    pub async fn set_priority(
+        &self,
+        id: Uuid,
+        priority: Priority,
+        at_ms: i64,
+    ) -> Result<(), StorageError> {
+        let mut tx = self.storage.begin_write().await?;
+        let changed =
+            sqlx::query("UPDATE downloads SET priority = ?2, updated_at_ms = ?3 WHERE id = ?1")
+                .bind(id_text(id))
+                .bind(priority_to_db(priority))
+                .bind(at_ms)
+                .execute(&mut *tx)
+                .await?
+                .rows_affected();
         if changed != 1 {
             return Err(StorageError::NotFound { id });
         }

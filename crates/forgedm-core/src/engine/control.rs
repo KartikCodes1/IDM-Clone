@@ -10,7 +10,7 @@
 use std::time::Duration;
 
 use forgedm_protocol::DownloadState;
-use tokio::time::timeout;
+use tokio::time::{Instant, timeout, timeout_at};
 use uuid::Uuid;
 
 use super::{Actor, Control, StopReason, delete_stale_part};
@@ -35,6 +35,22 @@ fn command_of(control: Control, resumable: bool) -> Command {
         Control::Retry { .. } => Command::Retry,
     }
 }
+
+/// What [`EngineHandle::pause_all`](super::EngineHandle::pause_all) did.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PauseAllOutcome {
+    /// Downloads that are paused now.
+    pub paused: Vec<Uuid>,
+    /// Active non-resumable downloads left running (pausing would lose their progress).
+    pub skipped_not_resumable: Vec<Uuid>,
+}
+
+/// States `PauseAll` can move to `paused` when no task runs them (A.6).
+const PAUSABLE_IDLE: [DownloadState; 3] = [
+    DownloadState::Queued,
+    DownloadState::RetryWaiting,
+    DownloadState::Interrupted,
+];
 
 fn refusal(err: TransitionError) -> EngineError {
     match err {
@@ -73,6 +89,89 @@ impl Actor {
         }
     }
 
+    /// Pauses every pausable download. Running ones are all asked to stop first and then
+    /// awaited together, so the call lasts one settle wait, not one per download.
+    pub(super) async fn pause_all(
+        &mut self,
+        discard_progress: bool,
+    ) -> Result<PauseAllOutcome, EngineError> {
+        if self.closing {
+            return Err(EngineError::ShuttingDown);
+        }
+        let pause = Control::Pause { discard_progress };
+        let mut outcome = PauseAllOutcome::default();
+        let mut stopping = Vec::new();
+        for id in self.pausable_ids().await? {
+            let Some(job) = self.deps.store.load(id).await? else {
+                continue;
+            };
+            let live = self.registry.get(id);
+            let state = live.as_ref().map_or(job.state, |live| live.state());
+            let resumable = job.transfer_mode.is_none_or(is_resumable_mode);
+            match transition(state, command_of(pause, resumable)) {
+                Err(TransitionError::NotResumable) => outcome.skipped_not_resumable.push(id),
+                Err(TransitionError::InvalidState { .. }) => {}
+                Ok(step) if !step.changed => {}
+                Ok(_) => match live {
+                    Some(live) => {
+                        live.stop().request(StopReason::Pause);
+                        stopping.push(live);
+                    }
+                    None => {
+                        if self.control_idle(job, pause).await? == DownloadState::Paused {
+                            outcome.paused.push(id);
+                        }
+                    }
+                },
+            }
+        }
+        let deadline = Instant::now() + SETTLE_WAIT;
+        for live in stopping {
+            let _ = timeout_at(deadline, live.finished()).await;
+            let id = live.id();
+            if self.stored_state(id).await.ok() == Some(DownloadState::Paused) {
+                outcome.paused.push(id);
+            }
+        }
+        Ok(outcome)
+    }
+
+    /// Every download `PauseAll` may touch: the running ones and the idle pausable ones.
+    async fn pausable_ids(&self) -> Result<Vec<Uuid>, EngineError> {
+        let mut ids = self.registry.ids();
+        for id in self.deps.store.ids_in_states(&PAUSABLE_IDLE).await? {
+            if !ids.contains(&id) {
+                ids.push(id);
+            }
+        }
+        Ok(ids)
+    }
+
+    /// Resumes every paused download and admits them together, best first.
+    pub(super) async fn resume_all(&mut self) -> Result<Vec<Uuid>, EngineError> {
+        if self.closing {
+            return Err(EngineError::ShuttingDown);
+        }
+        let mut resumed = Vec::new();
+        for id in self
+            .deps
+            .store
+            .ids_in_states(&[DownloadState::Paused])
+            .await?
+        {
+            let Some(job) = self.deps.store.load(id).await? else {
+                continue;
+            };
+            match self.requeue_idle(job, Control::Resume).await {
+                Ok(DownloadState::Queued) => resumed.push(id),
+                Ok(_) | Err(EngineError::InvalidState(_)) => {}
+                Err(other) => return Err(other),
+            }
+        }
+        self.admit().await;
+        Ok(resumed)
+    }
+
     /// The download has a running task: ask it to stop (pause, cancel) and wait for it.
     async fn control_running(
         &mut self,
@@ -108,8 +207,21 @@ impl Actor {
         stored.map(|job| job.state).ok_or(EngineError::NotFound)
     }
 
-    /// No task is running: move the stored state by compare-and-set.
+    /// No task is running: move the stored state by compare-and-set, then admit.
     async fn control_idle(
+        &mut self,
+        job: StoredJob,
+        control: Control,
+    ) -> Result<DownloadState, EngineError> {
+        let state = self.requeue_idle(job, control).await?;
+        if state == DownloadState::Queued {
+            self.admit().await;
+        }
+        Ok(state)
+    }
+
+    /// [`control_idle`](Self::control_idle) without the admission, for batches.
+    async fn requeue_idle(
         &mut self,
         mut job: StoredJob,
         control: Control,
@@ -144,7 +256,7 @@ impl Actor {
             }) => return Err(EngineError::InvalidState(actual)),
             Err(other) => return Err(other.into()),
         }
-        self.queue.retain(|queued| queued.id != job.id);
+        self.queue.remove(job.id);
         self.deps
             .sink
             .emit(EngineEvent::Changed { id: job.id })
@@ -152,8 +264,7 @@ impl Actor {
         if step.to == DownloadState::Queued {
             job.state = DownloadState::Queued;
             job.state_reason = None;
-            self.queue.push_back(job);
-            self.admit().await;
+            self.queue_job(job);
         }
         Ok(step.to)
     }
@@ -194,7 +305,7 @@ impl Actor {
                 return Err(EngineError::Busy);
             }
         }
-        self.queue.retain(|queued| queued.id != id);
+        self.queue.remove(id);
         // Re-read: the task may have recorded the staging file while it settled.
         let job = self.deps.store.load(id).await?.unwrap_or(job);
         if delete_partial && job.state != DownloadState::Completed {

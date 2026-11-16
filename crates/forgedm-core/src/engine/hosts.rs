@@ -5,9 +5,11 @@
 //! connection limit halves once per burst of throttles and recovers after two clean minutes.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
+use tokio::sync::Notify;
 use tokio::time::Instant;
 use url::Url;
 
@@ -24,6 +26,24 @@ pub const CONNS_PER_HOST: u32 = 8;
 #[derive(Debug)]
 pub struct HostHandle {
     state: Mutex<HostState>,
+    /// Connection slots in use right now (never above the AIMD limit at the time of taking).
+    in_use: AtomicU32,
+    /// First connections of downloads that are waiting for a slot.
+    first_waiting: AtomicU32,
+    freed: Notify,
+}
+
+/// Marks a first connection that is waiting for a host slot; extra connections of other
+/// downloads stand back while any exists. Ends when dropped.
+#[derive(Debug)]
+pub struct FirstWaiter {
+    host: Arc<HostHandle>,
+}
+
+impl Drop for FirstWaiter {
+    fn drop(&mut self) {
+        self.host.first_waiting.fetch_sub(1, Ordering::AcqRel);
+    }
 }
 
 impl HostHandle {
@@ -32,7 +52,77 @@ impl HostHandle {
     pub fn new(max_connections: u32) -> Self {
         Self {
             state: Mutex::new(HostState::new(max_connections)),
+            in_use: AtomicU32::new(0),
+            first_waiting: AtomicU32::new(0),
+            freed: Notify::new(),
         }
+    }
+
+    /// Registers a waiting first connection (see [`FirstWaiter`]).
+    #[must_use]
+    pub fn first_waiter(self: &Arc<Self>) -> FirstWaiter {
+        self.first_waiting.fetch_add(1, Ordering::AcqRel);
+        FirstWaiter {
+            host: Arc::clone(self),
+        }
+    }
+
+    /// Takes a connection slot if one is free under the current AIMD limit. A connection that
+    /// is not `first` of its download yields to waiting first connections.
+    pub fn try_take_slot(&self, now: Instant, first: bool) -> bool {
+        if !first && self.first_waiting.load(Ordering::Acquire) > 0 {
+            return false;
+        }
+        let limit = self.limit(now);
+        let mut current = self.in_use.load(Ordering::Acquire);
+        loop {
+            if current >= limit {
+                return false;
+            }
+            match self.in_use.compare_exchange_weak(
+                current,
+                current + 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return true,
+                Err(actual) => current = actual,
+            }
+        }
+    }
+
+    /// Returns a slot taken with [`try_take_slot`](Self::try_take_slot) and wakes waiters.
+    pub fn release_slot(&self) {
+        let mut current = self.in_use.load(Ordering::Acquire);
+        while current > 0 {
+            match self.in_use.compare_exchange_weak(
+                current,
+                current - 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => break,
+                Err(actual) => current = actual,
+            }
+        }
+        self.freed.notify_waiters();
+    }
+
+    /// First connections waiting for a slot on this host.
+    #[must_use]
+    pub fn first_waiting(&self) -> u32 {
+        self.first_waiting.load(Ordering::Acquire)
+    }
+
+    /// Slots in use right now.
+    #[must_use]
+    pub fn slots_in_use(&self) -> u32 {
+        self.in_use.load(Ordering::Acquire)
+    }
+
+    /// Resolves when a slot was returned (register before checking, as with [`Notify`]).
+    pub fn slot_freed(&self) -> tokio::sync::futures::Notified<'_> {
+        self.freed.notified()
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, HostState> {
@@ -147,5 +237,30 @@ mod tests {
         host.throttled(now, Duration::from_secs(2));
         assert_eq!(host.limit(now), 4);
         assert_eq!(host.cooldown_remaining(now), Duration::from_secs(9));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn slots_follow_the_aimd_limit_and_first_waiters_go_first() {
+        let host = Arc::new(HostHandle::new(2));
+        let now = Instant::now();
+        assert!(host.try_take_slot(now, false));
+        assert!(host.try_take_slot(now, false));
+        assert!(!host.try_take_slot(now, false), "limit of two reached");
+
+        host.release_slot();
+        let waiter = host.first_waiter();
+        assert!(
+            !host.try_take_slot(now, false),
+            "an extra connection stands back for a waiting first one"
+        );
+        assert!(host.try_take_slot(now, true));
+        drop(waiter);
+        host.release_slot();
+        host.release_slot();
+        assert_eq!(host.slots_in_use(), 0);
+
+        host.throttled(now, Duration::from_secs(1));
+        assert!(host.try_take_slot(now, true), "AIMD limit is one now");
+        assert!(!host.try_take_slot(now, true));
     }
 }

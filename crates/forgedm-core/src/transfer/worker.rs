@@ -25,11 +25,13 @@ use crate::client::{
     ClientError, FetchSpec, HttpClient, classify_reqwest, response_meta, retry_after_of,
 };
 use crate::engine::LiveDownload;
+use crate::engine::budgets::ConnGate;
 use crate::error::{Failure, Fault, TaskStop};
 use crate::http::content_range::RangeRequest;
 use crate::http::range_decision::{RangeDecision, RangedRequest, decide};
 use crate::http::validators::ResumeIdentity;
 use crate::progress::SpeedMeter;
+use crate::rate_limit::TokenBucket;
 use crate::retry::{Phase, TransferErrorKind};
 use crate::transfer::single::writer_stop;
 use crate::writer::{Coalescer, WRITE_COALESCE, WriteHandle, WritePermit};
@@ -74,6 +76,10 @@ pub struct Shared {
     pub if_range: Option<String>,
     /// Retry decisions, budgets and the host cooldown of this download.
     pub res: Arc<Resilience>,
+    /// Where connections take their permits (global, then host).
+    pub gate: Arc<ConnGate>,
+    /// The download's bandwidth bucket (its parent is the global one).
+    pub bucket: Arc<TokenBucket>,
     /// Fires when every worker must stop (a user stop or a failure).
     pub halt: CancellationToken,
     fatal: Mutex<Option<TaskStop>>,
@@ -96,6 +102,10 @@ pub struct SharedInit {
     pub identity: ResumeIdentity,
     /// Retry decisions of this download.
     pub res: Arc<Resilience>,
+    /// Where connections take their permits.
+    pub gate: Arc<ConnGate>,
+    /// The download's bandwidth bucket.
+    pub bucket: Arc<TokenBucket>,
     /// Should be a child of the download's stop token.
     pub halt: CancellationToken,
 }
@@ -114,6 +124,8 @@ impl Shared {
             identity: init.identity,
             if_range,
             res: init.res,
+            gate: init.gate,
+            bucket: init.bucket,
             halt: init.halt,
             fatal: Mutex::new(None),
             final_url: Mutex::new(None),
@@ -307,8 +319,15 @@ async fn fetch_segment(
         if shared.res.gate(cancel).await.is_err() {
             return Ok(SegmentEnd::Cancelled);
         }
+        // A permit lives for one request: it is returned before any retry wait, and a
+        // download's extra connections stand back for other downloads' first ones.
+        let Ok(permit) = shared.gate.acquire_for_worker(cancel).await else {
+            return Ok(SegmentEnd::Cancelled);
+        };
         let ranged = (claim, end);
-        match attempt(shared, id, no, ranged, cancel, buffer).await {
+        let outcome = attempt(shared, id, no, ranged, cancel, buffer).await;
+        drop(permit);
+        match outcome {
             Ok(SegmentEnd::Done) => {}
             Ok(SegmentEnd::Cancelled) => return Ok(SegmentEnd::Cancelled),
             Err(TaskStop::Retry(fault)) => {
@@ -463,6 +482,15 @@ impl Body<'_> {
             pos += allowed;
             received += allowed;
             self.shared.res.on_progress(self.no, allowed);
+            if self
+                .shared
+                .bucket
+                .acquire(allowed, self.cancel)
+                .await
+                .is_err()
+            {
+                return Ok(SegmentEnd::Cancelled);
+            }
             if published.elapsed() >= SPEED_PUBLISH {
                 meter.sample(Instant::now(), received);
                 self.shared.lock().set_speed(self.no, meter.speed());
@@ -478,6 +506,11 @@ impl Body<'_> {
             }
             if self.accepted.strict && (bytes.len() as u64) > taken {
                 return Err(Failure::protocol_violation("body_beyond_content_range").into());
+            }
+            if self.shared.gate.should_yield() {
+                // Give the permit back; the segment continues with a fresh request once
+                // the waiting first connection has had its turn.
+                return Ok(SegmentEnd::Done);
             }
         }
         Ok(SegmentEnd::Done)

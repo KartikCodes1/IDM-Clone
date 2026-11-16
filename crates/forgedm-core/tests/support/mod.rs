@@ -11,6 +11,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use forgedm_core::client::{ClientOptions, HttpClient, ProxyMode};
+use forgedm_core::engine::budgets::FreeSpace;
 use forgedm_core::engine::{self, EngineConfig, EngineDeps, EngineHandle};
 use forgedm_core::ports::{EngineEvent, NewJob, unix_ms};
 use forgedm_core::transfer::resilience::RetryEnv;
@@ -290,23 +291,53 @@ impl Harness {
         Self::with(RecordingSleeper::new(), options)
     }
 
+    /// Custom engine tunables (active downloads, connection budgets).
+    pub fn configured(config: EngineConfig) -> Self {
+        Self::build(
+            RecordingSleeper::new(),
+            ClientOptions::new(ProxyMode::None),
+            config,
+            None,
+        )
+    }
+
+    /// Custom tunables and an injected free-space reading.
+    pub fn with_free_space(config: EngineConfig, space: Arc<dyn FreeSpace>) -> Self {
+        Self::build(
+            RecordingSleeper::new(),
+            ClientOptions::new(ProxyMode::None),
+            config,
+            Some(space),
+        )
+    }
+
     fn with(sleeper: RecordingSleeper, options: ClientOptions) -> Self {
+        Self::build(sleeper, options, EngineConfig::default(), None)
+    }
+
+    fn build(
+        sleeper: RecordingSleeper,
+        options: ClientOptions,
+        config: EngineConfig,
+        space: Option<Arc<dyn FreeSpace>>,
+    ) -> Self {
         let store = Arc::new(MemoryStore::new());
         let sink = Arc::new(RecordingSink::new());
         let sleeper = Arc::new(sleeper);
-        let engine = engine::start_with(
-            EngineConfig::default(),
-            EngineDeps {
-                store: store.clone(),
-                sink: sink.clone(),
-                client: HttpClient::with_options(&options).unwrap(),
-                motw: Arc::new(MotwService::start().unwrap()),
-            },
-            RetryEnv {
-                sleeper: sleeper.clone(),
-                jitter_seed: Some(42),
-            },
-        );
+        let deps = EngineDeps {
+            store: store.clone(),
+            sink: sink.clone(),
+            client: HttpClient::with_options(&options).unwrap(),
+            motw: Arc::new(MotwService::start().unwrap()),
+        };
+        let retry = RetryEnv {
+            sleeper: sleeper.clone(),
+            jitter_seed: Some(42),
+        };
+        let engine = match space {
+            Some(space) => engine::start_with_space(config, deps, retry, space),
+            None => engine::start_with(config, deps, retry),
+        };
         Self {
             store,
             sink,
@@ -323,10 +354,22 @@ impl Harness {
 
     /// Enqueues `url` as `name` with a cap of `connections`.
     pub async fn enqueue(&self, url: &str, name: &str, connections: u32) -> Uuid {
+        self.enqueue_with(url, name, connections, Priority::Normal)
+            .await
+    }
+
+    /// Enqueues `url` as `name` with a cap of `connections` and a priority.
+    pub async fn enqueue_with(
+        &self,
+        url: &str,
+        name: &str,
+        connections: u32,
+        priority: Priority,
+    ) -> Uuid {
         let job = NewJob {
             id: Uuid::now_v7(),
             source: ClientKind::Cli,
-            priority: Priority::Normal,
+            priority,
             display_name: name.to_owned(),
             url: validate_user_url(url).unwrap(),
             target_dir: self.target(),

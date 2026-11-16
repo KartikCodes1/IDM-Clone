@@ -2,9 +2,10 @@
 //!
 //! Served here: Handshake, Ping, GetAgentStatus, GetSnapshot, Subscribe, Unsubscribe,
 //! ListDownloads, ShutdownAgentSafely, (S1.7) EnqueueUrl and GetDownload and (S1.9) Pause,
-//! Resume, Cancel, Retry and Remove through an injected [`EngineControl`], and (S1.11)
-//! `UpdateLimits` for the connection cap of one download. Without an engine
-//! they answer `not_implemented`, as do the other limits actions ([`limits`]) until S1.13.
+//! Resume, Cancel, Retry and Remove through an injected [`EngineControl`], (S1.11)
+//! `UpdateLimits` for the connection cap of one download, and (S1.13) the global limits,
+//! `PauseAll`, `ResumeAll` and `UpdatePriority` ([`limits`]). Without an engine they all
+//! answer `not_implemented`.
 //!
 //! The IPC server does not cancel handlers (S0.7), so every call is bounded here by
 //! `ENGINE_REPLY_TIMEOUT` (5 s); a timeout maps to the retryable `busy` error (PCR-05).
@@ -109,10 +110,10 @@ impl AgentHandler {
             B::Cancel(request) => control::cancel(self, request).await,
             B::Retry(request) => control::retry(self, request).await,
             B::Remove(request) => control::remove(self, request).await,
-            B::PauseAll(request) => limits::pause_all(&request),
-            B::ResumeAll(request) => limits::resume_all(&request),
+            B::PauseAll(request) => limits::pause_all(self, request).await,
+            B::ResumeAll(request) => limits::resume_all(self, request).await,
             B::UpdateLimits(request) => limits::update_limits(self, request).await,
-            B::UpdatePriority(request) => limits::update_priority(&request),
+            B::UpdatePriority(request) => limits::update_priority(self, request).await,
         }
     }
 
@@ -360,9 +361,21 @@ mod tests {
         assert!(!conn.is_subscribed());
     }
 
-    /// An engine that only records connection caps.
+    /// An engine that only records what it was asked to apply.
     struct CapEngine {
         caps: std::sync::Mutex<Vec<(Uuid, u32)>>,
+        rates: std::sync::Mutex<Vec<(Uuid, Option<u64>)>>,
+        globals: std::sync::Mutex<Vec<crate::limits_store::GlobalPatch>>,
+    }
+
+    impl CapEngine {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                caps: std::sync::Mutex::new(Vec::new()),
+                rates: std::sync::Mutex::new(Vec::new()),
+                globals: std::sync::Mutex::new(Vec::new()),
+            })
+        }
     }
 
     impl EngineControl for CapEngine {
@@ -392,6 +405,30 @@ mod tests {
             self.caps.lock().unwrap().push((id, value));
             Box::pin(async move { Ok(value) })
         }
+
+        fn set_rate_limit(
+            &self,
+            id: Uuid,
+            limit: Option<u64>,
+        ) -> forgedm_core::clock::BoxFuture<'_, Result<Option<u64>, AgentError>> {
+            self.rates.lock().unwrap().push((id, limit));
+            Box::pin(async move { Ok(limit) })
+        }
+
+        fn update_global_limits(
+            &self,
+            patch: crate::limits_store::GlobalPatch,
+        ) -> forgedm_core::clock::BoxFuture<'_, Result<forgedm_protocol::EffectiveLimits, AgentError>>
+        {
+            self.globals.lock().unwrap().push(patch);
+            Box::pin(async move {
+                Ok(forgedm_protocol::EffectiveLimits {
+                    max_connections: patch.max_connections,
+                    rate_limit_bps: patch.rate_limit_bps.flatten(),
+                    max_active_downloads: patch.max_active_downloads,
+                })
+            })
+        }
     }
 
     fn limits_request(
@@ -402,9 +439,7 @@ mod tests {
 
     #[tokio::test]
     async fn update_limits_sets_the_connection_cap_of_one_download() {
-        let engine = Arc::new(CapEngine {
-            caps: std::sync::Mutex::new(Vec::new()),
-        });
+        let engine = CapEngine::new();
         let handler = handler().with_engine(engine.clone());
         let mut conn = conn();
         let id = Uuid::now_v7();
@@ -430,31 +465,113 @@ mod tests {
         assert_eq!(engine.caps.lock().unwrap().as_slice(), [(id, 12)]);
     }
 
+    fn effective_of(response: &Response) -> forgedm_protocol::EffectiveLimits {
+        let ResultBody::UpdateLimits(result) = ResultBody::from_value(
+            forgedm_protocol::Action::UpdateLimits,
+            response.result().expect("a success").clone(),
+        )
+        .unwrap() else {
+            unreachable!("not an UpdateLimits result");
+        };
+        result.effective
+    }
+
     #[tokio::test]
-    async fn limits_that_belong_to_later_slices_are_refused_not_ignored() {
-        let engine = Arc::new(CapEngine {
-            caps: std::sync::Mutex::new(Vec::new()),
-        });
+    async fn global_limits_reach_the_engine_as_one_patch() {
+        let engine = CapEngine::new();
+        let handler = handler().with_engine(engine.clone());
+        let mut conn = conn();
+        let mut global = limits_request(forgedm_protocol::LimitScope::Global);
+        global.max_connections = Some(4);
+        global.rate_limit_bps = Some(Some(2048));
+        global.max_active_downloads = Some(2);
+
+        let response = handler
+            .handle(
+                &mut conn,
+                super::Request::new(4, RequestBody::UpdateLimits(global)),
+            )
+            .await;
+
+        let effective = effective_of(&response);
+        assert_eq!(effective.max_connections, Some(4));
+        assert_eq!(effective.rate_limit_bps, Some(2048));
+        assert_eq!(effective.max_active_downloads, Some(2));
+        let seen = engine.globals.lock().unwrap().clone();
+        assert_eq!(
+            seen,
+            [crate::limits_store::GlobalPatch {
+                max_connections: Some(4),
+                rate_limit_bps: Some(Some(2048)),
+                max_active_downloads: Some(2),
+            }]
+        );
+        assert!(engine.caps.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_download_rate_limit_and_an_unlimited_reset_reach_the_engine() {
+        let engine = CapEngine::new();
         let handler = handler().with_engine(engine.clone());
         let mut conn = conn();
         let id = Uuid::now_v7();
-        let mut global = limits_request(forgedm_protocol::LimitScope::Global);
-        global.max_connections = Some(4);
-        let mut rate = limits_request(forgedm_protocol::LimitScope::Download { download_id: id });
-        rate.rate_limit_bps = Some(Some(2048));
-        for request in [global, rate] {
+        for (request_id, limit) in [(5, Some(4096)), (6, None)] {
+            let mut rate =
+                limits_request(forgedm_protocol::LimitScope::Download { download_id: id });
+            rate.rate_limit_bps = Some(limit);
             let response = handler
                 .handle(
                     &mut conn,
-                    super::Request::new(4, RequestBody::UpdateLimits(request)),
+                    super::Request::new(request_id, RequestBody::UpdateLimits(rate)),
                 )
                 .await;
+            assert_eq!(effective_of(&response).rate_limit_bps, limit);
+        }
+        assert_eq!(
+            engine.rates.lock().unwrap().as_slice(),
+            [(id, Some(4096)), (id, None)]
+        );
+    }
+
+    #[tokio::test]
+    async fn an_active_download_cap_needs_the_global_scope() {
+        let engine = CapEngine::new();
+        let handler = handler().with_engine(engine.clone());
+        let mut conn = conn();
+        let mut request = limits_request(forgedm_protocol::LimitScope::Download {
+            download_id: Uuid::now_v7(),
+        });
+        request.max_active_downloads = Some(2);
+
+        let response = handler
+            .handle(
+                &mut conn,
+                super::Request::new(7, RequestBody::UpdateLimits(request)),
+            )
+            .await;
+
+        assert_eq!(error_code(&response), ErrorCode::NotImplemented);
+        assert!(engine.globals.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn batch_and_priority_actions_without_an_engine_are_not_implemented() {
+        let handler = handler();
+        let mut conn = conn();
+        let bodies = [
+            RequestBody::PauseAll(forgedm_protocol::PauseAllRequest {
+                discard_progress: false,
+            }),
+            RequestBody::ResumeAll(Empty {}),
+            RequestBody::UpdatePriority(forgedm_protocol::UpdatePriorityRequest {
+                download_id: Uuid::nil(),
+                priority: forgedm_protocol::Priority::High,
+            }),
+        ];
+        for body in bodies {
+            let response = handler.handle(&mut conn, request(body)).await;
             assert_eq!(error_code(&response), ErrorCode::NotImplemented);
         }
-        assert!(
-            engine.caps.lock().unwrap().is_empty(),
-            "nothing was applied"
-        );
     }
 
     #[tokio::test]

@@ -19,7 +19,7 @@ use forgedm_core::ports::{
 };
 use forgedm_core::transfer::segment_table::SegmentSnapshot;
 use forgedm_core::url_policy::SecretUrl;
-use forgedm_protocol::{DownloadState, TransferMode};
+use forgedm_protocol::{DownloadState, Priority, TransferMode};
 use tokio::sync::Notify;
 use uuid::Uuid;
 
@@ -149,6 +149,9 @@ impl DownloadStore for MemoryStore {
                 transfer_mode: None,
                 progress: StoredProgress::default(),
                 max_connections: new.max_connections,
+                priority: new.priority,
+                queue_position: new.created_at_ms,
+                created_at_ms: new.created_at_ms,
             };
             self.seed(job);
             Ok(())
@@ -294,6 +297,27 @@ impl DownloadStore for MemoryStore {
             row.job.max_connections = value;
             row.persisted_max_connections = Some(value);
             Ok(())
+        })
+    }
+
+    fn set_priority(&self, id: Uuid, priority: Priority) -> StoreFuture<'_, ()> {
+        Box::pin(async move {
+            let mut rows = self.rows();
+            let row = rows.get_mut(&id).ok_or(StoreError::NotFound)?;
+            row.job.priority = priority;
+            Ok(())
+        })
+    }
+
+    fn ids_in_states(&self, states: &[DownloadState]) -> StoreFuture<'_, Vec<Uuid>> {
+        let states = states.to_vec();
+        Box::pin(async move {
+            Ok(self
+                .rows()
+                .values()
+                .filter(|row| states.contains(&row.job.state))
+                .map(|row| row.job.id)
+                .collect())
         })
     }
 

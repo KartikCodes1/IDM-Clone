@@ -376,6 +376,9 @@ async fn n416_at_end_after_crash_is_complete() {
         part_file_id: Some(encode_file_id(&file_id(&file).unwrap())),
         transfer_mode: Some(TransferMode::SingleRanged),
         max_connections: 4,
+        priority: forgedm_protocol::Priority::Normal,
+        queue_position: 0,
+        created_at_ms: 0,
         progress: StoredProgress {
             total: Some(size),
             committed: size,

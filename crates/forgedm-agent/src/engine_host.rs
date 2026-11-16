@@ -6,18 +6,21 @@
 //! - [`HubSink`] turns [`EngineEvent`]s into wire events. It re-reads the stored download
 //!   after every persisted change, so the hub only ever sees what is committed.
 
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use forgedm_core::client::{HttpClient, ProxyMode as CoreProxyMode};
 use forgedm_core::clock::BoxFuture;
-use forgedm_core::engine::{self, Control, EngineConfig, EngineDeps, EngineHandle};
+use forgedm_core::engine::{
+    self, Control, EffectiveGlobal, EngineConfig, EngineDeps, EngineHandle, GlobalLimits,
+};
 use forgedm_core::ports::{EngineEvent, EngineEventSink, NewJob, ProgressSample, unix_ms};
 use forgedm_core::url_policy::SecretUrl;
 use forgedm_platform::motw::MotwService;
 use forgedm_protocol::{
     ClientKind, DownloadCompletedData, DownloadDetail, DownloadFailedData, DownloadRemovedData,
-    DownloadState, DownloadSummary, EnqueueUrlResult, EventBody, Priority, ProgressItem,
-    ProgressSnapshotData,
+    DownloadState, DownloadSummary, EffectiveLimits, EnqueueUrlResult, EventBody, PauseAllResult,
+    Priority, ProgressItem, ProgressSnapshotData, ResumeAllResult,
 };
 use forgedm_storage::Storage;
 use uuid::Uuid;
@@ -26,6 +29,7 @@ use crate::config::ProxyMode;
 use crate::detail::{build_detail, load_summary};
 use crate::error::AgentError;
 use crate::events_hub::HubHandle;
+use crate::limits_store::{self, DEFAULT_CONNECTIONS, GlobalPatch};
 use crate::store_adapter::StorageStore;
 
 /// A validated enqueue request: everything the engine needs, nothing it must re-check.
@@ -72,6 +76,45 @@ pub trait EngineControl: Send + Sync + 'static {
     /// Removes a download (and, on request, its recorded `.part`).
     fn remove(&self, _id: Uuid, _delete_partial: bool) -> BoxFuture<'_, Result<(), AgentError>> {
         Box::pin(async { Err(AgentError::NotImplemented) })
+    }
+    /// Applies a change to the agent-wide limits, live and stored, and returns the limits in
+    /// force (an empty patch just reads them).
+    fn update_global_limits(
+        &self,
+        _patch: GlobalPatch,
+    ) -> BoxFuture<'_, Result<EffectiveLimits, AgentError>> {
+        Box::pin(async { Err(AgentError::NotImplemented) })
+    }
+    /// Sets the rate limit of one download (`None` = unlimited); returns the limit in force.
+    fn set_rate_limit(
+        &self,
+        _id: Uuid,
+        _limit: Option<u64>,
+    ) -> BoxFuture<'_, Result<Option<u64>, AgentError>> {
+        Box::pin(async { Err(AgentError::NotImplemented) })
+    }
+    /// Changes the priority of a download.
+    fn set_priority(
+        &self,
+        _id: Uuid,
+        _priority: Priority,
+    ) -> BoxFuture<'_, Result<(), AgentError>> {
+        Box::pin(async { Err(AgentError::NotImplemented) })
+    }
+    /// Pauses every pausable download.
+    fn pause_all(
+        &self,
+        _discard_progress: bool,
+    ) -> BoxFuture<'_, Result<PauseAllResult, AgentError>> {
+        Box::pin(async { Err(AgentError::NotImplemented) })
+    }
+    /// Resumes every paused download.
+    fn resume_all(&self) -> BoxFuture<'_, Result<ResumeAllResult, AgentError>> {
+        Box::pin(async { Err(AgentError::NotImplemented) })
+    }
+    /// Connections a new download gets when the request names none.
+    fn default_connections(&self) -> u32 {
+        DEFAULT_CONNECTIONS
     }
 }
 
@@ -200,6 +243,7 @@ fn progress_body(samples: &[ProgressSample]) -> EventBody {
 pub struct EngineHost {
     engine: EngineHandle,
     storage: Storage,
+    default_connections: Arc<AtomicU32>,
 }
 
 impl std::fmt::Debug for EngineHost {
@@ -238,15 +282,50 @@ impl EngineHost {
         let engine = engine::start(config, deps);
         // The cell is private to this function: setting it cannot fail.
         let _ = engine_cell.set(engine.clone());
-        Ok(Self { engine, storage })
+        Ok(Self {
+            engine,
+            storage,
+            default_connections: Arc::new(AtomicU32::new(DEFAULT_CONNECTIONS)),
+        })
     }
 
     /// Resumes stored work: queued downloads run, interrupted ones auto-resume from their
     /// committed bytes when they can, and restart from zero when they cannot.
     pub async fn recover(&self) {
+        self.apply_saved_limits().await;
         match self.engine.recover().await {
             Ok(count) => tracing::info!(count, "resumed stored downloads"),
             Err(err) => tracing::error!(error = %err, "could not resume stored downloads"),
+        }
+    }
+
+    /// Applies the limits stored by an earlier run, before any download is admitted.
+    async fn apply_saved_limits(&self) {
+        let saved = match limits_store::load(&self.storage).await {
+            Ok(saved) => saved,
+            Err(err) => {
+                tracing::error!(error = %err, "could not read the stored limits; using defaults");
+                return;
+            }
+        };
+        if let Some(value) = saved.max_connections {
+            self.default_connections.store(value, Ordering::Release);
+        }
+        let patch = GlobalLimits {
+            max_active: saved.max_active_downloads.map(|v| v as usize),
+            rate_limit_bps: saved.rate_limit_bps,
+        };
+        if let Err(err) = self.engine.update_global_limits(patch).await {
+            tracing::error!(error = %err, "could not apply the stored limits");
+        }
+    }
+
+    /// The limits in force, as the wire reports them.
+    fn effective(&self, global: EffectiveGlobal) -> EffectiveLimits {
+        EffectiveLimits {
+            max_connections: Some(self.default_connections.load(Ordering::Acquire)),
+            rate_limit_bps: global.rate_limit_bps,
+            max_active_downloads: u32::try_from(global.max_active).ok(),
         }
     }
 
@@ -305,6 +384,62 @@ impl EngineControl for EngineHost {
 
     fn set_max_connections(&self, id: Uuid, value: u32) -> BoxFuture<'_, Result<u32, AgentError>> {
         Box::pin(async move { Ok(self.engine.set_max_connections(id, value).await?) })
+    }
+
+    fn update_global_limits(
+        &self,
+        patch: GlobalPatch,
+    ) -> BoxFuture<'_, Result<EffectiveLimits, AgentError>> {
+        Box::pin(async move {
+            // Stored first: a limit that was not kept would silently revert at the next start.
+            limits_store::save(&self.storage, &patch, unix_ms()).await?;
+            if let Some(value) = patch.max_connections {
+                self.default_connections.store(value, Ordering::Release);
+            }
+            let applied = GlobalLimits {
+                max_active: patch.max_active_downloads.map(|v| v as usize),
+                rate_limit_bps: patch.rate_limit_bps,
+            };
+            let global = self.engine.update_global_limits(applied).await?;
+            Ok(self.effective(global))
+        })
+    }
+
+    fn set_rate_limit(
+        &self,
+        id: Uuid,
+        limit: Option<u64>,
+    ) -> BoxFuture<'_, Result<Option<u64>, AgentError>> {
+        Box::pin(async move { Ok(self.engine.set_rate_limit(id, limit).await?) })
+    }
+
+    fn set_priority(&self, id: Uuid, priority: Priority) -> BoxFuture<'_, Result<(), AgentError>> {
+        Box::pin(async move { Ok(self.engine.set_priority(id, priority).await?) })
+    }
+
+    fn pause_all(
+        &self,
+        discard_progress: bool,
+    ) -> BoxFuture<'_, Result<PauseAllResult, AgentError>> {
+        Box::pin(async move {
+            let outcome = self.engine.pause_all(discard_progress).await?;
+            Ok(PauseAllResult {
+                paused: outcome.paused,
+                skipped_not_resumable: outcome.skipped_not_resumable,
+            })
+        })
+    }
+
+    fn resume_all(&self) -> BoxFuture<'_, Result<ResumeAllResult, AgentError>> {
+        Box::pin(async move {
+            Ok(ResumeAllResult {
+                resumed: self.engine.resume_all().await?,
+            })
+        })
+    }
+
+    fn default_connections(&self) -> u32 {
+        self.default_connections.load(Ordering::Acquire)
     }
 }
 

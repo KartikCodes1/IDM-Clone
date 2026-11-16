@@ -10,9 +10,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use forgedm_platform::PlatformError;
-use forgedm_platform::fs::{
-    create_part_file, delete_by_handle, ensure_within, file_id, free_space,
-};
+use forgedm_platform::fs::{create_part_file, delete_by_handle, ensure_within, file_id};
 use forgedm_protocol::{DownloadErrorCode, TransferMode};
 use reqwest::Response;
 use url::Url;
@@ -20,22 +18,20 @@ use uuid::Uuid;
 
 use crate::checkpoint::flush_then_commit;
 use crate::client::classify_reqwest;
+use crate::engine::budgets::{FREE_SPACE_RECHECK, FreeSpace, ensure_space};
 use crate::engine::{LiveDownload, StopSignal};
 use crate::error::{Failure, Fault, TaskStop, stop_from_class, stop_from_platform};
 use crate::http::range_decision::{ResponseMeta, parse_content_length};
 use crate::http::validators::{EntityTag, Validators, last_modified_is_strong};
 use crate::naming::{self, PART_SUFFIX_UTF16, sanitize_opt};
 use crate::ports::{ProbeFacts, StoredJob};
+use crate::rate_limit::TokenBucket;
 use crate::transfer::encode_file_id;
 use crate::url_policy::{SecretUrl, validate_user_url};
 use crate::writer::{Writer, WriterError};
 
 /// Checkpoint cadence while transferring (A.9 `CHECKPOINT_INTERVAL`).
 pub const CHECKPOINT_INTERVAL: Duration = Duration::from_secs(2);
-/// Free space kept beyond the file itself (A.9 `FREE_SPACE_MARGIN`).
-pub const FREE_SPACE_MARGIN: u64 = 64 * 1024 * 1024;
-/// Free space is re-checked after this many bytes (A.9).
-pub const FREE_SPACE_RECHECK: u64 = 1024 * 1024 * 1024;
 /// Attempts at a unique staging name before giving up.
 const PART_NAME_ATTEMPTS: usize = 8;
 /// Hex characters in the staging suffix.
@@ -214,24 +210,6 @@ fn verify_placement(file: File, path: PathBuf, dir: &Path) -> Result<PartFile, T
     })
 }
 
-/// Fails (as a pause) unless `dir`'s volume has `needed` bytes plus the margin free. A
-/// failed query is logged and does not block the download.
-///
-/// # Errors
-/// [`TaskStop::PauseFor`] `disk_full`.
-pub fn ensure_free_space(dir: &Path, needed: u64) -> Result<(), TaskStop> {
-    match free_space(dir) {
-        Ok(free) if free < needed.saturating_add(FREE_SPACE_MARGIN) => {
-            Err(TaskStop::PauseFor(DownloadErrorCode::DiskFull))
-        }
-        Ok(_) => Ok(()),
-        Err(err) => {
-            tracing::warn!(error = %err, "free space query failed; continuing");
-            Ok(())
-        }
-    }
-}
-
 /// Maps a writer failure to the task's stop.
 #[must_use]
 pub fn writer_stop(err: &WriterError) -> TaskStop {
@@ -256,6 +234,10 @@ pub struct Stream<'a> {
     /// Absolute offset at which the body must end (the declared total for a plain GET, the
     /// end of the accepted range for a 206), when known.
     pub limit: Option<u64>,
+    /// The free-space reading for the re-check.
+    pub space: &'a dyn FreeSpace,
+    /// The download's bandwidth bucket (its parent is the global one).
+    pub bucket: &'a TokenBucket,
 }
 
 /// Periodic work the stream loop asks its caller to do.
@@ -303,13 +285,21 @@ pub async fn stream_body(
         offset += bytes.len() as u64;
         *reached = offset;
         env.live.set_accepted(offset);
+        if env
+            .bucket
+            .acquire(bytes.len() as u64, env.stop.token())
+            .await
+            .is_err()
+        {
+            return Err(env.stop.stopped());
+        }
         if env.limit.is_some_and(|t| offset > t) {
             return Err(Failure::new(DownloadErrorCode::SizeMismatch).into());
         }
         if offset >= next_space_check {
             next_space_check = next_space_check.saturating_add(FREE_SPACE_RECHECK);
             let remaining = env.limit.map_or(0, |t| t.saturating_sub(offset));
-            ensure_free_space(env.dir, remaining)?;
+            ensure_space(env.space, env.dir, remaining)?;
         }
         if last_checkpoint.elapsed() >= CHECKPOINT_INTERVAL {
             flush_then_commit(writer, checkpointer, env.live).await?;

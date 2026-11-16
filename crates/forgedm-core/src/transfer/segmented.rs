@@ -25,14 +25,16 @@ use uuid::Uuid;
 
 use super::resilience::Resilience;
 use super::segment_table::{CONNECTION_STAGGER, SegmentTable};
-use super::single::{FREE_SPACE_RECHECK, ensure_free_space, writer_stop};
+use super::single::writer_stop;
 use super::worker::{Shared, SharedInit, SharedTable, WorkerEnd, run_worker};
 use crate::checkpoint::{commit_segments, flush_then_commit_segments};
 use crate::client::HttpClient;
 use crate::engine::LiveDownload;
+use crate::engine::budgets::{ConnGate, FREE_SPACE_RECHECK, FreeSpace, ensure_space};
 use crate::error::{Failure, TaskStop};
 use crate::http::validators::ResumeIdentity;
 use crate::ports::DownloadStore;
+use crate::rate_limit::TokenBucket;
 use crate::writer::{Frontier, WriteTracker, Writer};
 
 /// How often the supervisor looks for work for idle connection slots.
@@ -145,6 +147,12 @@ pub struct SegmentedTransfer {
     pub checkpoint_every: Duration,
     /// Retry decisions and the host cooldown of this download.
     pub res: Arc<Resilience>,
+    /// Where this download's connections take their permits.
+    pub gate: Arc<ConnGate>,
+    /// The download's bandwidth bucket (its parent is the global one).
+    pub bucket: Arc<TokenBucket>,
+    /// The free-space reading for the re-check.
+    pub space: Arc<dyn FreeSpace>,
 }
 
 impl SegmentedTransfer {
@@ -210,6 +218,8 @@ impl SegmentedTransfer {
             url: self.url.clone(),
             identity: self.identity.clone(),
             res: Arc::clone(&self.res),
+            gate: Arc::clone(&self.gate),
+            bucket: Arc::clone(&self.bucket),
             halt: stop.token().child_token(),
         }));
         let mut pool = Pool::new(Arc::clone(&shared));
@@ -279,7 +289,11 @@ impl SegmentedTransfer {
         if accepted < next_check {
             return Ok(next_check);
         }
-        ensure_free_space(&self.dir, total.saturating_sub(accepted))?;
+        ensure_space(
+            self.space.as_ref(),
+            &self.dir,
+            total.saturating_sub(accepted),
+        )?;
         Ok(accepted.saturating_add(FREE_SPACE_RECHECK))
     }
 }

@@ -178,6 +178,12 @@ impl LiveDownload {
         }
     }
 
+    /// The download's id.
+    #[must_use]
+    pub fn id(&self) -> Uuid {
+        self.id
+    }
+
     /// The state the owning task last persisted (the task is the only writer).
     #[must_use]
     pub fn state(&self) -> DownloadState {
@@ -333,6 +339,12 @@ impl Registry {
     #[must_use]
     pub fn get(&self, id: Uuid) -> Option<Arc<LiveDownload>> {
         self.map().get(&id).cloned()
+    }
+
+    /// The ids of the running downloads.
+    #[must_use]
+    pub fn ids(&self) -> Vec<Uuid> {
+        self.map().keys().copied().collect()
     }
 
     /// Fires `reason` on every running download.

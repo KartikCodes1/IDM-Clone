@@ -111,6 +111,13 @@ pub struct StoredJob {
     pub progress: StoredProgress,
     /// The per-download connection cap chosen at enqueue (A.3), restored after a restart.
     pub max_connections: u32,
+    /// Scheduling priority: admission order is priority, then `queue_position`, then
+    /// `created_at_ms`.
+    pub priority: Priority,
+    /// Position in the queue (lower runs first among equal priorities).
+    pub queue_position: i64,
+    /// Creation time, epoch milliseconds.
+    pub created_at_ms: i64,
 }
 
 impl std::fmt::Debug for StoredJob {
@@ -243,6 +250,23 @@ pub trait DownloadStore: Send + Sync + 'static {
     /// default keeps nothing: a store that cannot persist it forgets live changes.
     fn set_max_connections(&self, _id: Uuid, _value: u32) -> StoreFuture<'_, ()> {
         Box::pin(async { Ok(()) })
+    }
+    /// Persists a new scheduling priority. The default refuses: a store that cannot keep it
+    /// would silently revert the change at the next start.
+    fn set_priority(&self, _id: Uuid, _priority: Priority) -> StoreFuture<'_, ()> {
+        Box::pin(async {
+            Err(StoreError::Unavailable(
+                "this store cannot persist priorities".to_owned(),
+            ))
+        })
+    }
+    /// The ids of every download in one of `states` (any order). The default refuses.
+    fn ids_in_states(&self, _states: &[DownloadState]) -> StoreFuture<'_, Vec<Uuid>> {
+        Box::pin(async {
+            Err(StoreError::Unavailable(
+                "this store cannot list downloads by state".to_owned(),
+            ))
+        })
     }
     /// Records when a `retry_waiting` download is due (epoch milliseconds), durable before
     /// the state change that parks it. The default keeps nothing: the download is then

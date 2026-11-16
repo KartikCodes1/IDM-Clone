@@ -82,9 +82,79 @@ pub enum Command {
         #[arg(long)]
         yes: bool,
     },
+    /// Show or change the agent-wide limits (stored; applied at once).
+    Limits(LimitsArgs),
+    /// Pause every download that can be paused.
+    PauseAll {
+        /// Also pause downloads that cannot resume, throwing their progress away.
+        #[arg(long)]
+        discard_progress: bool,
+    },
+    /// Resume every paused download.
+    ResumeAll,
+    /// Change a download's queue priority.
+    Priority {
+        /// The download id.
+        id: Uuid,
+        /// The new priority.
+        priority: PriorityArg,
+    },
     /// Control the background agent.
     #[command(subcommand)]
     Agent(AgentCommand),
+}
+
+/// `forgedm limits [--max-active N] [--speed <bytes/s|off>] [--connections N]`.
+#[derive(Debug, Clone, Copy, Args)]
+pub struct LimitsArgs {
+    /// Downloads that run at once (1 to 10).
+    #[arg(long, value_name = "N", value_parser = clap::value_parser!(u32).range(1..=10))]
+    pub max_active: Option<u32>,
+    /// Total speed limit in bytes per second (at least 1024), or `off`.
+    #[arg(long, value_name = "BYTES_PER_SEC|off", value_parser = speed_limit)]
+    pub speed: Option<SpeedLimit>,
+    /// Default connections for new downloads (1 to 16).
+    #[arg(long, value_name = "N", value_parser = clap::value_parser!(u32).range(1..=16))]
+    pub connections: Option<u32>,
+}
+
+/// A speed limit: none, or a number of bytes per second.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SpeedLimit {
+    /// No limit.
+    Off,
+    /// At most this many bytes per second.
+    BytesPerSecond(u64),
+}
+
+/// The priorities a user can choose.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum PriorityArg {
+    /// Runs before everything else.
+    High,
+    /// The default.
+    Normal,
+    /// Runs after everything else.
+    Low,
+}
+
+/// Smallest speed limit the agent accepts (A.3).
+const MIN_SPEED_BPS: u64 = 1024;
+
+/// Parses `off` or a byte rate of at least [`MIN_SPEED_BPS`].
+fn speed_limit(raw: &str) -> Result<SpeedLimit, String> {
+    if raw.eq_ignore_ascii_case("off") {
+        return Ok(SpeedLimit::Off);
+    }
+    let bytes: u64 = raw
+        .parse()
+        .map_err(|_| "expected a number of bytes per second, or `off`".to_owned())?;
+    if bytes < MIN_SPEED_BPS {
+        return Err(format!(
+            "the limit must be at least {MIN_SPEED_BPS} bytes per second"
+        ));
+    }
+    Ok(SpeedLimit::BytesPerSecond(bytes))
 }
 
 /// `forgedm add <url|-> ...`.
@@ -241,6 +311,85 @@ mod tests {
             Cli::try_parse_from(["forgedm", "cancel"]).is_err(),
             "the id is required"
         );
+    }
+
+    #[test]
+    fn limits_parse_each_flag_and_off() {
+        let parse = |args: &[&str]| {
+            let mut full = vec!["forgedm", "limits"];
+            full.extend_from_slice(args);
+            Cli::try_parse_from(full)
+        };
+        let Command::Limits(args) = parse(&[
+            "--max-active",
+            "2",
+            "--speed",
+            "500000",
+            "--connections",
+            "6",
+        ])
+        .unwrap()
+        .command
+        else {
+            unreachable!("not limits");
+        };
+        assert_eq!(args.max_active, Some(2));
+        assert_eq!(args.speed, Some(SpeedLimit::BytesPerSecond(500_000)));
+        assert_eq!(args.connections, Some(6));
+        let Command::Limits(off) = parse(&["--speed", "OFF"]).unwrap().command else {
+            unreachable!("not limits");
+        };
+        assert_eq!(off.speed, Some(SpeedLimit::Off));
+        let Command::Limits(none) = parse(&[]).unwrap().command else {
+            unreachable!("not limits");
+        };
+        assert!(none.max_active.is_none() && none.speed.is_none() && none.connections.is_none());
+    }
+
+    #[test]
+    fn limits_refuse_values_outside_the_documented_ranges() {
+        let bad = |flag: &str, value: &str| {
+            Cli::try_parse_from(["forgedm", "limits", flag, value]).is_err()
+        };
+        assert!(bad("--max-active", "0"));
+        assert!(bad("--max-active", "11"));
+        assert!(bad("--connections", "0"));
+        assert!(bad("--connections", "17"));
+        assert!(bad("--speed", "1023"));
+        assert!(bad("--speed", "fast"));
+        assert!(bad("--speed", "-5"));
+    }
+
+    #[test]
+    fn batch_and_priority_commands_parse() {
+        let id = Uuid::nil().to_string();
+        assert!(matches!(
+            Cli::try_parse_from(["forgedm", "pause-all", "--discard-progress"])
+                .unwrap()
+                .command,
+            Command::PauseAll {
+                discard_progress: true
+            }
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["forgedm", "resume-all"])
+                .unwrap()
+                .command,
+            Command::ResumeAll
+        ));
+        for (word, expected) in [
+            ("high", PriorityArg::High),
+            ("normal", PriorityArg::Normal),
+            ("low", PriorityArg::Low),
+        ] {
+            let cli = Cli::try_parse_from(["forgedm", "priority", &id, word]).unwrap();
+            assert!(matches!(
+                cli.command,
+                Command::Priority { priority, .. } if priority == expected
+            ));
+        }
+        assert!(Cli::try_parse_from(["forgedm", "priority", &id, "urgent"]).is_err());
+        assert!(Cli::try_parse_from(["forgedm", "priority", &id]).is_err());
     }
 
     #[test]

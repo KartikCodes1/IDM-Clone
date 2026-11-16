@@ -243,34 +243,42 @@ async fn list_empty() {
 }
 
 #[tokio::test]
-async fn unimplemented_actions_return_not_implemented() {
+async fn every_action_of_the_contract_is_served() {
     let dir = TempDir::new().unwrap();
     let agent = AgentProc::start(dir.path(), &[]);
     let (mut client, _) = agent.connect().await;
-    let id = Uuid::nil();
-    // EnqueueUrl and GetDownload are served since S1.7 (tests/enqueue_e2e.rs) and the five
-    // control actions since S1.9 (tests/control_e2e.rs).
-    let requests = vec![
-        RequestBody::PauseAll(PauseAllRequest {
+    // EnqueueUrl and GetDownload are served since S1.7 (tests/enqueue_e2e.rs), the five
+    // control actions since S1.9 (tests/control_e2e.rs), and PauseAll, ResumeAll,
+    // UpdateLimits and UpdatePriority since S1.13 (tests/limits_e2e.rs). With nothing queued
+    // the batch actions are empty successes and an unknown download is `not_found`.
+    let none = client
+        .call(RequestBody::PauseAll(PauseAllRequest {
             discard_progress: false,
-        }),
-        RequestBody::ResumeAll(Empty {}),
-        RequestBody::UpdateLimits(UpdateLimitsRequest::new(LimitScope::Global)),
-        RequestBody::UpdatePriority(UpdatePriorityRequest {
-            download_id: id,
+        }))
+        .await
+        .unwrap();
+    assert!(matches!(none, ResultBody::PauseAll(r) if r.paused.is_empty()));
+    let none = client.call(RequestBody::ResumeAll(Empty {})).await.unwrap();
+    assert!(matches!(none, ResultBody::ResumeAll(r) if r.resumed.is_empty()));
+    let limits = client
+        .call(RequestBody::UpdateLimits(UpdateLimitsRequest::new(
+            LimitScope::Global,
+        )))
+        .await
+        .unwrap();
+    assert!(matches!(
+        limits,
+        ResultBody::UpdateLimits(r) if r.effective.max_active_downloads == Some(3)
+    ));
+    let unknown = client
+        .call(RequestBody::UpdatePriority(UpdatePriorityRequest {
+            download_id: Uuid::nil(),
             priority: Priority::High,
-        }),
-    ];
-
-    for body in requests {
-        let action = body.action();
-        match client.call(body).await {
-            Err(IpcError::Server(error)) => {
-                assert_eq!(error.code, ErrorCode::NotImplemented, "{action:?}");
-                assert!(!error.retryable, "{action:?}");
-            }
-            other => panic!("{action:?} should be not_implemented, got {other:?}"),
-        }
+        }))
+        .await;
+    match unknown {
+        Err(IpcError::Server(error)) => assert_eq!(error.code, ErrorCode::NotFound),
+        other => panic!("an unknown download should be not_found, got {other:?}"),
     }
     // The connection is still usable afterwards.
     client.call(RequestBody::Ping(Empty {})).await.unwrap();

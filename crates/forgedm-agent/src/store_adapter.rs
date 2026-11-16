@@ -17,7 +17,7 @@ use forgedm_core::ports::{
 };
 use forgedm_core::transfer::segment_table::SegmentSnapshot;
 use forgedm_core::url_policy::{SecretUrl, validate_user_url};
-use forgedm_protocol::{DownloadError, DownloadState};
+use forgedm_protocol::{DownloadError, DownloadState, Priority};
 use forgedm_storage::{
     DownloadRecord, EventRecord, NewDownload, NewEvent, ProbeResult, SegmentRecord, Storage,
     StorageError,
@@ -187,6 +187,9 @@ impl StorageStore {
             transfer_mode: record.transfer_mode,
             progress,
             max_connections: record.max_connections,
+            priority: record.priority,
+            queue_position: record.queue_position,
+            created_at_ms: record.created_at_ms,
         })
     }
 
@@ -427,6 +430,37 @@ impl DownloadStore for StorageStore {
                 .set_max_connections(id, value, unix_ms())
                 .await
                 .map_err(map_error)
+        })
+    }
+
+    fn set_priority(&self, id: Uuid, priority: Priority) -> StoreFuture<'_, ()> {
+        Box::pin(async move {
+            self.storage
+                .downloads()
+                .set_priority(id, priority, unix_ms())
+                .await
+                .map_err(map_error)
+        })
+    }
+
+    fn ids_in_states(&self, states: &[DownloadState]) -> StoreFuture<'_, Vec<Uuid>> {
+        let states = states.to_vec();
+        Box::pin(async move {
+            let mut ids = Vec::new();
+            loop {
+                let offset = u32::try_from(ids.len()).unwrap_or(u32::MAX);
+                let page = self
+                    .storage
+                    .downloads()
+                    .list(Some(&states), PAGE, offset)
+                    .await
+                    .map_err(map_error)?;
+                let last = page.len() < usize::try_from(PAGE).unwrap_or(usize::MAX);
+                ids.extend(page.into_iter().map(|record| record.id));
+                if last {
+                    return Ok(ids);
+                }
+            }
         })
     }
 

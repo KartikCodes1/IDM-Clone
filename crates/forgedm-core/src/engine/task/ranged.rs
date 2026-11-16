@@ -87,6 +87,7 @@ impl DownloadTask {
         file: File,
         from: &Continuation,
     ) -> Result<Url, TaskStop> {
+        let _permit = self.permit().await?;
         let (mut writer, committer) = self.start_session(file, from.committed, Some(from.total))?;
         let outcome = self.ranged_loop(&mut writer, &committer, from).await;
         let (reached, final_url) = match outcome {
@@ -217,6 +218,8 @@ impl DownloadTask {
             dir: &self.job.target_dir,
             start,
             limit: Some(end_excl),
+            space: self.ctx.budgets.space().as_ref(),
+            bucket: &self.ctx.bucket,
         };
         self.ctx.live.set_connections(1);
         self.ctx.live.set_active_ranges(vec![(start, end_excl)]);

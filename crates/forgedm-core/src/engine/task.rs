@@ -27,6 +27,7 @@ mod segmented;
 mod settle;
 
 use super::REASON_RESTART_FROM_ZERO;
+use super::budgets::{Budgets, ConnGate, ConnPermit, ensure_space};
 use super::cleanup::delete_stale_part;
 use super::hosts::HostRegistry;
 use super::live::{LiveDownload, StopReason};
@@ -38,6 +39,7 @@ use crate::error::{Failure, Fault, TaskStop, stop_from_store};
 use crate::finalize::{Finalized, finalize};
 use crate::ports::{DownloadStore, EngineEvent, EngineEventSink, StoreEvent, StoredJob};
 use crate::probe::{Probed, probe};
+use crate::rate_limit::TokenBucket;
 use crate::resume::{
     Continuation, RestartReason, ResumePlan, is_resumable_mode, open_valid_part, plan_resume,
 };
@@ -48,8 +50,8 @@ use crate::transfer::resilience::{Resilience, RetryEnv, Verdict};
 use crate::transfer::segment_table::SegmentTable;
 use crate::transfer::segmented::ConnectionCap;
 use crate::transfer::single::{
-    Checkpointer, PartFile, Plan, Stream, choose_name, create_part, ensure_free_space, id8,
-    plan_response, probe_facts, stream_body, writer_stop,
+    Checkpointer, PartFile, Plan, Stream, choose_name, create_part, id8, plan_response,
+    probe_facts, stream_body, writer_stop,
 };
 use crate::transfer::{Verified, verify_part};
 use crate::writer::Writer;
@@ -63,6 +65,8 @@ pub(crate) struct TaskCtx {
     pub live: Arc<LiveDownload>,
     pub cap: Arc<ConnectionCap>,
     pub hosts: Arc<HostRegistry>,
+    pub budgets: Arc<Budgets>,
+    pub bucket: Arc<TokenBucket>,
     pub retry: RetryEnv,
 }
 
@@ -95,6 +99,11 @@ pub(crate) struct DownloadTask {
     state: DownloadState,
     /// Retry decisions, budgets and the host cooldown of this run.
     res: Arc<Resilience>,
+    /// Where this download takes its connection permits.
+    gate: Arc<ConnGate>,
+    /// The permit of the probe, kept for the single-connection transfer that follows it so a
+    /// small download does not queue for a second permit right after the first.
+    carried: Option<ConnPermit>,
     /// Whether the one allowed re-probe after a broken range contract was used.
     reprobed: bool,
 }
@@ -117,12 +126,15 @@ impl DownloadTask {
         let state = job.state;
         ctx.live.set_state(state);
         let host = ctx.hosts.handle_for(job.url.as_url());
+        let gate = ctx.budgets.gate(Arc::clone(&host));
         let res = Arc::new(Resilience::new(&ctx.retry, host));
         Self {
             job,
             ctx,
             state,
             res,
+            gate,
+            carried: None,
             reprobed: false,
         }
     }
@@ -188,6 +200,19 @@ impl DownloadTask {
         }
     }
 
+    /// A connection permit for a single-connection phase (the probe, a plain GET, a ranged
+    /// transfer). Waits for room, and ends at once when the download is stopped.
+    async fn permit(&mut self) -> Result<ConnPermit, TaskStop> {
+        if let Some(carried) = self.carried.take() {
+            return Ok(carried);
+        }
+        let token = self.ctx.live.stop().token().clone();
+        self.gate
+            .acquire(&token)
+            .await
+            .map_err(|_| self.ctx.live.stop().stopped())
+    }
+
     /// Stops for any reason (the transfer phases).
     fn stop_check(&self) -> Result<(), TaskStop> {
         self.ctx.live.stop().check()
@@ -212,19 +237,30 @@ impl DownloadTask {
         }
     }
 
-    async fn probe(&self) -> Result<Probed, TaskStop> {
+    async fn probe(&mut self) -> Result<Probed, TaskStop> {
         let token = self.ctx.live.stop().token().clone();
         loop {
             self.stop_check()?;
             if self.res.gate(&token).await.is_err() {
                 return Err(self.ctx.live.stop().stopped());
             }
+            let permit = self.permit().await?;
             let probed = probe(&self.ctx.client, self.job.url.as_url(), &token).await;
-            match probed {
-                Ok(probed) => return Ok(probed),
-                Err(TaskStop::Stopped(_)) => return Err(self.ctx.live.stop().stopped()),
-                Err(TaskStop::Retry(fault)) => self.settle_fault(Phase::Probe, fault).await?,
-                Err(other) => return Err(other),
+            let stop = match probed {
+                Ok(probed) => {
+                    self.carried = Some(permit);
+                    return Ok(probed);
+                }
+                Err(stop) => {
+                    // Returned before any retry wait.
+                    drop(permit);
+                    stop
+                }
+            };
+            match stop {
+                TaskStop::Stopped(_) => return Err(self.ctx.live.stop().stopped()),
+                TaskStop::Retry(fault) => self.settle_fault(Phase::Probe, fault).await?,
+                other => return Err(other),
             }
         }
     }
@@ -331,6 +367,7 @@ impl DownloadTask {
 
     /// A server that ignores ranges (or has no known length): one plain GET, sequentially.
     async fn plain(&mut self) -> Result<Landed, TaskStop> {
+        let _permit = self.permit().await?;
         let Opened {
             response,
             final_url,
@@ -407,6 +444,8 @@ impl DownloadTask {
             dir: &self.job.target_dir,
             start: 0,
             limit: plan.total,
+            space: self.ctx.budgets.space().as_ref(),
+            bucket: &self.ctx.bucket,
         };
         self.ctx.live.set_connections(1);
         self.ctx.live.set_active_ranges(vec![(0, u64::MAX)]);
@@ -428,7 +467,15 @@ impl DownloadTask {
     ) -> Result<Staged, TaskStop> {
         self.stop_check()?;
         let dir = self.job.target_dir.clone();
-        ensure_free_space(&dir, plan.total.unwrap_or(0))?;
+        let space = self.ctx.budgets.space().as_ref();
+        if let Err(stop) = ensure_space(space, &dir, plan.total.unwrap_or(0)) {
+            // Only `downloading` has a pause edge for a full disk (A.6): get there first, so
+            // the download is paused (`disk_full`) and resumes from scratch later.
+            if self.state == DownloadState::Probing {
+                self.advance(Command::ProbeSucceeded, None).await?;
+            }
+            return Err(stop);
+        }
         let (id, owned_name) = (self.job.id, name.to_owned());
         let part = tokio::task::spawn_blocking(move || create_part(&dir, &owned_name, id))
             .await

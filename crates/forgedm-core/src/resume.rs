@@ -224,6 +224,9 @@ mod tests {
             transfer_mode: mode,
             progress,
             max_connections: 8,
+            priority: forgedm_protocol::Priority::Normal,
+            queue_position: 0,
+            created_at_ms: 0,
         }
     }
 

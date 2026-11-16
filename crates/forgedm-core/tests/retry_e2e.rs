@@ -440,6 +440,9 @@ async fn stale_timer_does_not_requeue_before_the_new_due_time() {
         transfer_mode: None,
         progress: StoredProgress::default(),
         max_connections: 4,
+        priority: forgedm_protocol::Priority::Normal,
+        queue_position: 0,
+        created_at_ms: 0,
     });
     h.store.schedule_retry(id, unix_ms() + 700).await.unwrap();
     h.engine.recover().await.unwrap(); // arms the early timer

@@ -92,6 +92,8 @@ impl DownloadTask {
         table: SegmentTable,
         identity: ResumeIdentity,
     ) -> Result<Url, TaskStop> {
+        // Workers take their own permits; the probe's is no longer needed.
+        self.carried = None;
         let id = self.job.id;
         let sparse_handle = file.try_clone().map_err(|e| stop_from_io(&e))?;
         let table = Arc::new(Mutex::new(table));
@@ -111,6 +113,9 @@ impl DownloadTask {
             cap: Arc::clone(&self.ctx.cap),
             checkpoint_every: CHECKPOINT_INTERVAL,
             res: Arc::clone(&self.res),
+            gate: Arc::clone(&self.gate),
+            bucket: Arc::clone(&self.ctx.bucket),
+            space: Arc::clone(self.ctx.budgets.space()),
         };
         let final_url = transfer.run(table, writer).await?;
         clear_sparse(&sparse_handle);

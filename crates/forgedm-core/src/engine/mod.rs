@@ -2,10 +2,10 @@
 //!
 //! Commands arrive on a bounded channel ([`DISPATCH_CAPACITY`]); a full channel, or no
 //! reply within [`ENGINE_REPLY_TIMEOUT`], is `busy`. Admitted downloads run as one tokio
-//! task each, up to [`DEFAULT_MAX_ACTIVE`]. S1.7 admits first come, first served;
-//! priorities and per-host budgets arrive with S1.13.
+//! task each, up to the configured number of active downloads ([`DEFAULT_MAX_ACTIVE`]),
+//! admitted by priority, then queue position, then creation time ([`admission`]). Connection
+//! permits, bandwidth buckets and the free-space reading are shared through [`budgets`].
 
-use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -13,31 +13,40 @@ use forgedm_platform::motw::MotwService;
 use forgedm_protocol::DownloadState;
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::{JoinHandle, JoinSet};
-use tokio::time::{Instant, MissedTickBehavior, interval, sleep, timeout};
+use tokio::time::{Instant, MissedTickBehavior, interval, timeout};
 use tokio_util::task::TaskTracker;
 use uuid::Uuid;
 
+pub mod admission;
+pub mod budgets;
 mod cleanup;
 mod control;
 pub mod hosts;
 mod live;
+mod retry_timer;
+mod supervisor;
 mod task;
 
+pub use admission::{EffectiveGlobal, GlobalLimits, Queue};
 pub use cleanup::{Cleanup, delete_stale_part};
+pub use control::PauseAllOutcome;
 pub use live::{LiveDownload, Registry, StopReason, StopSignal};
 
 use crate::client::HttpClient;
 use crate::error::EngineError;
 use crate::ports::{
     DownloadStore, EngineEvent, EngineEventSink, NewJob, ProgressSample, StoreEvent, StoredJob,
-    StoredProgress, unix_ms,
+    StoredProgress,
 };
 use crate::progress::TICK;
 use crate::state::{Command, transition};
 use crate::transfer::resilience::RetryEnv;
 use crate::transfer::segmented::ConnectionCaps;
-use forgedm_protocol::{MAX_CONNECTIONS, MIN_CONNECTIONS};
-use hosts::HostRegistry;
+use budgets::{Budgets, CONNS_GLOBAL, FreeSpace, SystemFreeSpace};
+use forgedm_protocol::{MAX_CONNECTIONS, MIN_CONNECTIONS, Priority};
+use hosts::{CONNS_PER_HOST, HostRegistry};
+use retry_timer::Due;
+use supervisor::Supervisor;
 use task::{DownloadTask, TaskCtx};
 
 /// Commands the dispatch channel holds (implementation constant, ARCHITECTURE 4.1).
@@ -81,6 +90,10 @@ pub struct EngineConfig {
     pub queue_max: usize,
     /// How long [`EngineHandle`] calls wait for an answer.
     pub reply_timeout: Duration,
+    /// Connections open at once across all downloads (A.9 `CONNS_GLOBAL`).
+    pub global_connections: usize,
+    /// Connections open at once to one host (A.9 `CONNS_PER_HOST`, AIMD-adjusted below it).
+    pub host_connections: u32,
 }
 
 impl Default for EngineConfig {
@@ -89,6 +102,8 @@ impl Default for EngineConfig {
             max_active: DEFAULT_MAX_ACTIVE,
             queue_max: QUEUE_MAX,
             reply_timeout: ENGINE_REPLY_TIMEOUT,
+            global_connections: CONNS_GLOBAL,
+            host_connections: CONNS_PER_HOST,
         }
     }
 }
@@ -138,6 +153,27 @@ enum Cmd {
         id: Uuid,
         value: u32,
         reply: oneshot::Sender<Result<u32, EngineError>>,
+    },
+    SetPriority {
+        id: Uuid,
+        priority: Priority,
+        reply: oneshot::Sender<Result<(), EngineError>>,
+    },
+    SetRateLimit {
+        id: Uuid,
+        limit: Option<u64>,
+        reply: oneshot::Sender<Result<Option<u64>, EngineError>>,
+    },
+    UpdateGlobal {
+        patch: GlobalLimits,
+        reply: oneshot::Sender<Result<EffectiveGlobal, EngineError>>,
+    },
+    PauseAll {
+        discard_progress: bool,
+        reply: oneshot::Sender<Result<PauseAllOutcome, EngineError>>,
+    },
+    ResumeAll {
+        reply: oneshot::Sender<Result<Vec<Uuid>, EngineError>>,
     },
     Shutdown {
         reply: oneshot::Sender<()>,
@@ -231,6 +267,74 @@ impl EngineHandle {
         self.call(cmd, answer).await?
     }
 
+    /// Changes the priority of download `id`; a queued download is reordered at once.
+    ///
+    /// # Errors
+    /// [`EngineError::NotFound`] for an unknown download, plus the errors of
+    /// [`enqueue`](Self::enqueue).
+    pub async fn set_priority(&self, id: Uuid, priority: Priority) -> Result<(), EngineError> {
+        let (reply, answer) = oneshot::channel();
+        let cmd = Cmd::SetPriority {
+            id,
+            priority,
+            reply,
+        };
+        self.call(cmd, answer).await?
+    }
+
+    /// Sets the rate limit of download `id` in bytes per second (`None` = unlimited, at
+    /// least 1024 otherwise), live. Returns the limit now in force. Lasts for the agent
+    /// session; only the global limit is stored.
+    ///
+    /// # Errors
+    /// [`EngineError::NotFound`] for an unknown download, plus the errors of
+    /// [`enqueue`](Self::enqueue).
+    pub async fn set_rate_limit(
+        &self,
+        id: Uuid,
+        limit: Option<u64>,
+    ) -> Result<Option<u64>, EngineError> {
+        let (reply, answer) = oneshot::channel();
+        let cmd = Cmd::SetRateLimit { id, limit, reply };
+        self.call(cmd, answer).await?
+    }
+
+    /// Changes the agent-wide limits live and returns what is in force.
+    ///
+    /// # Errors
+    /// As [`enqueue`](Self::enqueue).
+    pub async fn update_global_limits(
+        &self,
+        patch: GlobalLimits,
+    ) -> Result<EffectiveGlobal, EngineError> {
+        let (reply, answer) = oneshot::channel();
+        self.call(Cmd::UpdateGlobal { patch, reply }, answer)
+            .await?
+    }
+
+    /// Pauses every pausable download (A.6): queued, active, retrying and interrupted ones.
+    /// Active non-resumable downloads are skipped unless `discard_progress`.
+    ///
+    /// # Errors
+    /// As [`enqueue`](Self::enqueue).
+    pub async fn pause_all(&self, discard_progress: bool) -> Result<PauseAllOutcome, EngineError> {
+        let (reply, answer) = oneshot::channel();
+        let cmd = Cmd::PauseAll {
+            discard_progress,
+            reply,
+        };
+        self.call(cmd, answer).await?
+    }
+
+    /// Resumes every paused download; returns the ids that were queued again.
+    ///
+    /// # Errors
+    /// As [`enqueue`](Self::enqueue).
+    pub async fn resume_all(&self) -> Result<Vec<Uuid>, EngineError> {
+        let (reply, answer) = oneshot::channel();
+        self.call(Cmd::ResumeAll { reply }, answer).await?
+    }
+
     /// Asks a running download to stop and become `cancelled` (the `.part` is kept).
     /// Returns whether `id` was running. [`control`](Self::control) is the checked,
     /// serialized form.
@@ -287,6 +391,17 @@ pub fn start(config: EngineConfig, deps: EngineDeps) -> EngineHandle {
 /// and the jitter seed), so tests can run retries without real waiting.
 #[must_use]
 pub fn start_with(config: EngineConfig, deps: EngineDeps, retry: RetryEnv) -> EngineHandle {
+    start_with_space(config, deps, retry, Arc::new(SystemFreeSpace))
+}
+
+/// [`start_with`] with an explicit free-space reading, so tests can inject a full disk.
+#[must_use]
+pub fn start_with_space(
+    config: EngineConfig,
+    deps: EngineDeps,
+    retry: RetryEnv,
+    space: Arc<dyn FreeSpace>,
+) -> EngineHandle {
     let (tx, rx) = mpsc::channel(DISPATCH_CAPACITY);
     let (finished_tx, finished_rx) = mpsc::unbounded_channel();
     // Unbounded on purpose: one small message per armed retry timer, never more than one per
@@ -298,13 +413,14 @@ pub fn start_with(config: EngineConfig, deps: EngineDeps, retry: RetryEnv) -> En
         config,
         deps,
         registry: Arc::clone(&registry),
-        queue: VecDeque::new(),
+        queue: Queue::new(),
         active: 0,
         tracker: TaskTracker::new(),
         finished_tx,
         closing: false,
         caps: Arc::new(ConnectionCaps::default()),
-        hosts: Arc::new(HostRegistry::default()),
+        hosts: Arc::new(HostRegistry::new(config.host_connections)),
+        budgets: Arc::new(Budgets::new(config.global_connections, space)),
         retry,
         due_tx,
         timers: JoinSet::new(),
@@ -334,30 +450,18 @@ fn spawn_ticker(registry: Arc<Registry>, sink: Arc<dyn EngineEventSink>) -> Join
     })
 }
 
-/// A retry timer that fired; `attempt` counts storage-error re-arms.
-struct Due {
-    id: Uuid,
-    attempt: u32,
-}
-
-/// Bounded re-arms of a retry timer after a storage error.
-const RETRY_DUE_ATTEMPTS: u32 = 5;
-/// Base delay of those re-arms (multiplied by the attempt number).
-const RETRY_DUE_BACKOFF_MS: i64 = 1_000;
-/// Wait used when the stored retry time cannot be read.
-const RETRY_FALLBACK_MS: i64 = 30_000;
-
 struct Actor {
     config: EngineConfig,
     deps: EngineDeps,
     registry: Arc<Registry>,
-    queue: VecDeque<StoredJob>,
+    queue: Queue,
     active: usize,
     tracker: TaskTracker,
     finished_tx: mpsc::UnboundedSender<Uuid>,
     closing: bool,
     caps: Arc<ConnectionCaps>,
     hosts: Arc<HostRegistry>,
+    budgets: Arc<Budgets>,
     retry: RetryEnv,
     due_tx: mpsc::UnboundedSender<Due>,
     timers: JoinSet<()>,
@@ -416,12 +520,40 @@ impl Actor {
                 let result = self.remove(id, delete_partial).await;
                 if result.is_ok() {
                     self.caps.forget(id);
+                    self.budgets.forget(id);
                 }
                 let _ = reply.send(result);
                 false
             }
             Cmd::SetMaxConnections { id, value, reply } => {
                 let _ = reply.send(self.set_max_connections(id, value).await);
+                false
+            }
+            Cmd::SetPriority {
+                id,
+                priority,
+                reply,
+            } => {
+                let _ = reply.send(self.set_priority(id, priority).await);
+                false
+            }
+            Cmd::SetRateLimit { id, limit, reply } => {
+                let _ = reply.send(self.set_rate_limit(id, limit).await);
+                false
+            }
+            Cmd::UpdateGlobal { patch, reply } => {
+                let _ = reply.send(self.update_global_limits(patch).await);
+                false
+            }
+            Cmd::PauseAll {
+                discard_progress,
+                reply,
+            } => {
+                let _ = reply.send(self.pause_all(discard_progress).await);
+                false
+            }
+            Cmd::ResumeAll { reply } => {
+                let _ = reply.send(self.resume_all().await);
                 false
             }
             Cmd::Shutdown { reply } => {
@@ -454,6 +586,9 @@ impl Actor {
             transfer_mode: None,
             progress: StoredProgress::default(),
             max_connections: new.max_connections,
+            priority: new.priority,
+            queue_position: new.created_at_ms,
+            created_at_ms: new.created_at_ms,
         };
         self.caps.set(new.id, new.max_connections);
         let enqueued = Enqueued {
@@ -466,7 +601,7 @@ impl Actor {
             .sink
             .emit(EngineEvent::Added { id: stored.id })
             .await;
-        self.queue.push_back(stored);
+        self.queue_job(stored);
         self.admit().await;
         Ok(enqueued)
     }
@@ -479,10 +614,10 @@ impl Actor {
         let mut queued = 0;
         for job in work {
             match job.state {
-                DownloadState::Queued => self.queue.push_back(job),
+                DownloadState::Queued => self.queue_job(job),
                 DownloadState::Interrupted => {
                     if let Some(requeued) = self.auto_resume(job).await {
-                        self.queue.push_back(requeued);
+                        self.queue_job(requeued);
                     } else {
                         continue;
                     }
@@ -539,124 +674,7 @@ impl Actor {
         Ok(self.caps.cap_for(id, value).get())
     }
 
-    /// After a task ended: when it parked the download in `retry_waiting`, arms the timer
-    /// that brings it back.
-    async fn arm_if_waiting(&mut self, id: Uuid) {
-        let job = match self.deps.store.load(id).await {
-            Ok(Some(job)) => job,
-            Ok(None) => return,
-            Err(err) => {
-                tracing::error!(error = %err, "could not read a finished download to arm its retry");
-                return;
-            }
-        };
-        if job.state != DownloadState::RetryWaiting {
-            return;
-        }
-        let at_ms = match self.deps.store.next_retry_at(id).await {
-            Ok(at_ms) => at_ms.unwrap_or(0),
-            Err(err) => {
-                tracing::error!(error = %err, "could not read the retry time; using a fallback");
-                unix_ms().saturating_add(RETRY_FALLBACK_MS)
-            }
-        };
-        self.arm_timer(id, at_ms);
-    }
-
-    /// Sends `id` to the engine again at `at_ms` (epoch milliseconds; past means now).
-    fn arm_timer(&mut self, id: Uuid, at_ms: i64) {
-        self.arm_timer_attempt(id, at_ms, 0);
-    }
-
-    fn arm_timer_attempt(&mut self, id: Uuid, at_ms: i64, attempt: u32) {
-        // Reap the timers that already fired so the set stays small.
-        while self.timers.try_join_next().is_some() {}
-        let left_ms = u64::try_from(at_ms.saturating_sub(unix_ms())).unwrap_or(0);
-        let due = self.due_tx.clone();
-        self.timers.spawn(async move {
-            sleep(Duration::from_millis(left_ms)).await;
-            // The receiver only goes away when the engine stops; nothing is left to wake then.
-            let _ = due.send(Due { id, attempt });
-        });
-    }
-
-    /// Re-arms a timer after a storage error, with a growing delay, up to
-    /// [`RETRY_DUE_ATTEMPTS`] times.
-    fn rearm_after_error(&mut self, due: Due) {
-        let attempt = due.attempt + 1;
-        if attempt > RETRY_DUE_ATTEMPTS {
-            tracing::error!(
-                id = %due.id,
-                "gave up requeueing a download whose retry is due; resume it or restart the agent"
-            );
-            return;
-        }
-        let delay = RETRY_DUE_BACKOFF_MS.saturating_mul(i64::from(attempt));
-        self.arm_timer_attempt(due.id, unix_ms().saturating_add(delay), attempt);
-    }
-
-    /// The retry timer of `id` fired: `retry_waiting -> queued` (A.6 timer edge), then admit.
-    /// A download that left `retry_waiting` in the meantime (resumed, cancelled) is left alone,
-    /// and so is one that parked again with a later due time (a stale timer fired).
-    async fn retry_due(&mut self, due: Due) {
-        if self.closing {
-            return;
-        }
-        let id = due.id;
-        let mut job = match self.deps.store.load(id).await {
-            Ok(Some(job)) => job,
-            Ok(None) => return,
-            Err(err) => {
-                tracing::warn!(error = %err, "could not read a download whose retry is due");
-                self.rearm_after_error(due);
-                return;
-            }
-        };
-        let Ok(step) = transition(job.state, Command::TimerDue) else {
-            return;
-        };
-        match self.deps.store.next_retry_at(id).await {
-            Ok(Some(at_ms)) if at_ms > unix_ms() => {
-                self.arm_timer(id, at_ms);
-                return;
-            }
-            Ok(_) => {}
-            Err(err) => {
-                tracing::warn!(error = %err, "could not read the retry time of a due download");
-                self.rearm_after_error(due);
-                return;
-            }
-        }
-        let event = StoreEvent::now("retry_due");
-        let moved = self
-            .deps
-            .store
-            .transition(id, job.state, step.to, None, event)
-            .await;
-        if let Err(err) = moved {
-            tracing::warn!(error = %err, "could not requeue a download whose retry is due");
-            self.rearm_after_error(due);
-            return;
-        }
-        job.state = step.to;
-        job.state_reason = None;
-        self.deps.sink.emit(EngineEvent::Changed { id }).await;
-        self.queue.push_back(job);
-        self.admit().await;
-    }
-
-    /// Starts queued downloads while slots are free.
-    async fn admit(&mut self) {
-        while !self.closing && self.active < self.config.max_active {
-            let Some(job) = self.queue.pop_front() else {
-                return;
-            };
-            self.active += 1;
-            self.spawn_task(job);
-        }
-    }
-
-    fn spawn_task(&self, job: StoredJob) {
+    pub(super) fn spawn_task(&self, job: StoredJob) {
         let id = job.id;
         let live = Arc::new(LiveDownload::new(id, StopSignal::new()));
         self.registry.insert(Arc::clone(&live));
@@ -668,6 +686,8 @@ impl Actor {
             live: Arc::clone(&live),
             cap: self.caps.cap_for(id, job.max_connections),
             hosts: Arc::clone(&self.hosts),
+            budgets: Arc::clone(&self.budgets),
+            bucket: self.budgets.download_bucket(id),
             retry: self.retry.clone(),
         };
         let supervisor = Supervisor {
@@ -689,98 +709,6 @@ impl Actor {
         if timeout(SHUTDOWN_WAIT, self.tracker.wait()).await.is_err() {
             tracing::warn!("downloads did not settle before the shutdown deadline");
         }
-    }
-}
-
-/// Watches one task. Whatever way the task ends, the stored state is not left active: a
-/// panic surfaces as `failed(internal)` (or `interrupted` from `pausing`), and a task that
-/// ended without settling is moved to `interrupted`; the agent keeps running
-/// (ARCHITECTURE 4.13, SFH-15 and SFH-16).
-struct Supervisor {
-    store: Arc<dyn DownloadStore>,
-    sink: Arc<dyn EngineEventSink>,
-    registry: Arc<Registry>,
-    finished: mpsc::UnboundedSender<Uuid>,
-    live: Arc<LiveDownload>,
-}
-
-/// Attempts to move a leftover active download off its state.
-const LEFTOVER_ATTEMPTS: u32 = 3;
-/// Pause between those attempts.
-const LEFTOVER_RETRY: Duration = Duration::from_millis(100);
-
-impl Supervisor {
-    async fn watch(self, id: Uuid, inner: JoinHandle<()>) {
-        let panicked = matches!(inner.await, Err(err) if err.is_panic());
-        if panicked {
-            tracing::error!(%id, "a download task panicked");
-        }
-        self.settle_leftovers(id, panicked).await;
-        self.registry.remove_live(&self.live);
-        self.live.mark_finished();
-        let _ = self.finished.send(id);
-    }
-
-    /// What the stored state of a finished task must become, if it is still active.
-    fn leftover_target(state: DownloadState, panicked: bool) -> Option<Command> {
-        use DownloadState as S;
-        match (state, panicked) {
-            (S::Probing | S::Downloading | S::Verifying | S::Finalizing, true) => {
-                Some(Command::Fail)
-            }
-            (S::Pausing, _) | (S::Probing | S::Downloading | S::Verifying, false) => {
-                Some(Command::Interrupt)
-            }
-            _ => None,
-        }
-    }
-
-    async fn settle_leftovers(&self, id: Uuid, panicked: bool) {
-        let failure = crate::error::Failure::new(forgedm_protocol::DownloadErrorCode::Internal);
-        for attempt in 1..=LEFTOVER_ATTEMPTS {
-            let stored = match self.store.load(id).await {
-                Ok(Some(stored)) => stored,
-                Ok(None) => return,
-                Err(err) => {
-                    tracing::warn!(%id, error = %err, "cannot read a finished download");
-                    tokio::time::sleep(LEFTOVER_RETRY).await;
-                    continue;
-                }
-            };
-            let Some(cmd) = Self::leftover_target(stored.state, panicked) else {
-                return;
-            };
-            let Ok(step) = transition(stored.state, cmd) else {
-                return;
-            };
-            let failing = cmd == Command::Fail;
-            let (kind, code, reason) = if failing {
-                ("failed", failure.code.as_str(), None)
-            } else {
-                ("interrupted", "settle_failed", Some("crash".to_owned()))
-            };
-            let event = StoreEvent::now(kind).with_code(code);
-            let moved = self
-                .store
-                .transition(id, stored.state, step.to, reason, event)
-                .await;
-            match moved {
-                Ok(()) => {
-                    tracing::warn!(%id, from = ?stored.state, to = ?step.to, "settled a leftover download");
-                    self.sink.emit(EngineEvent::Changed { id }).await;
-                    if failing {
-                        let error = failure.to_download_error();
-                        self.sink.emit(EngineEvent::Failed { id, error }).await;
-                    }
-                    return;
-                }
-                Err(err) => {
-                    tracing::warn!(%id, attempt, error = %err, "could not settle a leftover download");
-                    tokio::time::sleep(LEFTOVER_RETRY).await;
-                }
-            }
-        }
-        tracing::error!(%id, "a finished download is still marked active");
     }
 }
 
@@ -834,5 +762,7 @@ mod tests {
         assert_eq!(config.max_active, 3);
         assert_eq!(config.queue_max, 10_000);
         assert_eq!(config.reply_timeout, Duration::from_secs(5));
+        assert_eq!(config.global_connections, 32);
+        assert_eq!(config.host_connections, 8);
     }
 }
