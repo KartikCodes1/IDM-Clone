@@ -31,6 +31,8 @@ export interface DownloadFailure {
   code: string;
   message: string;
   retryable: boolean;
+  /** Parameters of the code; only the retry time is used by the UI. */
+  details?: { retry_at_ms?: number };
 }
 
 export interface DownloadSummary {
@@ -106,7 +108,7 @@ export function str(obj: Obj, key: string): string {
 }
 
 /** Non-negative integer that survives a JS number (the protocol keeps u64 below 2^53). */
-function uint(obj: Obj, key: string): number {
+export function uint(obj: Obj, key: string): number {
   const value = obj[key];
   if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0) {
     throw new PayloadError(`${key} is not a non-negative safe integer`);
@@ -114,7 +116,7 @@ function uint(obj: Obj, key: string): number {
   return value;
 }
 
-function optUint(obj: Obj, key: string): number | undefined {
+export function optUint(obj: Obj, key: string): number | undefined {
   return obj[key] === undefined || obj[key] === null ? undefined : uint(obj, key);
 }
 
@@ -148,10 +150,16 @@ function withOptional<K extends keyof DownloadSummary>(
 function parseFailure(value: unknown): DownloadFailure {
   const o = asObject(value, "last_error");
   const retryable = o["retryable"];
+  const details = o["details"];
+  const retryAt =
+    typeof details === "object" && details !== null && !Array.isArray(details)
+      ? optUint(details as Obj, "retry_at_ms")
+      : undefined;
   return {
     code: str(o, "code"),
     message: str(o, "message"),
     retryable: typeof retryable === "boolean" ? retryable : false,
+    ...(retryAt === undefined ? {} : { details: { retry_at_ms: retryAt } }),
   };
 }
 

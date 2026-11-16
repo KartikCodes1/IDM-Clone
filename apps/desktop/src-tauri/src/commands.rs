@@ -2,8 +2,8 @@
 //! `build.rs` and granted only by `capabilities/main-window.json` (ADR-022).
 
 use forgedm_protocol::{
-    AgentStatusInfo, DownloadDetail, EnqueueUrlResult, ListDownloadsResult, SnapshotResult,
-    StateResult,
+    AgentStatusInfo, DownloadDetail, EnqueueUrlResult, ListDownloadsResult, PauseAllResult,
+    ResumeAllResult, SnapshotResult, StateResult, UpdateLimitsResult,
 };
 use std::sync::Mutex;
 
@@ -11,11 +11,12 @@ use tauri::State;
 
 use crate::agent_client::{self, AgentLocator};
 use crate::error::CommandError;
+use crate::request::{LimitsChange, RateLimitChoice};
 use crate::{engine, open_folder, request};
 
 /// The registered command names; must equal the `build.rs` manifest list and the
 /// `generate_handler!` entries (checked by `manifest_matches_registered_commands`).
-pub const COMMAND_NAMES: [&str; 13] = [
+pub const COMMAND_NAMES: [&str; 18] = [
     "agent_status",
     "list_downloads",
     "get_snapshot",
@@ -29,6 +30,11 @@ pub const COMMAND_NAMES: [&str; 13] = [
     "start_engine",
     "stop_engine",
     "show_in_folder",
+    "pause_all",
+    "resume_all",
+    "update_limits",
+    "update_priority",
+    "get_limits",
 ];
 
 /// Builds the locator; replaceable so tests can simulate a startup failure.
@@ -225,6 +231,77 @@ pub async fn show_in_folder(
     let detail = agent_client::fetch_download(&target.locator()?, body).await?;
     let plan = open_folder::plan_launch(&detail.summary, &open_folder::system_root()?)?;
     open_folder::launch(&plan)
+}
+
+/// Pauses every eligible download; active non-resumable ones are skipped unless
+/// `discard_progress`.
+///
+/// # Errors
+/// [`CommandError`] (`agent_unavailable` when the engine is not running).
+#[tauri::command(rename_all = "snake_case")]
+pub async fn pause_all(
+    target: State<'_, AgentTarget>,
+    discard_progress: Option<bool>,
+) -> Result<PauseAllResult, CommandError> {
+    let body = request::pause_all(discard_progress.unwrap_or(false));
+    agent_client::pause_all(&target.locator()?, body).await
+}
+
+/// Resumes every paused or interrupted download.
+///
+/// # Errors
+/// [`CommandError`] (`agent_unavailable` when the engine is not running).
+#[tauri::command(rename_all = "snake_case")]
+pub async fn resume_all(target: State<'_, AgentTarget>) -> Result<ResumeAllResult, CommandError> {
+    agent_client::resume_all(&target.locator()?, request::resume_all()).await
+}
+
+/// Changes limits and returns the ones now in force. `scope` is `global` or `download`
+/// (which needs `download_id`); `rate_limit` is `"off"` or bytes per second.
+///
+/// # Errors
+/// [`CommandError`] (`invalid_request` for a value outside the protocol range).
+#[tauri::command(rename_all = "snake_case")]
+pub async fn update_limits(
+    target: State<'_, AgentTarget>,
+    scope: String,
+    download_id: Option<String>,
+    max_connections: Option<u32>,
+    rate_limit: Option<RateLimitChoice>,
+    max_active_downloads: Option<u32>,
+) -> Result<UpdateLimitsResult, CommandError> {
+    let change = LimitsChange {
+        max_connections,
+        rate_limit,
+        max_active_downloads,
+    };
+    let body = request::update_limits(&scope, download_id.as_deref(), &change)?;
+    agent_client::update_limits(&target.locator()?, body).await
+}
+
+/// The global limits in force, read without changing anything.
+///
+/// # Errors
+/// [`CommandError`] (`agent_unavailable` when the engine is not running).
+#[tauri::command(rename_all = "snake_case")]
+pub async fn get_limits(
+    target: State<'_, AgentTarget>,
+) -> Result<UpdateLimitsResult, CommandError> {
+    agent_client::update_limits(&target.locator()?, request::get_limits()).await
+}
+
+/// Sets a download's queue priority (`high`, `normal` or `low`).
+///
+/// # Errors
+/// [`CommandError`] (`invalid_request` for a malformed id or priority).
+#[tauri::command(rename_all = "snake_case")]
+pub async fn update_priority(
+    target: State<'_, AgentTarget>,
+    id: String,
+    priority: String,
+) -> Result<(), CommandError> {
+    let body = request::update_priority(&id, &priority)?;
+    agent_client::update_priority(&target.locator()?, body).await
 }
 
 #[cfg(test)]

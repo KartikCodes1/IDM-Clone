@@ -2,14 +2,18 @@
 // commands declare; optional values are omitted rather than sent as null.
 
 import {
+  PayloadError,
   call,
+  optUint,
   parseAgentStatus,
   parseSnapshot,
   type AgentStatusInfo,
   type EngineSnapshot,
   asObject,
   str,
+  type Obj,
 } from "./ipc";
+import { parseLimitsResult, type EffectiveLimits, type LimitsInput } from "./limits";
 
 export interface EnqueueInput {
   url: string;
@@ -71,4 +75,59 @@ export function startEngine(): Promise<AgentStatusInfo> {
 
 export function stopEngine(): Promise<void> {
   return call("stop_engine", ignore);
+}
+
+/** `PauseAll` / `ResumeAll` answer: how many downloads changed and how many were skipped. */
+export interface BatchResult {
+  changed: number;
+  skipped: number;
+}
+
+function idCount(obj: Obj, key: string): number {
+  const value = obj[key];
+  if (!Array.isArray(value)) throw new PayloadError(`${key} is not an array`);
+  return value.length;
+}
+
+function parsePauseAll(value: unknown): BatchResult {
+  const o = asObject(value, "pause-all result");
+  return { changed: idCount(o, "paused"), skipped: idCount(o, "skipped_not_resumable") };
+}
+
+function parseResumeAll(value: unknown): BatchResult {
+  return { changed: idCount(asObject(value, "resume-all result"), "resumed"), skipped: 0 };
+}
+
+export function pauseAll(discardProgress = false): Promise<BatchResult> {
+  return call("pause_all", parsePauseAll, { discard_progress: discardProgress });
+}
+
+export function resumeAll(): Promise<BatchResult> {
+  return call("resume_all", parseResumeAll);
+}
+
+/** The global limits in force, read without changing anything. */
+export function getLimits(): Promise<EffectiveLimits> {
+  return call("get_limits", parseLimitsResult);
+}
+
+export function updateGlobalLimits(input: LimitsInput): Promise<EffectiveLimits> {
+  return call("update_limits", parseLimitsResult, { scope: "global", ...input });
+}
+
+export function updateDownloadConnections(id: string, maxConnections: number): Promise<EffectiveLimits> {
+  return call("update_limits", parseLimitsResult, {
+    scope: "download",
+    download_id: id,
+    max_connections: maxConnections,
+  });
+}
+
+export function updatePriority(id: string, priority: string): Promise<void> {
+  return call("update_priority", ignore, { id, priority });
+}
+
+/** The time of the next automatic retry from `GetDownload`, when the engine has set one. */
+export function getNextRetryAt(id: string): Promise<number | undefined> {
+  return call("get_download", (value) => optUint(asObject(value, "download"), "next_retry_at_ms"), { id });
 }

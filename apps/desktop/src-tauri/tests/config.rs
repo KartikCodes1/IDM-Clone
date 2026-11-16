@@ -121,9 +121,9 @@ fn manifest_matches_registered_commands() {
     );
 }
 
-/// The full, reviewed command surface (W7). Kept as a literal so that adding a command
+/// The full, reviewed command surface (W7, W10a). Kept as a literal so that adding a command
 /// to `COMMAND_NAMES` without a review of this list fails.
-const EXPECTED_COMMANDS: [&str; 13] = [
+const EXPECTED_COMMANDS: [&str; 18] = [
     "agent_status",
     "list_downloads",
     "get_snapshot",
@@ -137,6 +137,11 @@ const EXPECTED_COMMANDS: [&str; 13] = [
     "start_engine",
     "stop_engine",
     "show_in_folder",
+    "pause_all",
+    "resume_all",
+    "update_limits",
+    "update_priority",
+    "get_limits",
 ];
 
 #[test]

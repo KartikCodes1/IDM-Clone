@@ -1,8 +1,12 @@
 import { useEffect, useRef, useState } from "react";
 
-import { ACTION_LABELS, actionsFor, failureText, type RowAction } from "../lib/actions";
+import { useRetryAt } from "../hooks/useRetryAt";
+import type { RowSetting } from "../hooks/useRowSettings";
+import { ACTION_LABELS, actionsFor, type RowAction } from "../lib/actions";
 import { formatBytes, formatEta, formatSpeed, hostOf, percentComplete, stateLabel } from "../lib/format";
 import type { DownloadSummary } from "../lib/ipc";
+import { MAX_CONNECTIONS } from "../lib/limits";
+import { stateMessage } from "../lib/messages";
 
 /** What a row asks the app to do; `deletePartial` only matters for `remove`. */
 export interface RowRequest {
@@ -65,13 +69,68 @@ function RemoveConfirm(props: { completed: boolean; onChoose: (request: RowReque
   );
 }
 
+const PRIORITIES = [
+  ["high", "High"],
+  ["normal", "Normal"],
+  ["low", "Low"],
+] as const;
+
+const TUNABLE_STATES: readonly string[] = ["queued", "probing", "downloading", "pausing", "paused", "retry_waiting", "interrupted"];
+
+const CONNECTION_CHOICES = Array.from({ length: MAX_CONNECTIONS }, (_, i) => i + 1);
+
+/** Priority and connection-count selectors for downloads that are still going to run. */
+function RowSettings(props: { item: DownloadSummary; onSetting: (item: DownloadSummary, setting: RowSetting) => void }) {
+  const { item, onSetting } = props;
+  const priority = PRIORITIES.some(([value]) => value === item.priority) ? item.priority : "";
+  return (
+    <div className="row-settings">
+      <select
+        className="row-select"
+        aria-label={`Priority for ${item.display_name}`}
+        value={priority}
+        onChange={(event) => onSetting(item, { kind: "priority", value: event.target.value })}
+      >
+        {priority === "" && (
+          <option value="" disabled>
+            Priority
+          </option>
+        )}
+        {PRIORITIES.map(([value, label]) => (
+          <option key={value} value={value}>
+            {label}
+          </option>
+        ))}
+      </select>
+      <select
+        className="row-select"
+        aria-label={`Connections for ${item.display_name}`}
+        value=""
+        onChange={(event) => onSetting(item, { kind: "connections", value: Number(event.target.value) })}
+      >
+        <option value="" disabled>
+          Connections
+        </option>
+        {CONNECTION_CHOICES.map((count) => (
+          <option key={count} value={count}>
+            {count}
+          </option>
+        ))}
+      </select>
+    </div>
+  );
+}
+
 interface RowProps {
   item: DownloadSummary;
   onRequest: (item: DownloadSummary, request: RowRequest) => void;
+  onSetting: (item: DownloadSummary, setting: RowSetting) => void;
 }
 
 /** One download. Everything shown from the engine is rendered as text. */
-export function DownloadRow({ item, onRequest }: RowProps) {
+export function DownloadRow({ item, onRequest, onSetting }: RowProps) {
+  const retryAt = useRetryAt(item);
+  const note = stateMessage(item, retryAt);
   const [confirming, setConfirming] = useState(false);
   const row = useRef<HTMLLIElement>(null);
   const wasConfirming = useRef(false);
@@ -103,6 +162,7 @@ export function DownloadRow({ item, onRequest }: RowProps) {
           <RemoveConfirm completed={item.state === "completed"} onChoose={choose} />
         ) : (
           <div className="row-actions">
+            {TUNABLE_STATES.includes(item.state) && <RowSettings item={item} onSetting={onSetting} />}
             {actionsFor(item.state).map((action) => (
               <button key={action} type="button" data-action={action} className="button button-small button-quiet" aria-label={`${ACTION_LABELS[action]} ${item.display_name}`} onClick={() => click(action)}>
                 {ACTION_LABELS[action]}
@@ -115,7 +175,7 @@ export function DownloadRow({ item, onRequest }: RowProps) {
         <Progress item={item} />
         <Stats item={item} />
       </div>
-      {item.state === "failed" && <p className="row-failure">{failureText(item.last_error)}</p>}
+      {note !== undefined && <p className={item.state === "failed" ? "row-failure" : "row-note"}>{note}</p>}
     </li>
   );
 }

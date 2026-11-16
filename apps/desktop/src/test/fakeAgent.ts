@@ -21,7 +21,13 @@ export interface FakeAgent {
   setItems(items: Row[]): void;
   /** Makes one command reject with a command error object (as Tauri does). */
   failWith(cmd: string, error: unknown): void;
+  /** Replaces a command's answer; a function receives the call's arguments. */
+  reply(cmd: string, answer: unknown): void;
 }
+
+export const LIMITS_REPLY = {
+  effective: { max_connections: 4, rate_limit_bps: 2_097_152, max_active_downloads: 3 },
+};
 
 export const AGENT_STATUS: Row = statusGolden.result as Row;
 
@@ -78,11 +84,17 @@ const DEFAULT_REPLIES: Record<string, unknown> = {
   show_in_folder: null,
   stop_engine: null,
   start_engine: AGENT_STATUS,
+  pause_all: { paused: [], skipped_not_resumable: [] },
+  resume_all: { resumed: [] },
+  update_priority: null,
+  update_limits: LIMITS_REPLY,
+  get_limits: LIMITS_REPLY,
 };
 
 export function installFakeAgent(initial: Row[] = []): FakeAgent {
   let items = initial;
   const failures = new Map<string, unknown>();
+  const answers = new Map<string, unknown>();
   const calls: Call[] = [];
   mockIPC((cmd, payload) => {
     calls.push({ cmd, args: (payload ?? {}) as Record<string, unknown> });
@@ -96,6 +108,11 @@ export function installFakeAgent(initial: Row[] = []): FakeAgent {
         truncated: false,
       };
     }
+    if (answers.has(cmd)) {
+      const answer = answers.get(cmd);
+      return typeof answer === "function" ? (answer as (a: Record<string, unknown>) => unknown)(calls.at(-1)?.args ?? {}) : answer;
+    }
+    if (cmd === "get_download") return goldenRow();
     if (Object.hasOwn(DEFAULT_REPLIES, cmd)) return DEFAULT_REPLIES[cmd];
     throw new Error(`unexpected command ${cmd}`);
   });
@@ -107,6 +124,9 @@ export function installFakeAgent(initial: Row[] = []): FakeAgent {
     },
     failWith: (cmd, error) => {
       failures.set(cmd, error);
+    },
+    reply: (cmd, answer) => {
+      answers.set(cmd, answer);
     },
   };
 }

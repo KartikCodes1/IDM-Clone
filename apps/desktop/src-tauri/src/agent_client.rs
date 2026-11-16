@@ -9,8 +9,8 @@ use std::path::{Path, PathBuf};
 use forgedm_ipc::{Client, ClientConfig, IpcError};
 use forgedm_protocol::{
     AgentStatusInfo, ClientKind, DownloadDetail, Empty, EnqueueUrlResult, ErrorCode,
-    ListDownloadsRequest, ListDownloadsResult, RequestBody, ResultBody, SnapshotResult,
-    StateResult,
+    ListDownloadsRequest, ListDownloadsResult, PauseAllResult, RequestBody, ResultBody,
+    ResumeAllResult, SnapshotResult, StateResult, UpdateLimitsResult,
 };
 
 use crate::error::{CommandError, CommandErrorKind};
@@ -197,6 +197,62 @@ pub async fn change_state(
         | ResultBody::Resume(r)
         | ResultBody::Cancel(r)
         | ResultBody::Retry(r) => Ok(r),
+        _ => Err(unexpected_result()),
+    }
+}
+
+/// `PauseAll`.
+///
+/// # Errors
+/// As [`send`].
+pub async fn pause_all(
+    locator: &AgentLocator,
+    body: RequestBody,
+) -> Result<PauseAllResult, CommandError> {
+    match send(locator, body).await? {
+        ResultBody::PauseAll(result) => Ok(result),
+        _ => Err(unexpected_result()),
+    }
+}
+
+/// `ResumeAll`.
+///
+/// # Errors
+/// As [`send`].
+pub async fn resume_all(
+    locator: &AgentLocator,
+    body: RequestBody,
+) -> Result<ResumeAllResult, CommandError> {
+    match send(locator, body).await? {
+        ResultBody::ResumeAll(result) => Ok(result),
+        _ => Err(unexpected_result()),
+    }
+}
+
+/// `UpdateLimits`: the limits now in force (also how the current limits are read).
+///
+/// # Errors
+/// As [`send`].
+pub async fn update_limits(
+    locator: &AgentLocator,
+    body: RequestBody,
+) -> Result<UpdateLimitsResult, CommandError> {
+    match send(locator, body).await? {
+        ResultBody::UpdateLimits(result) => Ok(result),
+        _ => Err(unexpected_result()),
+    }
+}
+
+/// `UpdatePriority`.
+///
+/// # Errors
+/// As [`send`].
+pub async fn update_priority(
+    locator: &AgentLocator,
+    body: RequestBody,
+) -> Result<(), CommandError> {
+    match send(locator, body).await? {
+        ResultBody::UpdatePriority(_) => Ok(()),
         _ => Err(unexpected_result()),
     }
 }

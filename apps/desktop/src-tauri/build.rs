@@ -38,6 +38,11 @@ fn main() {
         "start_engine",
         "stop_engine",
         "show_in_folder",
+        "pause_all",
+        "resume_all",
+        "update_limits",
+        "update_priority",
+        "get_limits",
     ]);
     let windows = tauri_build::WindowsAttributes::new().app_manifest(APP_MANIFEST);
     let attributes = tauri_build::Attributes::new()

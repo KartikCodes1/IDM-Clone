@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-update-priority"
+description = "Enables the update_priority command without any pre-configured scope."
+commands.allow = ["update_priority"]
+
+[[permission]]
+identifier = "deny-update-priority"
+description = "Denies the update_priority command without any pre-configured scope."
+commands.deny = ["update_priority"]

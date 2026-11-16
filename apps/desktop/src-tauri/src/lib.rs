@@ -36,7 +36,12 @@ pub fn run(log_guard: logging::LogGuard) -> Result<(), tauri::Error> {
             commands::remove,
             commands::start_engine,
             commands::stop_engine,
-            commands::show_in_folder
+            commands::show_in_folder,
+            commands::pause_all,
+            commands::resume_all,
+            commands::update_limits,
+            commands::update_priority,
+            commands::get_limits
         ])
         .setup(|_app| {
             tracing::info!("desktop shell started");

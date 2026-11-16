@@ -68,6 +68,17 @@ const FAILURE_TEXT: Readonly<Record<string, string>> = {
   finalize_locked: "The finished file is locked by another program.",
   part_file_invalid: "The partial file went missing.",
   retry_budget_exhausted: "Too many attempts failed.",
+  body_incomplete: "The server stopped sending the file early.",
+  too_many_redirects: "The link redirected too many times.",
+  redirect_loop: "The link redirects in a circle.",
+  redirect_downgrade: "The link tried to switch from a secure to an insecure connection.",
+  redirect_blocked: "The link redirected to an address that is not allowed.",
+  range_protocol_violation: "The server answered a partial request incorrectly.",
+  unsupported_content_encoding: "The server sent the file in an unsupported encoding.",
+  file_system_limit: "The destination drive cannot hold a file this large.",
+  secrets_unavailable: "The saved link could not be unlocked.",
+  internal: "The engine hit an internal error.",
+  path_escape: "The file would have been saved outside the destination folder, so it was stopped.",
 };
 
 /** A fixed, readable reason for a failed download. The engine's own text is not shown. */

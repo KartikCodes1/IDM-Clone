@@ -6,10 +6,12 @@ import { DownloadList } from "./components/DownloadList";
 import { EmptyState } from "./components/EmptyState";
 import { EngineBanner } from "./components/EngineBanner";
 import { StatusStrip } from "./components/StatusStrip";
+import { Toolbar } from "./components/Toolbar";
 import { StopEngine } from "./components/StopEngine";
 import { Toasts } from "./components/Toasts";
 import { messageOf, useEngine, type EngineControl } from "./hooks/useEngine";
 import { useRowRequests } from "./hooks/useRowRequests";
+import { useRowSettings } from "./hooks/useRowSettings";
 import { useSnapshotPolling, type PollState } from "./hooks/useSnapshotPolling";
 import { useToasts } from "./hooks/useToasts";
 
@@ -31,11 +33,13 @@ interface BodyProps {
   engine: EngineControl;
   refresh: () => void;
   onAdded: (fileName: string) => void;
-  onRowError: (message: string) => void;
+  notify: (tone: "info" | "error", message: string) => void;
 }
 
-function Body({ state, engine, refresh, onAdded, onRowError }: BodyProps) {
+function Body({ state, engine, refresh, onAdded, notify }: BodyProps) {
+  const onRowError = useCallback((message: string) => notify("error", message), [notify]);
   const onRequest = useRowRequests(onRowError, refresh);
+  const onSetting = useRowSettings(notify, refresh);
   switch (state.phase) {
     case "loading":
       return <p className="muted">Connecting to the background engine…</p>;
@@ -59,11 +63,12 @@ function Body({ state, engine, refresh, onAdded, onRowError }: BodyProps) {
             </EmptyState>
           )}
           <StatusStrip status={status} />
+          <Toolbar notify={notify} refresh={refresh} />
           <AddDownload onAdded={onAdded} />
           {downloads.length === 0 ? (
             <EmptyState title="No downloads yet">Downloads you add will appear here with live progress.</EmptyState>
           ) : (
-            <DownloadList items={downloads} onRequest={onRequest} />
+            <DownloadList items={downloads} onRequest={onRequest} onSetting={onSetting} />
           )}
         </>
       );
@@ -93,7 +98,6 @@ export default function App() {
     },
     [push, refresh],
   );
-  const onRowError = useCallback((message: string) => push("error", message), [push]);
   const { stop } = engine;
   const onStop = useCallback(() => {
     stop().catch((err: unknown) => push("error", messageOf(err)));
@@ -112,7 +116,7 @@ export default function App() {
         {state.phase === "ready" && <StopEngine onStop={onStop} />}
       </header>
       <main className="content">
-        <Body state={state} engine={engine} refresh={refresh} onAdded={onAdded} onRowError={onRowError} />
+        <Body state={state} engine={engine} refresh={refresh} onAdded={onAdded} notify={push} />
       </main>
       <Toasts toasts={toasts} onDismiss={dismiss} />
     </div>

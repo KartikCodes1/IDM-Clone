@@ -16,6 +16,11 @@
     "allow-remove",
     "allow-start-engine",
     "allow-stop-engine",
-    "allow-show-in-folder"
+    "allow-show-in-folder",
+    "allow-pause-all",
+    "allow-resume-all",
+    "allow-update-limits",
+    "allow-update-priority",
+    "allow-get-limits"
   ]
 }
