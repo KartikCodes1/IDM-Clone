@@ -743,3 +743,67 @@ NOT RUN:
 - `cargo deny --locked check` and coverage (cargo-llvm-cov) are not in the gate command list, so not run. The 80% coverage target is therefore not verified for this wave.
 - Ignored in the gate run and not run: full_5gib_segmented_exact_size_stream_compare, connect_timeout_15s_blackhole, iae_from_sta_writes_zone_identifier.
 - plan_tests_missing for S1.12: the connect_timeout_15s_blackhole slow tier; tls_untrusted_cert_fatal and the https_to_http e2e over TLS (see the S1.12 section).
+
+### S1.13 Admission, connection budgets, bandwidth caps, priorities (2026-11-15)
+
+RED: `cargo test -p forgedm-core --locked --no-run --test admission --test rate_limit_e2e` failed to compile (exit 101): E0432 unresolved import `forgedm_core::engine::budgets` (admission.rs and tests/support/mod.rs); E0432 no `GlobalLimits` in `engine` (rate_limit_e2e.rs); E0425 cannot find function `start_with_space` in module `engine`. The source record for this slice is truncated partway through the description of the post-implementation run, so that run's output is not recorded here.
+
+| Command | Exit | Result |
+|---|---|---|
+| `cargo fmt -p forgedm-core -- --check` | 0 | clean |
+| `cargo clippy -p forgedm-core --all-targets --locked -- -D warnings` | 0 | no warnings |
+| `cargo test -p forgedm-core --locked` | 0 | all test binaries ok, 0 failed; 2 pre-existing ignored. The implementer reported a slice total of 304 passed, 0 failed, 2 ignored; the per-binary results were not re-summed |
+| `git diff --exit-code Cargo.lock` | 0 | unchanged |
+
+NOT RUN (plan_tests_missing): none reported for this slice.
+
+Deviations:
+- Admission does not skip hosts in cooldown. ARCHITECTURE 4.2 mentions it, but the S1.13 test list and the task bullets do not. Cooldown is still honoured per request through Resilience::gate.
+- The disk-full precheck runs at stage() while the download is still probing. A.6 has no probing -> paused edge, so stage() moves the download to downloading (ProbeSucceeded) before returning PauseFor(DiskFull). The result is paused(disk_full), and a later Resume starts fresh; this replaces the earlier failed(disk_full) for that case. The 1 GiB recheck (stream_body and segmented check_space) uses the injectable FreeSpace reading. It is not exercised end to end because that needs more than 1 GiB written; only the A.9 constants and ensure_space are unit-tested.
+- Only the global limits are stored in settings. The per-download rate limit lasts for the agent session, like the per-download connection cap. The global max_connections is stored as the default for new downloads; it is not a live cap on downloads already running. EnqueueUrl rate_limit_bps and start_paused are still refused as before.
+- A connection permit is held for one request, per ARCHITECTURE 4.2. A worker also yields its permit mid-response (gate.should_yield) when another download's first connection is waiting and the yielding download holds at least two permits; without this a small download waited about 6 s behind a big one. The probe's permit is carried into the single-connection transfer that follows it, so a small download does not queue twice.
+- Per-host AIMD is enforced with live host slots checked against HostHandle::limit() at the moment a slot is taken, plus Pool.rebalance retiring workers above the limit. It is not a tokio Semaphore that forgets permits. The global budget is a real tokio Semaphore.
+- StoredJob gained priority, queue_position and created_at_ms. DownloadStore gained set_priority and ids_in_states, which default to refusing. Storage gained Downloads::set_priority. The existing StoredJob literals in tests were updated to match.
+- To keep engine/mod.rs under 800 lines (it is now 768), Supervisor moved to engine/supervisor.rs and the retry-timer actor code to engine/retry_timer.rs. This is a pure move.
+- crates/forgedm-agent/tests/process.rs: unimplemented_actions_return_not_implemented was replaced by every_action_of_the_contract_is_served, because PauseAll, ResumeAll, UpdateLimits and UpdatePriority are now served. The handlers/mod.rs test limits_that_belong_to_later_slices_are_refused_not_ignored was replaced by tests of the new behaviour. The implementer reports that no test was weakened.
+- Extra tests beyond the plan list: pause_all_with_discard_progress_includes_non_resumable, global_speed_limit_bounds_segmented_transfers_too, rate_limit_of_an_unknown_download_is_not_found, plus unit tests in admission, budgets, hosts, limits_store and the CLI grammar.
+
+Open (from the implementer and reviewers; see SECURITY_REVIEW "S1.13"):
+- S1.13-rust-reviewer-1: a voluntary permit yield still counts against MAX_REQUESTS_PER_SEGMENT, and no test covers it. It needs a SegmentEnd::Yielded variant and a test.
+- S1.13-rust-reviewer-2: a first connection still holds a global permit while it waits for a host slot. This is bounded and follows the documented order; it should be noted as accepted in ARCHITECTURE 4.2, which this slice does not own.
+- S1.13-rust-reviewer-3: per-download token buckets are freed only on Remove.
+- S1.13-rust-reviewer-4: a download-scope or global UpdateLimits request can be applied only in part.
+- S1.13-code-reviewer-5: limit constants are still duplicated across the core, agent and protocol crates.
+
+### W9 wave gate (2026-11-15)
+
+RED: not applicable. This is the gate run over the workspace after S1.13; its RED notes are in the section above.
+
+| Command | Exit | Result |
+|---|---|---|
+| `cargo fmt --all -- --check` (CARGO_TARGET_DIR unset, shared target dir) | 0 | no formatting differences |
+| `cargo clippy --workspace --all-targets --locked -- -D warnings` | 0 | clean, no warnings; finished dev profile in 10.38 s |
+| `cargo test --workspace --locked` (output kept in the session scratchpad as test.log) | 0 | 89 test binaries including doc-tests: 739 passed, 0 failed, 3 ignored (full_5gib_segmented_exact_size_stream_compare, connect_timeout_15s_blackhole, iae_from_sta_writes_zone_identifier) |
+| `git diff --exit-code Cargo.lock` (checked after the tests and again at the end) | 0 | unchanged |
+| `cargo build --workspace --bins --locked` | 0 | built forgedm.exe and forgedm-agent.exe in target\debug; forgedm-fixture.exe was already up to date |
+| `powershell -NoProfile -ExecutionPolicy Bypass -File scripts\check.ps1` (path quoted in the record) | 0 | 13 PASS, 0 FAIL, 0 NOT RUN: no-tls-bypass, no-assert-sql-safe, unsafe-only-in-platform, command-new-allowlist, layering, no-fixture-in-shipped, no-fault-injection-in-release, no-reqwest-compression, tauri-versions-match, no-loose-versions, lockfiles-committed, manifest-asinvoker, eslint-bans |
+| `powershell -NoProfile -ExecutionPolicy Bypass -File scripts\windows-smoke.ps1` (path quoted in the record) | 0 | 22 PASS, 0 FAIL, 0 NOT RUN. Includes agent-has-no-tcp-listener, lock held and released, a second agent exits 3, peak working set 31.2 MB, and no-leftover-processes |
+| limits smoke run 1, `powershell -File scratchpad\limits-smoke.ps1` (5 x 8 MiB, slow=2000000, --connections 1; logs kept in the scratchpad) | 0 | 13 PASS. Max active 3 across 341 samples, with 2 queued. All 5 completed with matching SHA-256. No forgedm process left. The limit check is not meaningful in this run: the unlimited baseline was only 1.86 MiB/s, below the 2 MiB/s limit (see Problems) |
+| limits smoke run 2, `scratchpad\limits-smoke.ps1 -Connections 0 -UnlimitedSampleSec 1` (default 8 connections) | 0 | 14 PASS, 0 FAIL. Default limits were max_active=3, speed off, 8 connections. Unlimited baseline 2.99 MiB/s. Max active 3 across 296 `list --json` samples, with 2 queued. After `forgedm limits --speed 2097152` (exit 0), 9,961,472 B came in over 5.008 s (1.897 MiB/s), under the 11,026,878 B bound (rate x t plus 512 KiB burst), with 3 downloads still active. `pause-all` (exit 0) paused all 5 mid-download, and the byte sum stayed at 16,465,920 for 1.5 s. `resume-all` (exit 0) resumed all 5. All 5 completed at 8,388,608 B with SHA-256 equal to the fixture hash. `agent stop` exit 0, agent exit 0, fixture killed, 0 forgedm processes left, 0 WARN/ERROR lines in the agent log |
+| limits smoke run 3, `scratchpad\limits-smoke.ps1 -Connections 0 -UnlimitedSampleSec 1.5 -LiftSec 2` | 1 | 14 PASS, 1 FAIL. Every required gate check passed (max active 3; limited window 2.002 MiB/s within the 11,001,365 B bound against a 3.38 MiB/s baseline; pause-all and resume-all exit 0; 5/5 SHA-256 match; no process left). The one failure was the extra check limit-lift-rate-rises, which the record attributes to the harness: the measurement window started after the `speed off` command returned, so about 6 MB had already drained and the window saw only 2 freshly started downloads. Superseded by run 4 |
+| limits smoke run 4 (final), `scratchpad\limits-smoke.ps1 -Connections 0 -UnlimitedSampleSec 1.5 -LiftSec 2` (lift window starts at the snapshot before the command) | 0 | 15 PASS, 0 FAIL. Unlimited 3.48 MiB/s. Max active 3 across 399 samples, with 2 queued. Limited: 9,699,328 B over 4.987 s (1.855 MiB/s), under the 10,982,323 B bound, with 3 still active. After `limits --speed off` the rate rose to 4.62 MiB/s over 2.00 s. `pause-all` paused the 2 unfinished downloads (3 had already completed) and bytes stayed frozen. `resume-all` resumed 2. All 5 SHA-256 match. `agent stop` 0, agent exit 0, fixture killed, 0 forgedm processes |
+| `tasklist \| grep -i forgedm` (after all smokes) | 1 | no match (grep exit 1): no forgedm process is running |
+
+Gate all_green: true, as recorded by the coordinator. Limits smoke run 3 exited 1 and is recorded above as a FAIL; the lift check rests on run 4 and the limit check on runs 2 and 4.
+
+Workspace tests: 739 passed, 0 failed, 3 ignored.
+
+Problems and notes:
+- The fixture's `slow=<Bps>` throttle is clamped to 64 KiB per 100 ms tick (tests/fixtures/src/body.rs: CHUNK 64 KiB, SLOW_TICK 100 ms), so slow=2000000 gives about 640 KiB/s per connection, not 2 MB/s. With --connections 1, three active downloads only reach about 1.86 MiB/s, below a 2 MiB/s limit, so run 1 proves nothing about the limit. The passing evidence comes from default connections (runs 2 and 4), where the unlimited baseline was 2.99 to 3.48 MiB/s.
+- The speed limit governs how fast the agent accepts bytes. While it is in force, the fixture keeps filling the kernel TCP receive buffers, and they drain at once when the limit is lifted (about 6 MB within 0.11 s in run 3). This is expected for an application-level limiter and is not a defect.
+- The limits smoke script is scratch, not part of the repo; its logs are kept alongside it in the scratchpad.
+
+NOT RUN:
+- Not in this gate's command list: cargo-llvm-cov coverage (no coverage figure is recorded for S1.13), cargo-deny, and the tauri build.
+- Ignored in the gate run and not run: full_5gib_segmented_exact_size_stream_compare, connect_timeout_15s_blackhole, iae_from_sta_writes_zone_identifier.
+- plan_tests_missing for S1.13: none reported.

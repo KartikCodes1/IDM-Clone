@@ -80,6 +80,9 @@ This log records the reviews that actually ran: the reviewer, the scope, each fi
 | 2026-11-15 | S1.12 | ecc:security-reviewer | 0 | 0 | 0 | 3 (not fixed) | 0 |
 | 2026-11-15 | S1.12 | ecc:code-reviewer | 0 | 0 | 0 | 3 (1 no change needed, 2 not fixed) | 0 |
 | 2026-11-15 | S1.12 | ecc:silent-failure-hunter | 0 | 0 | 1 (fixed, not re-reviewed) | 4 (2 fixed, 1 no change needed, 1 not fixed) | 0 |
+| 2026-11-15 | S1.13 | ecc:rust-reviewer | 0 | 0 | 0 | 4 (1 verified, 3 passed to fixer unverified; all not fixed) | 0 |
+| 2026-11-15 | S1.13 | ecc:security-reviewer | 0 | 0 | 0 | 0 | 0 |
+| 2026-11-15 | S1.13 | ecc:code-reviewer | 0 | 0 | 0 | 2 (1 fixed in part, 1 not fixed) | 0 |
 
 Process: each Medium or higher finding went to an independent verifier asked to refute it, and was fixed only if confirmed. Low findings were passed to the fixer unverified.
 
@@ -539,6 +542,26 @@ Other Low findings:
 
 Verifier-rejected: none.
 Re-review: none recorded (re-review null). The two MEDIUM fixes have not been re-reviewed. The reviewers read code only and ran no cargo, so their counts come from code reading; the coordinator's gate run is in TEST_EVIDENCE "W8 wave gate".
+
+### S1.13 Admission, connection budgets, bandwidth caps, priorities (0 Critical/High/Medium; 6 Low: 1 fixed in part, 5 not fixed)
+
+Confirmed (verified) findings:
+- S1.13-rust-reviewer-1 (LOW): permit yield consumes the per-segment request budget and can fail a healthy download. **Not fixed** (deferred; the verifier judged it very unlikely on default limits). Open: needs a SegmentEnd::Yielded variant and a test.
+
+Other Low findings:
+- S1.13-rust-reviewer-2: a first connection holds a global permit while it waits for a host slot. **Not fixed**: the wait is bounded and follows the documented order, so it is accepted behaviour. The ARCHITECTURE 4.2 note is outside this slice's ownership.
+- S1.13-rust-reviewer-3: per-download token buckets are freed only on Remove. **Not fixed**; the map grows by one small entry per download. Deferred.
+- S1.13-rust-reviewer-4: a download-scope or global UpdateLimits request can be applied only in part. **Not fixed**; partial application is documented in the limits_store comment. Deferred.
+- S1.13-code-reviewer-5: limit constants are duplicated across the core, agent and protocol crates. **Not fixed**; consolidation touches several crates and the values currently agree. Deferred.
+- S1.13-code-reviewer-6: Queue::admission_order and Queue::len are public but used only by unit tests. **Fixed in part**: Queue::admission_order is now `#[cfg(test)]`; Queue::len is still pub (it pairs with is_empty).
+
+Reviewer scope notes:
+- ecc:security-reviewer: no findings. It read validate_limits in forgedm-protocol and the rate-limit range checks, but not the CLI code, the engine's Cmd::UpdateGlobal handler body, the engine-side clamping, or the worker and segmented budget wiring. It ran no build or tests.
+- ecc:code-reviewer: spec-completeness review. All 11 plan test names exist (admission.rs 9, rate_limit_e2e.rs 2) with the expected assertions. Its two findings are the Low items above.
+- ecc:rust-reviewer: read budgets.rs, admission.rs, limits_store.rs, handlers/limits.rs, the engine_host.rs limits paths and the permit and yield paths. It did not check the CLI, the storage additions or the test files, and ran no cargo.
+
+Verifier-rejected: none.
+Re-review: none recorded (re-review null). The reviewers read code only, so their counts come from code reading; the coordinator's cargo results are in TEST_EVIDENCE "S1.13" and "W9 wave gate".
 
 ## Not run
 
