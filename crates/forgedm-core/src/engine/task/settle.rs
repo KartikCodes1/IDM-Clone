@@ -7,7 +7,7 @@
 
 use std::time::Duration;
 
-use forgedm_protocol::{DownloadErrorCode, DownloadState};
+use forgedm_protocol::{DownloadErrorCode, DownloadErrorDetails, DownloadState};
 use tokio::time::sleep;
 
 use super::DownloadTask;
@@ -30,8 +30,17 @@ const USER_PAUSE: Command = Command::Pause {
 impl DownloadTask {
     /// Moves the download to the state `stop` calls for.
     pub(super) async fn settle(&mut self, stop: TaskStop) {
-        match stop {
+        // A fault no retry loop handled is final.
+        match stop.into_final() {
             TaskStop::Fail(failure) => self.fail(&failure).await,
+            TaskStop::Retry(_) => self.fail(&Failure::new(DownloadErrorCode::Internal)).await,
+            TaskStop::RetryWait { at_ms } => self.wait_for_retry(at_ms).await,
+            TaskStop::NeedsUrlRefresh => {
+                let failure = Failure::new(DownloadErrorCode::UrlExpired);
+                let event = failure_event("needs_url_refresh", &failure);
+                self.park(Command::NeedUrlRefresh, None, event).await;
+            }
+            TaskStop::Reprobe(reason) => self.fail(&Failure::protocol_violation(reason)).await,
             TaskStop::NeedsCredentials => {
                 let failure = Failure::new(DownloadErrorCode::AuthRequired);
                 let event = failure_event("needs_credentials", &failure);
@@ -45,6 +54,24 @@ impl DownloadTask {
             TaskStop::Stopped(StopReason::Shutdown) => self.settle_shutdown().await,
             TaskStop::Stopped(StopReason::Pause) => self.settle_pause().await,
         }
+    }
+
+    /// `retry_waiting` until `at_ms`: the due time is stored first, then the state, so a
+    /// download found in `retry_waiting` after a crash knows when it is due.
+    async fn wait_for_retry(&mut self, at_ms: i64) {
+        let failure = Failure {
+            code: DownloadErrorCode::RateLimited,
+            details: Some(DownloadErrorDetails {
+                retry_at_ms: u64::try_from(at_ms).ok(),
+                ..DownloadErrorDetails::default()
+            }),
+        };
+        if let Err(err) = self.ctx.store.schedule_retry(self.job.id, at_ms).await {
+            tracing::error!(error = %err, "could not store the retry time; the engine falls back to the host cooldown");
+        }
+        let event = failure_event("retry_waiting", &failure);
+        let reason = Some(DownloadErrorCode::RateLimited.as_str());
+        self.park(Command::WaitRetry, reason, event).await;
     }
 
     /// Shutdown: active downloads become `interrupted(agent_shutdown)`; a download that was

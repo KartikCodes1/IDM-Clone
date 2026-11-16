@@ -405,8 +405,9 @@ async fn ranges_ignored_mid_download_no_misplaced_writes() {
     assert_eq!(h.store.state(id), Some(DownloadState::Failed));
     assert_committed_ranges_valid(&h, id, 49);
 
-    // Without a validator there is no `If-Range`: the 200 must still never be written at
-    // another offset.
+    // Without a validator there is no `If-Range`: the 200 must never be written at another
+    // offset. S1.12: the engine re-probes once and re-plans (the server now ignores ranges,
+    // so a plain single stream from zero) instead of failing; every byte lands in place.
     let (id, event) = h
         .run(
             &format!("/f/50/{size}?etag=none&range_200_after=3&slow=6000000&t=r200b"),
@@ -414,10 +415,10 @@ async fn ranges_ignored_mid_download_no_misplaced_writes() {
             4,
         )
         .await;
-    let (code, reason) = failure(&event);
-    assert_eq!(code, DownloadErrorCode::RangeProtocolViolation);
-    assert_eq!(reason.as_deref(), Some("ranges_no_longer_supported"));
-    assert_committed_ranges_valid(&h, id, 50);
+    let (path, sha) = completed(&event);
+    assert_eq!(sha, expected_sha(50, size));
+    verify::file_matches(&path, 50, size).unwrap();
+    assert_eq!(h.store.state(id), Some(DownloadState::Completed));
 }
 
 /// A server that probes correctly but answers every other range with a wrong start.

@@ -11,13 +11,14 @@ use std::path::PathBuf;
 use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
-use forgedm_core::clock::BoxFuture;
+use forgedm_core::clock::{BoxFuture, Sleeper};
 use forgedm_core::error::StoreError;
 use forgedm_core::ports::{
     DownloadStore, EngineEvent, EngineEventSink, NewJob, ProbeFacts, StoreEvent, StoreFuture,
     StoredJob, StoredProgress, unix_ms,
 };
 use forgedm_core::transfer::segment_table::SegmentSnapshot;
+use forgedm_core::url_policy::SecretUrl;
 use forgedm_protocol::{DownloadState, TransferMode};
 use tokio::sync::Notify;
 use uuid::Uuid;
@@ -45,6 +46,12 @@ pub struct Row {
     pub completion: Option<(PathBuf, String, bool)>,
     /// Times progress was reset.
     pub resets: u32,
+    /// The URL after redirects, as the probe saved it.
+    pub final_url: Option<SecretUrl>,
+    /// The connection cap last persisted with `set_max_connections`.
+    pub persisted_max_connections: Option<u32>,
+    /// When the download is due out of `retry_waiting`, epoch milliseconds.
+    pub next_retry_at_ms: Option<i64>,
     /// Insertion order.
     pub created_at_ms: i64,
 }
@@ -91,6 +98,9 @@ impl MemoryStore {
             finalize_targets: Vec::new(),
             completion: None,
             resets: 0,
+            final_url: None,
+            persisted_max_connections: None,
+            next_retry_at_ms: None,
             created_at_ms: unix_ms(),
         };
         self.rows().insert(job.id, row);
@@ -156,7 +166,14 @@ impl DownloadStore for MemoryStore {
             Ok(rows
                 .into_iter()
                 .map(|r| r.job)
-                .filter(|j| matches!(j.state, DownloadState::Queued | DownloadState::Interrupted))
+                .filter(|j| {
+                    matches!(
+                        j.state,
+                        DownloadState::Queued
+                            | DownloadState::Interrupted
+                            | DownloadState::RetryWaiting
+                    )
+                })
                 .collect())
         })
     }
@@ -194,6 +211,7 @@ impl DownloadStore for MemoryStore {
             let mut rows = self.rows();
             let row = rows.get_mut(&id).ok_or(StoreError::NotFound)?;
             row.probe = Some((facts.transfer_mode, facts.total));
+            row.final_url = Some(facts.final_url.clone());
             row.file_name = Some(facts.file_name.clone());
             row.job.file_name = Some(facts.file_name);
             row.job.transfer_mode = Some(facts.transfer_mode);
@@ -269,6 +287,29 @@ impl DownloadStore for MemoryStore {
         })
     }
 
+    fn set_max_connections(&self, id: Uuid, value: u32) -> StoreFuture<'_, ()> {
+        Box::pin(async move {
+            let mut rows = self.rows();
+            let row = rows.get_mut(&id).ok_or(StoreError::NotFound)?;
+            row.job.max_connections = value;
+            row.persisted_max_connections = Some(value);
+            Ok(())
+        })
+    }
+
+    fn schedule_retry(&self, id: Uuid, at_ms: i64) -> StoreFuture<'_, ()> {
+        Box::pin(async move {
+            let mut rows = self.rows();
+            let row = rows.get_mut(&id).ok_or(StoreError::NotFound)?;
+            row.next_retry_at_ms = Some(at_ms);
+            Ok(())
+        })
+    }
+
+    fn next_retry_at(&self, id: Uuid) -> StoreFuture<'_, Option<i64>> {
+        Box::pin(async move { Ok(self.row(id).and_then(|r| r.next_retry_at_ms)) })
+    }
+
     fn set_finalize_target(&self, id: Uuid, target: &std::path::Path) -> StoreFuture<'_, ()> {
         let target = target.to_path_buf();
         Box::pin(async move {
@@ -315,6 +356,53 @@ impl DownloadStore for MemoryStore {
             row.events.push(event);
             Ok(())
         })
+    }
+}
+
+/// A [`Sleeper`] that records every requested wait and returns at once (or never, when
+/// built with [`RecordingSleeper::blocking`]), so retry timing is asserted without waiting.
+#[derive(Default)]
+pub struct RecordingSleeper {
+    sleeps: Mutex<Vec<Duration>>,
+    block: bool,
+}
+
+impl RecordingSleeper {
+    /// A sleeper whose waits complete immediately.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// A sleeper whose waits never complete: only a cancelled token ends them.
+    #[must_use]
+    pub fn blocking() -> Self {
+        Self {
+            sleeps: Mutex::new(Vec::new()),
+            block: true,
+        }
+    }
+
+    /// Every wait requested so far, oldest first.
+    #[must_use]
+    pub fn sleeps(&self) -> Vec<Duration> {
+        self.sleeps
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+}
+
+impl Sleeper for RecordingSleeper {
+    fn sleep(&self, duration: Duration) -> BoxFuture<'_, ()> {
+        self.sleeps
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(duration);
+        if self.block {
+            return Box::pin(std::future::pending());
+        }
+        Box::pin(tokio::task::yield_now())
     }
 }
 

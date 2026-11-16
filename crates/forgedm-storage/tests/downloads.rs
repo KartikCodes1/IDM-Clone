@@ -614,3 +614,48 @@ async fn reset_for_restart_clears_progress_and_identity_but_keeps_state_and_chec
     let missing = downloads.reset_for_restart(new_id(), 9).await;
     assert!(matches!(missing, Err(StorageError::NotFound { .. })));
 }
+
+#[tokio::test]
+async fn max_connections_and_retry_time_are_persisted() {
+    let db = open_temp().await;
+    let id = new_id();
+    db.storage
+        .downloads()
+        .insert(&new_download(id, URL))
+        .await
+        .unwrap();
+
+    db.storage
+        .downloads()
+        .set_max_connections(id, 3, 10)
+        .await
+        .unwrap();
+    db.storage
+        .downloads()
+        .set_next_retry_at(id, 1_700_000_000_000, 11)
+        .await
+        .unwrap();
+
+    let record = db.storage.downloads().get(id).await.unwrap().unwrap();
+    assert_eq!(record.max_connections, 3);
+    assert_eq!(record.next_retry_at_ms, Some(1_700_000_000_000));
+    for bad in [0_u32, 17] {
+        let refused = db
+            .storage
+            .downloads()
+            .set_max_connections(id, bad, 12)
+            .await;
+        assert!(
+            matches!(refused, Err(StorageError::InvalidValue { .. })),
+            "{bad}"
+        );
+    }
+    let missing = db
+        .storage
+        .downloads()
+        .set_max_connections(new_id(), 2, 13)
+        .await;
+    assert!(matches!(missing, Err(StorageError::NotFound { .. })));
+    let still = db.storage.downloads().get(id).await.unwrap().unwrap();
+    assert_eq!(still.max_connections, 3, "a refused value changes nothing");
+}

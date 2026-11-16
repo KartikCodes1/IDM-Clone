@@ -9,14 +9,15 @@
 use std::time::Duration;
 
 use forgedm_protocol::DownloadErrorCode;
-use reqwest::header::CONTENT_DISPOSITION;
 use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 use url::Url;
 
-use crate::client::{ClientError, FetchSpec, HttpClient, response_meta};
+use crate::client::{
+    ClientError, FetchSpec, HttpClient, content_disposition_of, response_meta, retry_after_of,
+};
 use crate::engine::StopReason;
-use crate::error::{Failure, TaskStop, failure_from_transfer};
+use crate::error::{Failure, Fault, TaskStop};
 use crate::http::content_range::RangeRequest;
 use crate::http::probe_classify::{ProbeClassification, ProbeResult, classify_probe};
 use crate::http::range_decision::ResponseMeta;
@@ -41,7 +42,7 @@ fn client_stop(err: ClientError) -> TaskStop {
     match err {
         ClientError::Cancelled => TaskStop::Stopped(StopReason::Cancel),
         ClientError::Redirect(redirect) => TaskStop::Fail(Failure::new(redirect.code())),
-        ClientError::Transport(kind) => failure_from_transfer(kind),
+        ClientError::Transport(kind) => TaskStop::Retry(Fault::Transport(kind)),
         ClientError::Build(_) => TaskStop::Fail(Failure::new(DownloadErrorCode::Internal)),
     }
 }
@@ -72,7 +73,8 @@ async fn head(
 /// # Errors
 /// [`TaskStop::Stopped`] when `cancel` fires (the caller substitutes the real reason),
 /// [`TaskStop::NeedsCredentials`] for 401 or 407, `unsupported_content_encoding`,
-/// `range_protocol_violation{reason}`, `http_status{status}` or a transport failure.
+/// `range_protocol_violation{reason}`, and, as [`TaskStop::Retry`] for the caller's retry
+/// loop, a transport failure or an error status.
 pub async fn probe(
     client: &HttpClient,
     url: &Url,
@@ -88,11 +90,8 @@ pub async fn probe(
         .await
         .map_err(client_stop)?;
     let meta = response_meta(&fetched.response);
-    let content_disposition = fetched
-        .response
-        .headers()
-        .get(CONTENT_DISPOSITION)
-        .map(|v| String::from_utf8_lossy(v.as_bytes()).into_owned());
+    let content_disposition = content_disposition_of(&fetched.response);
+    let retry_after = retry_after_of(&fetched.response);
     let final_url = fetched.final_url;
     // Dropping the response closes the connection: the body is never read.
     drop(fetched.response);
@@ -108,7 +107,10 @@ pub async fn probe(
         }
         ProbeClassification::NeedsCredentials => Err(TaskStop::NeedsCredentials),
         ProbeClassification::UrlRejected { status }
-        | ProbeClassification::OtherStatus { status } => Err(Failure::http_status(status).into()),
+        | ProbeClassification::OtherStatus { status } => Err(TaskStop::Retry(Fault::Status {
+            status,
+            retry_after,
+        })),
         ProbeClassification::Violation(violation) => {
             Err(Failure::protocol_violation(violation.reason()).into())
         }

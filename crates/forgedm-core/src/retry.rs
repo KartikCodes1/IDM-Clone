@@ -454,6 +454,13 @@ impl HostState {
         self.halve(now);
     }
 
+    /// Another 429/503 while already cooling down: keep the longer cooldown without halving
+    /// the limit again (one burst of simultaneous throttles is one reduction).
+    pub fn extend_cooldown(&mut self, now: Instant, cooldown: Duration) {
+        let until = now + cooldown.min(RETRY_AFTER_WAIT_MAX);
+        self.cooldown_until = Some(self.cooldown_until.map_or(until, |old| old.max(until)));
+    }
+
     /// A connection was refused at open: halve the limit without a cooldown.
     pub fn on_refused_at_open(&mut self, now: Instant) {
         self.halve(now);

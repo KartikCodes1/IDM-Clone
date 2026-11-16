@@ -12,19 +12,29 @@ use url::Url;
 
 use super::{DownloadTask, Landed, client_stop, internal};
 use crate::checkpoint::StoreCommitter;
-use crate::client::{FetchSpec, response_meta};
-use crate::error::{Failure, TaskStop};
+use crate::client::{FetchSpec, response_meta, retry_after_of};
+use crate::error::{Failure, Fault, TaskStop};
 use crate::http::content_range::RangeRequest;
 use crate::http::range_decision::{RangeDecision, RangedRequest, decide};
 use crate::http::validators::ResumeIdentity;
 use crate::probe::Probed;
 use crate::resume::Continuation;
+use crate::retry::{Phase, TransferErrorKind};
+use crate::transfer::resilience::Verdict;
 use crate::transfer::single::{Plan, Stream, choose_name, stream_body};
 use crate::writer::Writer;
 
 /// Most requests one ranged transfer makes: a server answering one byte at a time must not
 /// keep a download alive forever.
 const MAX_REQUESTS: u32 = 4096;
+
+/// How one attempt of the ranged loop ended.
+enum Attempt {
+    /// Everything up to the total is on its way to disk.
+    Done(Url),
+    /// The accepted body was read; ask for the rest.
+    Partial,
+}
 
 /// What one request tells the loop to do next.
 enum Step {
@@ -96,22 +106,55 @@ impl DownloadTask {
         from: &Continuation,
     ) -> Result<(u64, Url), TaskStop> {
         let if_range = from.identity.if_range();
+        let token = self.ctx.live.stop().token().clone();
         let mut offset = from.committed;
         for _ in 0..MAX_REQUESTS {
-            let (step, response, url) = self.ask(offset, from, if_range.as_deref()).await?;
-            match step {
-                Step::Done => return Ok((offset, url)),
-                Step::Body { start, end_excl } => {
-                    offset = self
-                        .stream_part(response, writer, committer, start, end_excl)
-                        .await?;
-                }
+            if self.res.gate(&token).await.is_err() {
+                return Err(self.ctx.live.stop().stopped());
             }
-            if offset >= from.total {
-                return Ok((offset, url));
+            let before = offset;
+            let attempt = self
+                .attempt(writer, committer, from, if_range.as_deref(), &mut offset)
+                .await;
+            self.res.on_progress(0, offset.saturating_sub(before));
+            match attempt {
+                Ok(Attempt::Done(url)) => return Ok((offset, url)),
+                Ok(Attempt::Partial) => {}
+                Err(TaskStop::Retry(fault)) => {
+                    match self.res.on_fault(Phase::Transfer, 0, fault, &token).await {
+                        Verdict::Retry => {}
+                        Verdict::Cancelled => return Err(self.ctx.live.stop().stopped()),
+                        Verdict::Stop(stop) => return Err(stop),
+                    }
+                }
+                Err(other) => return Err(other),
             }
         }
         Err(Failure::protocol_violation("too_many_partial_responses").into())
+    }
+
+    /// One request from `offset` and the reading of its body. `offset` follows the bytes
+    /// handed to the writer, so a retry after a failure starts exactly where it left off.
+    async fn attempt(
+        &self,
+        writer: &mut Writer,
+        committer: &StoreCommitter,
+        from: &Continuation,
+        if_range: Option<&str>,
+        offset: &mut u64,
+    ) -> Result<Attempt, TaskStop> {
+        let (step, response, url) = self.ask(*offset, from, if_range).await?;
+        let Step::Body { start, end_excl } = step else {
+            return Ok(Attempt::Done(url));
+        };
+        let result = self
+            .stream_part(response, writer, committer, (start, end_excl), offset)
+            .await;
+        result?;
+        if *offset >= from.total {
+            return Ok(Attempt::Done(url));
+        }
+        Ok(Attempt::Partial)
     }
 
     /// Asks for everything from `offset` on and judges the response before anything is read
@@ -146,6 +189,15 @@ impl DownloadTask {
             has_committed_data: offset > 0,
         };
         let decision = decide(&request, &from.identity, &response_meta(&fetched.response));
+        if let RangeDecision::OtherStatus { status } = decision
+            && !matches!(status, 401 | 407)
+        {
+            let retry_after = retry_after_of(&fetched.response);
+            return Err(TaskStop::Retry(Fault::Status {
+                status,
+                retry_after,
+            }));
+        }
         let step = judge(decision)?;
         Ok((step, fetched.response, fetched.final_url))
     }
@@ -156,9 +208,9 @@ impl DownloadTask {
         response: Response,
         writer: &mut Writer,
         committer: &StoreCommitter,
-        start: u64,
-        end_excl: u64,
-    ) -> Result<u64, TaskStop> {
+        (start, end_excl): (u64, u64),
+        reached: &mut u64,
+    ) -> Result<(), TaskStop> {
         let env = Stream {
             live: &self.ctx.live,
             stop: self.ctx.live.stop(),
@@ -167,11 +219,13 @@ impl DownloadTask {
             limit: Some(end_excl),
         };
         self.ctx.live.set_connections(1);
-        let reached = stream_body(response, writer, &env, committer).await?;
-        if reached < end_excl {
-            return Err(Failure::new(DownloadErrorCode::BodyIncomplete).into());
+        self.ctx.live.set_active_ranges(vec![(start, end_excl)]);
+        let end = stream_body(response, writer, &env, committer, reached).await?;
+        if end < end_excl {
+            let eof = TransferErrorKind::PrematureEof;
+            return Err(TaskStop::Retry(Fault::Transport(eof)));
         }
-        Ok(reached)
+        Ok(())
     }
 }
 
@@ -187,10 +241,8 @@ fn judge(decision: RangeDecision) -> Result<Step, TaskStop> {
         RangeDecision::UnsupportedContentEncoding => {
             Err(Failure::new(DownloadErrorCode::UnsupportedContentEncoding).into())
         }
-        RangeDecision::RangeUnsupported => {
-            Err(Failure::protocol_violation("ranges_no_longer_supported").into())
-        }
-        RangeDecision::Reprobe => Err(Failure::protocol_violation("reprobe_needed").into()),
+        RangeDecision::RangeUnsupported => Err(TaskStop::Reprobe("ranges_no_longer_supported")),
+        RangeDecision::Reprobe => Err(TaskStop::Reprobe("reprobe_needed")),
         RangeDecision::Violation(violation) => {
             Err(Failure::protocol_violation(violation.reason()).into())
         }

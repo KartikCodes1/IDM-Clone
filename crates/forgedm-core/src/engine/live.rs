@@ -153,6 +153,7 @@ pub struct LiveDownload {
     committed: AtomicU64,
     total: AtomicU64,
     connections: AtomicU32,
+    active_ranges: Mutex<Vec<(u64, u64)>>,
     estimator: Mutex<Estimator>,
     stop: StopSignal,
     state: Mutex<DownloadState>,
@@ -169,6 +170,7 @@ impl LiveDownload {
             committed: AtomicU64::new(0),
             total: AtomicU64::new(NO_TOTAL),
             connections: AtomicU32::new(0),
+            active_ranges: Mutex::new(Vec::new()),
             estimator: Mutex::new(Estimator::new(Instant::now(), None, 0)),
             stop,
             state: Mutex::new(DownloadState::Queued),
@@ -242,6 +244,14 @@ impl LiveDownload {
         self.connections.store(count, Ordering::Release);
     }
 
+    /// Records the byte ranges connections are fetching right now.
+    pub fn set_active_ranges(&self, ranges: Vec<(u64, u64)>) {
+        *self
+            .active_ranges
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = ranges;
+    }
+
     /// The current numbers without advancing the estimator (what `GetDownload` reports).
     #[must_use]
     pub fn peek(&self) -> ProgressSample {
@@ -277,6 +287,11 @@ impl LiveDownload {
             speed_bps: (speed > 0).then_some(speed),
             eta_ms,
             active_connections: self.connections.load(Ordering::Acquire),
+            active_ranges: self
+                .active_ranges
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .clone(),
         }
     }
 }

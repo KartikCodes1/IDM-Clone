@@ -51,7 +51,11 @@ pub fn summary_of(
 const fn wants_last_error(state: DownloadState) -> bool {
     matches!(
         state,
-        DownloadState::Failed | DownloadState::NeedsCredentials | DownloadState::Paused
+        DownloadState::Failed
+            | DownloadState::NeedsCredentials
+            | DownloadState::NeedsUrlRefresh
+            | DownloadState::RetryWaiting
+            | DownloadState::Paused
     )
 }
 
@@ -125,6 +129,17 @@ fn motw_status(record: &DownloadRecord, events: &[EventRecord]) -> Option<MotwSt
             .and_then(|e| e.code.as_deref())
             .and_then(|code| MotwStatus::ALL.iter().copied().find(|s| s.as_str() == code))
     })
+}
+
+/// Whether a worker is transferring `segment` right now: it has bytes left and one of the
+/// engine's live `[start, end)` ranges (the unfetched part of every owned segment) overlaps
+/// it. The download's state alone says nothing about this.
+fn is_transferring(segment: &SegmentRecord, live_ranges: &[(u64, u64)]) -> bool {
+    let end = segment.end.unwrap_or(u64::MAX);
+    segment.committed < end
+        && live_ranges
+            .iter()
+            .any(|&(from, to)| from < end && to > segment.start)
 }
 
 fn segment_info(segment: &SegmentRecord, active: bool) -> SegmentInfo {
@@ -204,7 +219,8 @@ pub async fn build_detail(
             None
         }
     };
-    let active = holds_active_slot(record.state);
+    let transferring = holds_active_slot(record.state);
+    let ranges = live.map_or(&[][..], |sample| sample.active_ranges.as_slice());
     Ok(DownloadDetail {
         summary: summary_of(&record, &events, live),
         final_url_display,
@@ -215,9 +231,15 @@ pub async fn build_detail(
         },
         checksum: checksum_info(&record, &events),
         length_verified: record.length_verified,
-        segments: segments.iter().map(|s| segment_info(s, active)).collect(),
+        segments: segments
+            .iter()
+            .map(|s| segment_info(s, transferring && is_transferring(s, ranges)))
+            .collect(),
         retry_count: record.retry_count,
-        next_retry_at_ms: record.next_retry_at_ms.and_then(|t| u64::try_from(t).ok()),
+        next_retry_at_ms: record
+            .next_retry_at_ms
+            .filter(|_| record.state == DownloadState::RetryWaiting)
+            .and_then(|t| u64::try_from(t).ok()),
         motw_status: motw_status(&record, &events),
         recent_events: recent_events(&events),
     })
@@ -272,6 +294,46 @@ mod tests {
         assert_eq!(strength(None, false), ValidatorStrength::None);
         assert_eq!(strength(Some(false), true), ValidatorStrength::Weak);
         assert_eq!(strength(Some(true), true), ValidatorStrength::Strong);
+    }
+
+    fn segment(start: u64, end: u64, committed: u64) -> SegmentRecord {
+        SegmentRecord {
+            seg_no: 0,
+            start,
+            end: Some(end),
+            committed,
+            retry_count: 0,
+            updated_at_ms: 0,
+        }
+    }
+
+    #[test]
+    fn only_segments_a_worker_is_transferring_are_active() {
+        const M: u64 = 1024 * 1024;
+        let done = segment(0, 10 * M, 10 * M);
+        let busy = segment(10 * M, 20 * M, 12 * M);
+        let idle = segment(20 * M, 30 * M, 20 * M);
+        // One worker is fetching the unfinished tail of the middle segment.
+        let ranges = [(14 * M, 20 * M)];
+
+        assert!(!is_transferring(&done, &ranges), "finished");
+        assert!(is_transferring(&busy, &ranges), "a worker is on it");
+        assert!(
+            !is_transferring(&idle, &ranges),
+            "unfinished but nobody on it"
+        );
+        assert!(!is_transferring(&busy, &[]), "no worker, not active");
+    }
+
+    #[test]
+    fn a_finished_segment_is_not_active_even_if_a_stale_range_overlaps() {
+        let done = segment(0, 100, 100);
+        assert!(!is_transferring(&done, &[(0, 100)]));
+        let open_ended = SegmentRecord {
+            end: None,
+            ..segment(0, 0, 40)
+        };
+        assert!(is_transferring(&open_ended, &[(40, u64::MAX)]));
     }
 
     #[test]

@@ -12,13 +12,14 @@ use std::time::Duration;
 use forgedm_platform::motw::MotwService;
 use forgedm_protocol::DownloadState;
 use tokio::sync::{mpsc, oneshot};
-use tokio::task::JoinHandle;
-use tokio::time::{Instant, MissedTickBehavior, interval, timeout};
+use tokio::task::{JoinHandle, JoinSet};
+use tokio::time::{Instant, MissedTickBehavior, interval, sleep, timeout};
 use tokio_util::task::TaskTracker;
 use uuid::Uuid;
 
 mod cleanup;
 mod control;
+pub mod hosts;
 mod live;
 mod task;
 
@@ -29,11 +30,14 @@ use crate::client::HttpClient;
 use crate::error::EngineError;
 use crate::ports::{
     DownloadStore, EngineEvent, EngineEventSink, NewJob, ProgressSample, StoreEvent, StoredJob,
-    StoredProgress,
+    StoredProgress, unix_ms,
 };
 use crate::progress::TICK;
 use crate::state::{Command, transition};
+use crate::transfer::resilience::RetryEnv;
 use crate::transfer::segmented::ConnectionCaps;
+use forgedm_protocol::{MAX_CONNECTIONS, MIN_CONNECTIONS};
+use hosts::HostRegistry;
 use task::{DownloadTask, TaskCtx};
 
 /// Commands the dispatch channel holds (implementation constant, ARCHITECTURE 4.1).
@@ -276,8 +280,18 @@ impl EngineHandle {
 /// called or every handle is dropped.
 #[must_use]
 pub fn start(config: EngineConfig, deps: EngineDeps) -> EngineHandle {
+    start_with(config, deps, RetryEnv::default())
+}
+
+/// [`start`] with an explicit retry environment (the sleeper that backoff waits go through
+/// and the jitter seed), so tests can run retries without real waiting.
+#[must_use]
+pub fn start_with(config: EngineConfig, deps: EngineDeps, retry: RetryEnv) -> EngineHandle {
     let (tx, rx) = mpsc::channel(DISPATCH_CAPACITY);
     let (finished_tx, finished_rx) = mpsc::unbounded_channel();
+    // Unbounded on purpose: one small message per armed retry timer, never more than one per
+    // download at a time in practice, and the sender must never block a timer task.
+    let (due_tx, due_rx) = mpsc::unbounded_channel();
     let registry = Arc::new(Registry::default());
     let ticker = spawn_ticker(Arc::clone(&registry), Arc::clone(&deps.sink));
     let actor = Actor {
@@ -290,8 +304,12 @@ pub fn start(config: EngineConfig, deps: EngineDeps) -> EngineHandle {
         finished_tx,
         closing: false,
         caps: Arc::new(ConnectionCaps::default()),
+        hosts: Arc::new(HostRegistry::default()),
+        retry,
+        due_tx,
+        timers: JoinSet::new(),
     };
-    tokio::spawn(actor.run(rx, finished_rx, ticker));
+    tokio::spawn(actor.run(rx, finished_rx, due_rx, ticker));
     EngineHandle {
         tx,
         registry,
@@ -316,6 +334,19 @@ fn spawn_ticker(registry: Arc<Registry>, sink: Arc<dyn EngineEventSink>) -> Join
     })
 }
 
+/// A retry timer that fired; `attempt` counts storage-error re-arms.
+struct Due {
+    id: Uuid,
+    attempt: u32,
+}
+
+/// Bounded re-arms of a retry timer after a storage error.
+const RETRY_DUE_ATTEMPTS: u32 = 5;
+/// Base delay of those re-arms (multiplied by the attempt number).
+const RETRY_DUE_BACKOFF_MS: i64 = 1_000;
+/// Wait used when the stored retry time cannot be read.
+const RETRY_FALLBACK_MS: i64 = 30_000;
+
 struct Actor {
     config: EngineConfig,
     deps: EngineDeps,
@@ -326,6 +357,10 @@ struct Actor {
     finished_tx: mpsc::UnboundedSender<Uuid>,
     closing: bool,
     caps: Arc<ConnectionCaps>,
+    hosts: Arc<HostRegistry>,
+    retry: RetryEnv,
+    due_tx: mpsc::UnboundedSender<Due>,
+    timers: JoinSet<()>,
 }
 
 impl Actor {
@@ -333,6 +368,7 @@ impl Actor {
         mut self,
         mut rx: mpsc::Receiver<Cmd>,
         mut finished: mpsc::UnboundedReceiver<Uuid>,
+        mut due: mpsc::UnboundedReceiver<Due>,
         ticker: JoinHandle<()>,
     ) {
         loop {
@@ -345,10 +381,12 @@ impl Actor {
                     }
                     None => break,
                 },
-                Some(_id) = finished.recv() => {
+                Some(id) = finished.recv() => {
                     self.active = self.active.saturating_sub(1);
+                    self.arm_if_waiting(id).await;
                     self.admit().await;
                 }
+                Some(due) = due.recv() => self.retry_due(due).await,
             }
         }
         ticker.abort();
@@ -449,6 +487,11 @@ impl Actor {
                         continue;
                     }
                 }
+                DownloadState::RetryWaiting => {
+                    let at_ms = self.deps.store.next_retry_at(job.id).await?;
+                    self.arm_timer(job.id, at_ms.unwrap_or(0));
+                    continue;
+                }
                 _ => continue,
             }
             queued += 1;
@@ -489,8 +532,117 @@ impl Actor {
             .load(id)
             .await?
             .ok_or(EngineError::NotFound)?;
+        // Persist first: a cap that was not stored would silently revert at the next start.
+        let value = value.clamp(MIN_CONNECTIONS, MAX_CONNECTIONS);
+        self.deps.store.set_max_connections(id, value).await?;
         self.caps.set(id, value);
         Ok(self.caps.cap_for(id, value).get())
+    }
+
+    /// After a task ended: when it parked the download in `retry_waiting`, arms the timer
+    /// that brings it back.
+    async fn arm_if_waiting(&mut self, id: Uuid) {
+        let job = match self.deps.store.load(id).await {
+            Ok(Some(job)) => job,
+            Ok(None) => return,
+            Err(err) => {
+                tracing::error!(error = %err, "could not read a finished download to arm its retry");
+                return;
+            }
+        };
+        if job.state != DownloadState::RetryWaiting {
+            return;
+        }
+        let at_ms = match self.deps.store.next_retry_at(id).await {
+            Ok(at_ms) => at_ms.unwrap_or(0),
+            Err(err) => {
+                tracing::error!(error = %err, "could not read the retry time; using a fallback");
+                unix_ms().saturating_add(RETRY_FALLBACK_MS)
+            }
+        };
+        self.arm_timer(id, at_ms);
+    }
+
+    /// Sends `id` to the engine again at `at_ms` (epoch milliseconds; past means now).
+    fn arm_timer(&mut self, id: Uuid, at_ms: i64) {
+        self.arm_timer_attempt(id, at_ms, 0);
+    }
+
+    fn arm_timer_attempt(&mut self, id: Uuid, at_ms: i64, attempt: u32) {
+        // Reap the timers that already fired so the set stays small.
+        while self.timers.try_join_next().is_some() {}
+        let left_ms = u64::try_from(at_ms.saturating_sub(unix_ms())).unwrap_or(0);
+        let due = self.due_tx.clone();
+        self.timers.spawn(async move {
+            sleep(Duration::from_millis(left_ms)).await;
+            // The receiver only goes away when the engine stops; nothing is left to wake then.
+            let _ = due.send(Due { id, attempt });
+        });
+    }
+
+    /// Re-arms a timer after a storage error, with a growing delay, up to
+    /// [`RETRY_DUE_ATTEMPTS`] times.
+    fn rearm_after_error(&mut self, due: Due) {
+        let attempt = due.attempt + 1;
+        if attempt > RETRY_DUE_ATTEMPTS {
+            tracing::error!(
+                id = %due.id,
+                "gave up requeueing a download whose retry is due; resume it or restart the agent"
+            );
+            return;
+        }
+        let delay = RETRY_DUE_BACKOFF_MS.saturating_mul(i64::from(attempt));
+        self.arm_timer_attempt(due.id, unix_ms().saturating_add(delay), attempt);
+    }
+
+    /// The retry timer of `id` fired: `retry_waiting -> queued` (A.6 timer edge), then admit.
+    /// A download that left `retry_waiting` in the meantime (resumed, cancelled) is left alone,
+    /// and so is one that parked again with a later due time (a stale timer fired).
+    async fn retry_due(&mut self, due: Due) {
+        if self.closing {
+            return;
+        }
+        let id = due.id;
+        let mut job = match self.deps.store.load(id).await {
+            Ok(Some(job)) => job,
+            Ok(None) => return,
+            Err(err) => {
+                tracing::warn!(error = %err, "could not read a download whose retry is due");
+                self.rearm_after_error(due);
+                return;
+            }
+        };
+        let Ok(step) = transition(job.state, Command::TimerDue) else {
+            return;
+        };
+        match self.deps.store.next_retry_at(id).await {
+            Ok(Some(at_ms)) if at_ms > unix_ms() => {
+                self.arm_timer(id, at_ms);
+                return;
+            }
+            Ok(_) => {}
+            Err(err) => {
+                tracing::warn!(error = %err, "could not read the retry time of a due download");
+                self.rearm_after_error(due);
+                return;
+            }
+        }
+        let event = StoreEvent::now("retry_due");
+        let moved = self
+            .deps
+            .store
+            .transition(id, job.state, step.to, None, event)
+            .await;
+        if let Err(err) = moved {
+            tracing::warn!(error = %err, "could not requeue a download whose retry is due");
+            self.rearm_after_error(due);
+            return;
+        }
+        job.state = step.to;
+        job.state_reason = None;
+        self.deps.sink.emit(EngineEvent::Changed { id }).await;
+        self.queue.push_back(job);
+        self.admit().await;
     }
 
     /// Starts queued downloads while slots are free.
@@ -515,6 +667,8 @@ impl Actor {
             motw: Arc::clone(&self.deps.motw),
             live: Arc::clone(&live),
             cap: self.caps.cap_for(id, job.max_connections),
+            hosts: Arc::clone(&self.hosts),
+            retry: self.retry.clone(),
         };
         let supervisor = Supervisor {
             store: Arc::clone(&self.deps.store),

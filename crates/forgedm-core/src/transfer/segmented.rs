@@ -23,9 +23,10 @@ use tokio_util::sync::CancellationToken;
 use url::Url;
 use uuid::Uuid;
 
+use super::resilience::Resilience;
 use super::segment_table::{CONNECTION_STAGGER, SegmentTable};
 use super::single::{FREE_SPACE_RECHECK, ensure_free_space, writer_stop};
-use super::worker::{Shared, SharedTable, WorkerEnd, run_worker};
+use super::worker::{Shared, SharedInit, SharedTable, WorkerEnd, run_worker};
 use crate::checkpoint::{commit_segments, flush_then_commit_segments};
 use crate::client::HttpClient;
 use crate::engine::LiveDownload;
@@ -142,6 +143,8 @@ pub struct SegmentedTransfer {
     pub cap: Arc<ConnectionCap>,
     /// Time between checkpoints.
     pub checkpoint_every: Duration,
+    /// Retry decisions and the host cooldown of this download.
+    pub res: Arc<Resilience>,
 }
 
 impl SegmentedTransfer {
@@ -199,20 +202,22 @@ impl SegmentedTransfer {
         writer: &mut Writer,
     ) -> Result<Option<Url>, TaskStop> {
         let stop = self.live.stop();
-        let shared = Arc::new(Shared::new(
-            Arc::clone(table),
-            writer.handle(),
-            Arc::clone(&self.live),
-            self.client.clone(),
-            self.url.clone(),
-            self.identity.clone(),
-            stop.token().child_token(),
-        ));
+        let shared = Arc::new(Shared::new(SharedInit {
+            table: Arc::clone(table),
+            writer: writer.handle(),
+            live: Arc::clone(&self.live),
+            client: self.client.clone(),
+            url: self.url.clone(),
+            identity: self.identity.clone(),
+            res: Arc::clone(&self.res),
+            halt: stop.token().child_token(),
+        }));
         let mut pool = Pool::new(Arc::clone(&shared));
         let result = self.event_loop(&shared, &mut pool, writer).await;
         shared.halt.cancel();
         pool.drain().await;
         self.live.set_connections(0);
+        self.live.set_active_ranges(Vec::new());
         result.map(|()| shared.final_url())
     }
 
@@ -229,13 +234,16 @@ impl SegmentedTransfer {
         let mut next_checkpoint = Instant::now() + self.checkpoint_every;
         let mut next_space_check = shared.lock().accepted_bytes() + FREE_SPACE_RECHECK;
         loop {
-            pool.rebalance(self.cap.get());
+            // Every byte handed to the writer means the transfer is done: workers still in
+            // their connection stagger must not hold completion back.
+            if all_sent(shared) {
+                return Ok(());
+            }
+            pool.rebalance(self.cap.get().min(self.res.host_limit()));
             self.live
                 .set_connections(u32::try_from(pool.alive()).unwrap_or(u32::MAX));
+            self.live.set_active_ranges(active_ranges(shared));
             if pool.is_empty() {
-                if shared.lock().is_complete() {
-                    return Ok(());
-                }
                 tracing::error!("no worker is running and work remains");
                 return Err(Failure::new(DownloadErrorCode::Internal).into());
             }
@@ -274,6 +282,23 @@ impl SegmentedTransfer {
         ensure_free_space(&self.dir, total.saturating_sub(accepted))?;
         Ok(accepted.saturating_add(FREE_SPACE_RECHECK))
     }
+}
+
+/// Whether every byte of the file has been handed to the writer.
+fn all_sent(shared: &Shared) -> bool {
+    let table = shared.lock();
+    table.accepted_bytes() >= table.total()
+}
+
+/// The unfetched ranges workers own right now (what is being transferred).
+fn active_ranges(shared: &Shared) -> Vec<(u64, u64)> {
+    let table = shared.lock();
+    table
+        .segments()
+        .iter()
+        .filter(|s| s.owner.is_some() && s.claim < s.end)
+        .map(|s| (s.claim, s.end))
+        .collect()
 }
 
 /// A running worker as the supervisor sees it.

@@ -4,6 +4,7 @@
 //! Messages are generic: they never contain URLs, paths or other request values.
 
 use std::io;
+use std::time::Duration;
 
 use forgedm_platform::PlatformError;
 use forgedm_platform::fs::{IoClass, classify_io};
@@ -136,6 +137,63 @@ pub enum TaskStop {
     PauseFor(DownloadErrorCode),
     /// Stopped on request: see [`StopReason`](crate::engine::StopReason).
     Stopped(crate::engine::StopReason),
+    /// One attempt failed. The retry loop of the phase that made the attempt decides (back
+    /// off and retry, cool the host down, re-resolve, or give up). A fault that reaches the
+    /// task's settle step unhandled is finalised with [`Fault::into_stop`].
+    Retry(Fault),
+    /// Park in `retry_waiting` until `at_ms` (epoch milliseconds): the server asked for a
+    /// longer wait than the inline limit (`rate_limited`).
+    RetryWait {
+        /// When the retry timer fires.
+        at_ms: i64,
+    },
+    /// 403/404/410 during transfer persisted after one re-resolve: ends in
+    /// `needs_url_refresh`.
+    NeedsUrlRefresh,
+    /// The server stopped honouring the range contract: re-probe once and re-plan, else
+    /// fail with `range_protocol_violation{reason}`.
+    Reprobe(&'static str),
+}
+
+/// A failed network attempt, before the retry rules have judged it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Fault {
+    /// A transport or local failure already reduced by [`TransferErrorKind`].
+    Transport(TransferErrorKind),
+    /// An HTTP error status, with the parsed `Retry-After` when the server sent one.
+    Status {
+        /// The status code.
+        status: u16,
+        /// The honoured `Retry-After`, used for 429 and 503 only.
+        retry_after: Option<Duration>,
+    },
+}
+
+impl Fault {
+    /// The final stop for a fault no retry loop handled (non-retryable phases, exhausted
+    /// limited retries).
+    #[must_use]
+    pub fn into_stop(self) -> TaskStop {
+        match self {
+            Self::Transport(kind) => failure_from_transfer(kind),
+            Self::Status {
+                status: 401 | 407, ..
+            } => TaskStop::NeedsCredentials,
+            Self::Status { status, .. } => Failure::http_status(status).into(),
+        }
+    }
+}
+
+impl TaskStop {
+    /// Resolves a pending [`TaskStop::Retry`] into its final stop; every other stop is
+    /// returned as is.
+    #[must_use]
+    pub fn into_final(self) -> Self {
+        match self {
+            Self::Retry(fault) => fault.into_stop(),
+            other => other,
+        }
+    }
 }
 
 impl From<Failure> for TaskStop {
@@ -164,7 +222,9 @@ pub fn failure_from_transfer(kind: TransferErrorKind) -> TaskStop {
         K::RedirectLoop => C::RedirectLoop,
         K::RedirectDowngrade => C::RedirectDowngrade,
         K::RedirectBlocked => C::RedirectBlocked,
-        K::MalformedFraming => C::RangeProtocolViolation,
+        K::MalformedFraming => {
+            return TaskStop::Fail(Failure::protocol_violation("malformed_response"));
+        }
     };
     TaskStop::Fail(Failure::new(code))
 }

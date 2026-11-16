@@ -31,7 +31,13 @@ const PAGE: u32 = 500;
 /// Most events read back when looking for the checksum or the last failure.
 const EVENT_SCAN: u32 = 500;
 /// Event kinds whose `detail_json` is a serialised [`DownloadError`].
-const FAILURE_KINDS: [&str; 3] = ["failed", "needs_credentials", "paused"];
+const FAILURE_KINDS: [&str; 5] = [
+    "failed",
+    "needs_credentials",
+    "needs_url_refresh",
+    "retry_waiting",
+    "paused",
+];
 
 /// Maps a storage failure onto the port's error type.
 fn map_error(err: StorageError) -> StoreError {
@@ -244,7 +250,11 @@ impl DownloadStore for StorageStore {
 
     fn startup_work(&self) -> StoreFuture<'_, Vec<StoredJob>> {
         Box::pin(async move {
-            let wanted = [DownloadState::Queued, DownloadState::Interrupted];
+            let wanted = [
+                DownloadState::Queued,
+                DownloadState::Interrupted,
+                DownloadState::RetryWaiting,
+            ];
             let mut records = Vec::new();
             loop {
                 let offset = u32::try_from(records.len()).unwrap_or(u32::MAX);
@@ -407,6 +417,33 @@ impl DownloadStore for StorageStore {
                 }
             }
             Ok(())
+        })
+    }
+
+    fn set_max_connections(&self, id: Uuid, value: u32) -> StoreFuture<'_, ()> {
+        Box::pin(async move {
+            self.storage
+                .downloads()
+                .set_max_connections(id, value, unix_ms())
+                .await
+                .map_err(map_error)
+        })
+    }
+
+    fn schedule_retry(&self, id: Uuid, at_ms: i64) -> StoreFuture<'_, ()> {
+        Box::pin(async move {
+            self.storage
+                .downloads()
+                .set_next_retry_at(id, at_ms, unix_ms())
+                .await
+                .map_err(map_error)
+        })
+    }
+
+    fn next_retry_at(&self, id: Uuid) -> StoreFuture<'_, Option<i64>> {
+        Box::pin(async move {
+            let record = self.storage.downloads().get(id).await.map_err(map_error)?;
+            Ok(record.and_then(|r| r.next_retry_at_ms))
         })
     }
 

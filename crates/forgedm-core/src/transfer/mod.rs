@@ -15,6 +15,7 @@ use crate::error::{Failure, TaskStop, stop_from_io};
 use crate::hash::{HashError, sha256_file};
 
 pub mod prealloc;
+pub mod resilience;
 pub mod segment_table;
 pub mod segmented;
 pub mod single;

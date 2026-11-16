@@ -152,6 +152,67 @@ impl Downloads {
         Ok(())
     }
 
+    /// Persist the per-download connection cap (`1..=16`), so a limit changed at runtime
+    /// survives an agent restart.
+    ///
+    /// # Errors
+    /// [`StorageError::InvalidValue`] outside `1..=16` (nothing changes),
+    /// [`StorageError::NotFound`] or a database error.
+    pub async fn set_max_connections(
+        &self,
+        id: Uuid,
+        value: u32,
+        at_ms: i64,
+    ) -> Result<(), StorageError> {
+        if !(MIN_CONNECTIONS..=MAX_CONNECTIONS).contains(&value) {
+            return Err(StorageError::InvalidValue {
+                field: "max_connections",
+            });
+        }
+        let mut tx = self.storage.begin_write().await?;
+        let changed = sqlx::query(
+            "UPDATE downloads SET max_connections = ?2, updated_at_ms = ?3 WHERE id = ?1",
+        )
+        .bind(id_text(id))
+        .bind(i64::from(value))
+        .bind(at_ms)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+        if changed != 1 {
+            return Err(StorageError::NotFound { id });
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Record when a `retry_waiting` download is due (epoch milliseconds).
+    ///
+    /// # Errors
+    /// [`StorageError::NotFound`] or a database error.
+    pub async fn set_next_retry_at(
+        &self,
+        id: Uuid,
+        next_retry_at_ms: i64,
+        at_ms: i64,
+    ) -> Result<(), StorageError> {
+        let mut tx = self.storage.begin_write().await?;
+        let changed = sqlx::query(
+            "UPDATE downloads SET next_retry_at_ms = ?2, updated_at_ms = ?3 WHERE id = ?1",
+        )
+        .bind(id_text(id))
+        .bind(next_retry_at_ms)
+        .bind(at_ms)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+        if changed != 1 {
+            return Err(StorageError::NotFound { id });
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
     /// Load one download (never unseals).
     ///
     /// # Errors

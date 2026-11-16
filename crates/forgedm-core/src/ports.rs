@@ -239,6 +239,21 @@ pub trait DownloadStore: Send + Sync + 'static {
     fn reset_progress(&self, id: Uuid) -> StoreFuture<'_, ()>;
     /// Deletes the download (its segments and events go with it).
     fn remove(&self, id: Uuid) -> StoreFuture<'_, ()>;
+    /// Persists the per-download connection cap (`1..=16`) so it survives a restart. The
+    /// default keeps nothing: a store that cannot persist it forgets live changes.
+    fn set_max_connections(&self, _id: Uuid, _value: u32) -> StoreFuture<'_, ()> {
+        Box::pin(async { Ok(()) })
+    }
+    /// Records when a `retry_waiting` download is due (epoch milliseconds), durable before
+    /// the state change that parks it. The default keeps nothing: the download is then
+    /// retried at the next start.
+    fn schedule_retry(&self, _id: Uuid, _at_ms: i64) -> StoreFuture<'_, ()> {
+        Box::pin(async { Ok(()) })
+    }
+    /// When the `retry_waiting` download `id` is due, if that was recorded.
+    fn next_retry_at(&self, _id: Uuid) -> StoreFuture<'_, Option<i64>> {
+        Box::pin(async { Ok(None) })
+    }
     /// Persists the rename candidate about to be tried (durable before the attempt).
     fn set_finalize_target(&self, id: Uuid, target: &Path) -> StoreFuture<'_, ()>;
     /// Moves `finalizing` to `completed` and records the result.
@@ -270,6 +285,9 @@ pub struct ProgressSample {
     pub eta_ms: Option<u64>,
     /// Open connections.
     pub active_connections: u32,
+    /// The byte ranges `[start, end)` that connections are fetching right now. A segment
+    /// that overlaps none of them is not being transferred, whatever the download's state.
+    pub active_ranges: Vec<(u64, u64)>,
 }
 
 /// What the engine tells the outside world. Every event follows the change it describes

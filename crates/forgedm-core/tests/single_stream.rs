@@ -4,6 +4,7 @@
 #![allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)] // test code
 
 #[path = "../src/testing.rs"]
+#[allow(dead_code)] // each test file uses part of the shared fakes
 mod testing;
 
 use std::path::{Path, PathBuf};
@@ -204,7 +205,11 @@ async fn unknown_length_completes_length_unverified() {
 async fn drop_after_with_cl_is_incomplete_not_completed() {
     let h = Harness::new().await;
 
-    let (id, event) = h.run(&h.url("/f/22/400000?drop_after=100000")).await;
+    // `ranges=0`: a server that cannot resume. (With ranges the engine now retries from the
+    // claim and completes; that is covered by `mid_chunk_drop_resumes_from_claim_no_overlap`.)
+    let (id, event) = h
+        .run(&h.url("/f/22/400000?drop_after=100000&ranges=0"))
+        .await;
 
     assert_eq!(failed_code(&event), DownloadErrorCode::BodyIncomplete);
     assert_eq!(h.store.state(id), Some(DownloadState::Failed));

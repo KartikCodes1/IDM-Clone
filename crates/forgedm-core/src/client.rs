@@ -6,6 +6,7 @@
 
 use std::error::Error as StdError;
 use std::io;
+use std::net::SocketAddr;
 use std::time::Duration;
 
 use reqwest::header::{
@@ -19,7 +20,7 @@ use url::Url;
 use crate::http::content_range::RangeRequest;
 use crate::http::range_decision::ResponseMeta;
 use crate::http::redirect::{HopDecision, RedirectError, RedirectState, next_hop};
-use crate::retry::TransferErrorKind;
+use crate::retry::{TransferErrorKind, parse_retry_after};
 
 /// Connect timeout (A.9).
 pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
@@ -108,6 +109,33 @@ impl FetchSpec {
     }
 }
 
+/// Client settings beyond the proxy mode. The defaults are the A.9 values; the overrides
+/// exist so tests can use short timeouts and fixed name resolution.
+#[derive(Debug, Clone)]
+pub struct ClientOptions {
+    /// Where proxy settings come from.
+    pub proxy: ProxyMode,
+    /// Connect timeout.
+    pub connect_timeout: Duration,
+    /// Read (stall) timeout.
+    pub read_timeout: Duration,
+    /// Fixed name resolutions (`host` to address), bypassing DNS for those names.
+    pub resolve: Vec<(String, SocketAddr)>,
+}
+
+impl ClientOptions {
+    /// The A.9 timeouts, no fixed resolutions.
+    #[must_use]
+    pub const fn new(proxy: ProxyMode) -> Self {
+        Self {
+            proxy,
+            connect_timeout: CONNECT_TIMEOUT,
+            read_timeout: READ_TIMEOUT,
+            resolve: Vec::new(),
+        }
+    }
+}
+
 /// A response after redirects.
 #[derive(Debug)]
 pub struct Fetched {
@@ -138,7 +166,15 @@ impl HttpClient {
     /// # Errors
     /// [`ClientError::Build`] when the TLS backend cannot initialise.
     pub fn new(proxy: ProxyMode) -> Result<Self, ClientError> {
-        let builder = Client::builder()
+        Self::with_options(&ClientOptions::new(proxy))
+    }
+
+    /// Builds the client per ADR-007 with `options`.
+    ///
+    /// # Errors
+    /// [`ClientError::Build`] when the TLS backend cannot initialise.
+    pub fn with_options(options: &ClientOptions) -> Result<Self, ClientError> {
+        let mut builder = Client::builder()
             .user_agent(USER_AGENT)
             .default_headers(default_headers())
             .http1_only()
@@ -148,18 +184,23 @@ impl HttpClient {
             .no_zstd()
             .redirect(redirect::Policy::none())
             .referer(false)
-            .connect_timeout(CONNECT_TIMEOUT)
-            .read_timeout(READ_TIMEOUT)
+            .connect_timeout(options.connect_timeout)
+            .read_timeout(options.read_timeout)
             .pool_idle_timeout(POOL_IDLE_TIMEOUT)
             .pool_max_idle_per_host(POOL_MAX_IDLE_PER_HOST)
             .http1_max_headers(MAX_RESPONSE_HEADERS)
             .tls_backend_rustls();
-        let builder = match proxy {
+        for (host, addr) in &options.resolve {
+            builder = builder.resolve(host, *addr);
+        }
+        let builder = match options.proxy {
             ProxyMode::System => builder,
             ProxyMode::None => builder.no_proxy(),
         };
         Ok(Self {
-            inner: builder.build().map_err(ClientError::Build)?,
+            inner: builder
+                .build()
+                .map_err(|e| ClientError::Build(e.without_url()))?,
         })
     }
 
@@ -231,6 +272,28 @@ impl HttpClient {
     }
 }
 
+/// The `Retry-After` of `response`, as a delay (an HTTP-date is read against the response's
+/// own `Date`). `None` when absent or unusable.
+#[must_use]
+pub fn retry_after_of(response: &Response) -> Option<Duration> {
+    let headers = response.headers();
+    let value = headers.get(reqwest::header::RETRY_AFTER)?.to_str().ok()?;
+    let date = headers
+        .get(reqwest::header::DATE)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| httpdate::parse_http_date(v).ok());
+    parse_retry_after(value, date)
+}
+
+/// The raw `Content-Disposition` of `response`. [`crate::naming`] ignores values above 4 KiB.
+#[must_use]
+pub fn content_disposition_of(response: &Response) -> Option<String> {
+    response
+        .headers()
+        .get(reqwest::header::CONTENT_DISPOSITION)
+        .map(|v| String::from_utf8_lossy(v.as_bytes()).into_owned())
+}
+
 /// The parts of `response` the range and probe decisions read.
 #[must_use]
 pub fn response_meta(response: &Response) -> ResponseMeta {
@@ -272,7 +335,14 @@ pub fn response_meta(response: &Response) -> ResponseMeta {
 pub fn classify_reqwest(err: &reqwest::Error) -> TransferErrorKind {
     let io_error = io_in_chain(err);
     if let Some(kind) = io_error.and_then(classify_io_error) {
+        if err.is_connect() && kind == TransferErrorKind::PrematureEof {
+            // A connection that ends while still connecting ended in the TLS handshake.
+            return TransferErrorKind::Tls;
+        }
         return kind;
+    }
+    if err.is_connect() && io_error.is_some_and(is_wrapped_tls_error) {
+        return TransferErrorKind::Tls;
     }
     if err.is_timeout() {
         return if err.is_connect() {
@@ -291,6 +361,13 @@ pub fn classify_reqwest(err: &reqwest::Error) -> TransferErrorKind {
         return TransferErrorKind::PrematureEof;
     }
     TransferErrorKind::MalformedFraming
+}
+
+/// rustls reports certificate and handshake failures wrapped as an `io::Error` of kind
+/// `Other` carrying the TLS error. Plain-text connects never produce one, so in the connect
+/// phase it is a TLS failure (this crate cannot name the rustls error type to downcast).
+fn is_wrapped_tls_error(err: &io::Error) -> bool {
+    err.kind() == io::ErrorKind::Other && err.get_ref().is_some()
 }
 
 fn io_in_chain<'a>(err: &'a (dyn StdError + 'static)) -> Option<&'a io::Error> {
@@ -346,6 +423,18 @@ mod tests {
         );
         let invalid = io::Error::from(io::ErrorKind::InvalidData);
         assert_eq!(classify_io_error(&invalid), Some(TransferErrorKind::Tls));
+    }
+
+    #[test]
+    fn a_wrapped_tls_error_is_told_from_a_plain_other_error() {
+        let wrapped = io::Error::other(io::Error::from(io::ErrorKind::InvalidInput));
+        assert!(is_wrapped_tls_error(&wrapped));
+        assert!(!is_wrapped_tls_error(&io::Error::from(
+            io::ErrorKind::Other
+        )));
+        assert!(!is_wrapped_tls_error(&io::Error::from(
+            io::ErrorKind::ConnectionRefused
+        )));
     }
 
     #[test]

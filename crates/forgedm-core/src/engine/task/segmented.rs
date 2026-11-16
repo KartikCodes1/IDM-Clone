@@ -110,6 +110,7 @@ impl DownloadTask {
             dir: self.job.target_dir.clone(),
             cap: Arc::clone(&self.ctx.cap),
             checkpoint_every: CHECKPOINT_INTERVAL,
+            res: Arc::clone(&self.res),
         };
         let final_url = transfer.run(table, writer).await?;
         clear_sparse(&sparse_handle);

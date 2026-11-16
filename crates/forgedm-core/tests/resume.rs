@@ -4,6 +4,7 @@
 #![allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)] // test code
 
 #[path = "../src/testing.rs"]
+#[allow(dead_code)] // each test file uses part of the shared fakes
 mod testing;
 
 use std::path::PathBuf;

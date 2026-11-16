@@ -21,7 +21,7 @@ use uuid::Uuid;
 use crate::checkpoint::flush_then_commit;
 use crate::client::classify_reqwest;
 use crate::engine::{LiveDownload, StopSignal};
-use crate::error::{Failure, TaskStop, failure_from_transfer, stop_from_class, stop_from_platform};
+use crate::error::{Failure, Fault, TaskStop, stop_from_class, stop_from_platform};
 use crate::http::range_decision::{ResponseMeta, parse_content_length};
 use crate::http::validators::{EntityTag, Validators, last_modified_is_strong};
 use crate::naming::{self, PART_SUFFIX_UTF16, sanitize_opt};
@@ -267,19 +267,22 @@ pub trait Checkpointer: Send + Sync {
 /// Streams `response` into `writer`: accepted bytes are counted as they arrive, a flush and
 /// checkpoint (see [`flush_then_commit`]) run every [`CHECKPOINT_INTERVAL`], and the loop
 /// stops promptly on a stop request. Returns the absolute offset reached (`start` plus the
-/// bytes received).
+/// bytes received). `reached` is kept current while streaming, so after a failure the caller
+/// knows where the next request must start.
 ///
 /// # Errors
-/// A network failure classified through the retry rules, a writer failure, a pause for a
-/// full disk, `size_mismatch` when the server sends more than it declared, or
+/// A network failure as [`TaskStop::Retry`] for the caller's retry loop, a writer failure, a
+/// pause for a full disk, `size_mismatch` when the server sends more than it declared, or
 /// [`TaskStop::Stopped`].
 pub async fn stream_body(
     mut response: Response,
     writer: &mut Writer,
     env: &Stream<'_>,
     checkpointer: &dyn Checkpointer,
+    reached: &mut u64,
 ) -> Result<u64, TaskStop> {
     let mut offset = env.start;
+    *reached = offset;
     let mut last_checkpoint = Instant::now();
     let mut next_space_check = env.start.saturating_add(FREE_SPACE_RECHECK);
     loop {
@@ -291,13 +294,14 @@ pub async fn stream_body(
         let bytes = match chunk {
             Ok(Some(bytes)) => bytes,
             Ok(None) => return Ok(offset),
-            Err(err) => return Err(failure_from_transfer(classify_reqwest(&err))),
+            Err(err) => return Err(TaskStop::Retry(Fault::Transport(classify_reqwest(&err)))),
         };
         writer
             .write(offset, &bytes)
             .await
             .map_err(|e| writer_stop(&e))?;
         offset += bytes.len() as u64;
+        *reached = offset;
         env.live.set_accepted(offset);
         if env.limit.is_some_and(|t| offset > t) {
             return Err(Failure::new(DownloadErrorCode::SizeMismatch).into());

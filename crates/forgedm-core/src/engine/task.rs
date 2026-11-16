@@ -19,7 +19,7 @@ use forgedm_platform::PlatformError;
 use forgedm_platform::motw::MotwService;
 use forgedm_protocol::{DownloadErrorCode, DownloadState, MotwStatus, TransferMode};
 use reqwest::Response;
-use reqwest::header::CONTENT_DISPOSITION;
+use tokio_util::sync::CancellationToken;
 use url::Url;
 
 mod ranged;
@@ -28,18 +28,23 @@ mod settle;
 
 use super::REASON_RESTART_FROM_ZERO;
 use super::cleanup::delete_stale_part;
+use super::hosts::HostRegistry;
 use super::live::{LiveDownload, StopReason};
 use crate::checkpoint::{StoreCommitter, flush_then_commit};
-use crate::client::{ClientError, HttpClient, response_meta};
-use crate::error::{Failure, TaskStop, failure_from_transfer, stop_from_store};
+use crate::client::{
+    ClientError, HttpClient, content_disposition_of, response_meta, retry_after_of,
+};
+use crate::error::{Failure, Fault, TaskStop, stop_from_store};
 use crate::finalize::{Finalized, finalize};
 use crate::ports::{DownloadStore, EngineEvent, EngineEventSink, StoreEvent, StoredJob};
 use crate::probe::{Probed, probe};
 use crate::resume::{
     Continuation, RestartReason, ResumePlan, is_resumable_mode, open_valid_part, plan_resume,
 };
+use crate::retry::Phase;
 use crate::state::{Command, transition};
 use crate::transfer::prealloc::{open_part_for_segments, prepare_part_on_volume};
+use crate::transfer::resilience::{Resilience, RetryEnv, Verdict};
 use crate::transfer::segment_table::SegmentTable;
 use crate::transfer::segmented::ConnectionCap;
 use crate::transfer::single::{
@@ -57,6 +62,8 @@ pub(crate) struct TaskCtx {
     pub motw: Arc<MotwService>,
     pub live: Arc<LiveDownload>,
     pub cap: Arc<ConnectionCap>,
+    pub hosts: Arc<HostRegistry>,
+    pub retry: RetryEnv,
 }
 
 /// What the first response of a plain GET produced.
@@ -86,6 +93,10 @@ pub(crate) struct DownloadTask {
     job: StoredJob,
     ctx: TaskCtx,
     state: DownloadState,
+    /// Retry decisions, budgets and the host cooldown of this run.
+    res: Arc<Resilience>,
+    /// Whether the one allowed re-probe after a broken range contract was used.
+    reprobed: bool,
 }
 
 fn internal() -> TaskStop {
@@ -96,7 +107,7 @@ fn client_stop(err: ClientError, ctx: &TaskCtx) -> TaskStop {
     match err {
         ClientError::Cancelled => ctx.live.stop().stopped(),
         ClientError::Redirect(redirect) => TaskStop::Fail(Failure::new(redirect.code())),
-        ClientError::Transport(kind) => failure_from_transfer(kind),
+        ClientError::Transport(kind) => TaskStop::Retry(Fault::Transport(kind)),
         ClientError::Build(_) => internal(),
     }
 }
@@ -105,7 +116,15 @@ impl DownloadTask {
     pub(crate) fn new(job: StoredJob, ctx: TaskCtx) -> Self {
         let state = job.state;
         ctx.live.set_state(state);
-        Self { job, ctx, state }
+        let host = ctx.hosts.handle_for(job.url.as_url());
+        let res = Arc::new(Resilience::new(&ctx.retry, host));
+        Self {
+            job,
+            ctx,
+            state,
+            res,
+            reprobed: false,
+        }
     }
 
     /// Runs to a terminal or paused state, or until stopped.
@@ -119,17 +138,54 @@ impl DownloadTask {
         let plan = plan_resume(&self.job);
         let reason = matches!(plan, ResumePlan::Restart(_)).then_some(REASON_RESTART_FROM_ZERO);
         self.advance(Command::Admit, reason).await?;
-        let landed = match plan {
-            ResumePlan::Continue(continuation) => self.resume(continuation).await?,
-            ResumePlan::Restart(why) => {
-                self.restart(why).await?;
-                self.start_fresh().await?
-            }
-            ResumePlan::Fresh => self.start_fresh().await?,
+        let landed = match self.transfer(plan).await {
+            Err(TaskStop::Reprobe(reason)) => self.replan(reason).await?,
+            other => other?,
         };
         let verified = self.verify(&landed.path, landed.total).await?;
         self.finish(&landed.path, &landed.final_url, &landed.name, &verified)
             .await
+    }
+
+    async fn transfer(&mut self, plan: ResumePlan) -> Result<Landed, TaskStop> {
+        match plan {
+            ResumePlan::Continue(continuation) => self.resume(continuation).await,
+            ResumePlan::Restart(why) => {
+                self.restart(why).await?;
+                self.start_fresh().await
+            }
+            ResumePlan::Fresh => self.start_fresh().await,
+        }
+    }
+
+    /// The server stopped honouring ranges (or contradicted the probe) mid-download: probe
+    /// again once, from nothing, and run whatever plan the new probe supports (a plain
+    /// single stream when ranges are gone). Nothing already on disk is trusted, so no byte
+    /// can land at a misplaced offset; a second break fails the download.
+    async fn replan(&mut self, reason: &'static str) -> Result<Landed, TaskStop> {
+        if self.reprobed {
+            return Err(Failure::protocol_violation(reason).into());
+        }
+        self.reprobed = true;
+        tracing::warn!(
+            reason,
+            "the range contract broke; re-probing and re-planning"
+        );
+        self.restart(RestartReason::NotResumable).await?;
+        match self.start_fresh().await {
+            Err(TaskStop::Reprobe(again)) => Err(Failure::protocol_violation(again).into()),
+            other => other,
+        }
+    }
+
+    /// Waits and decides after a failed attempt in the probe or the first plain request.
+    async fn settle_fault(&self, phase: Phase, fault: Fault) -> Result<(), TaskStop> {
+        let token = self.ctx.live.stop().token().clone();
+        match self.res.on_fault(phase, 0, fault, &token).await {
+            Verdict::Retry => Ok(()),
+            Verdict::Cancelled => Err(self.ctx.live.stop().stopped()),
+            Verdict::Stop(stop) => Err(stop),
+        }
     }
 
     /// Stops for any reason (the transfer phases).
@@ -157,14 +213,20 @@ impl DownloadTask {
     }
 
     async fn probe(&self) -> Result<Probed, TaskStop> {
-        self.stop_check()?;
         let token = self.ctx.live.stop().token().clone();
-        probe(&self.ctx.client, self.job.url.as_url(), &token)
-            .await
-            .map_err(|stop| match stop {
-                TaskStop::Stopped(_) => self.ctx.live.stop().stopped(),
-                other => other,
-            })
+        loop {
+            self.stop_check()?;
+            if self.res.gate(&token).await.is_err() {
+                return Err(self.ctx.live.stop().stopped());
+            }
+            let probed = probe(&self.ctx.client, self.job.url.as_url(), &token).await;
+            match probed {
+                Ok(probed) => return Ok(probed),
+                Err(TaskStop::Stopped(_)) => return Err(self.ctx.live.stop().stopped()),
+                Err(TaskStop::Retry(fault)) => self.settle_fault(Phase::Probe, fault).await?,
+                Err(other) => return Err(other),
+            }
+        }
     }
 
     /// Continues a stored download after checking its staging file. A file that is missing,
@@ -290,21 +352,39 @@ impl DownloadTask {
         })
     }
 
+    /// The first plain GET, retried while its failures are retryable.
     async fn open(&mut self) -> Result<Opened, TaskStop> {
-        self.stop_check()?;
         let token = self.ctx.live.stop().token().clone();
+        loop {
+            self.stop_check()?;
+            if self.res.gate(&token).await.is_err() {
+                return Err(self.ctx.live.stop().stopped());
+            }
+            match self.open_once(&token).await {
+                Ok(opened) => return Ok(opened),
+                Err(TaskStop::Retry(fault)) => self.settle_fault(Phase::Probe, fault).await?,
+                Err(other) => return Err(other),
+            }
+        }
+    }
+
+    async fn open_once(&self, token: &CancellationToken) -> Result<Opened, TaskStop> {
         let fetched = self
             .ctx
             .client
-            .get(self.job.url.as_url(), &token)
+            .get(self.job.url.as_url(), token)
             .await
             .map_err(|e| client_stop(e, &self.ctx))?;
+        let status = fetched.response.status().as_u16();
+        if status >= 400 && !matches!(status, 401 | 407) {
+            let retry_after = retry_after_of(&fetched.response);
+            return Err(TaskStop::Retry(Fault::Status {
+                status,
+                retry_after,
+            }));
+        }
         let plan = plan_response(&response_meta(&fetched.response))?;
-        let disposition = fetched
-            .response
-            .headers()
-            .get(CONTENT_DISPOSITION)
-            .map(|v| String::from_utf8_lossy(v.as_bytes()).into_owned());
+        let disposition = content_disposition_of(&fetched.response);
         let name = choose_name(&self.job, disposition.as_deref(), &fetched.final_url);
         Ok(Opened {
             response: fetched.response,
@@ -329,7 +409,11 @@ impl DownloadTask {
             limit: plan.total,
         };
         self.ctx.live.set_connections(1);
-        let outcome = stream_body(response, &mut writer, &env, &committer).await;
+        self.ctx.live.set_active_ranges(vec![(0, u64::MAX)]);
+        let mut reached = 0;
+        let outcome = stream_body(response, &mut writer, &env, &committer, &mut reached).await;
+        // A plain GET cannot resume: a failed body is final, never retried.
+        let outcome = outcome.map_err(TaskStop::into_final);
         self.end_session(writer, &committer, outcome).await
     }
 
@@ -365,12 +449,17 @@ impl DownloadTask {
             }
             return Err(stop);
         }
-        let cmd = if plan.transfer_mode == TransferMode::ZeroLength {
-            Command::ZeroLength
-        } else {
-            Command::ProbeSucceeded
+        let zero = plan.transfer_mode == TransferMode::ZeroLength;
+        let cmd = match (self.state, zero) {
+            // A re-plan after a broken range contract is already downloading.
+            (DownloadState::Downloading, true) => Some(Command::TransferComplete),
+            (DownloadState::Downloading, false) => None,
+            (_, true) => Some(Command::ZeroLength),
+            (_, false) => Some(Command::ProbeSucceeded),
         };
-        self.advance(cmd, None).await?;
+        if let Some(cmd) = cmd {
+            self.advance(cmd, None).await?;
+        }
         Ok(Staged {
             path: part.path,
             file: part.file,
@@ -420,6 +509,7 @@ impl DownloadTask {
         outcome: Result<u64, TaskStop>,
     ) -> Result<(), TaskStop> {
         self.ctx.live.set_connections(0);
+        self.ctx.live.set_active_ranges(Vec::new());
         match outcome {
             Ok(reached) => {
                 let frontier = writer.close().await.map_err(|e| writer_stop(&e))?;

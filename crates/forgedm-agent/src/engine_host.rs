@@ -337,6 +337,7 @@ mod tests {
             speed_bps: Some(5),
             eta_ms: Some(1000),
             active_connections: 1,
+            active_ranges: Vec::new(),
         };
         let item = progress_item(&sample);
         assert_eq!((item.accepted_bytes, item.committed_bytes), (10, 8));

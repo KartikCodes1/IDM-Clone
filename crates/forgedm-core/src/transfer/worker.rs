@@ -19,14 +19,18 @@ use tokio::time::{Instant, sleep, timeout};
 use tokio_util::sync::CancellationToken;
 use url::Url;
 
+use super::resilience::{Resilience, Verdict};
 use super::segment_table::{SegmentTable, TableError, WorkerId};
-use crate::client::{ClientError, FetchSpec, HttpClient, classify_reqwest, response_meta};
+use crate::client::{
+    ClientError, FetchSpec, HttpClient, classify_reqwest, response_meta, retry_after_of,
+};
 use crate::engine::LiveDownload;
-use crate::error::{Failure, TaskStop, failure_from_transfer};
+use crate::error::{Failure, Fault, TaskStop};
 use crate::http::content_range::RangeRequest;
 use crate::http::range_decision::{RangeDecision, RangedRequest, decide};
 use crate::http::validators::ResumeIdentity;
 use crate::progress::SpeedMeter;
+use crate::retry::{Phase, TransferErrorKind};
 use crate::transfer::single::writer_stop;
 use crate::writer::{Coalescer, WRITE_COALESCE, WriteHandle, WritePermit};
 
@@ -68,34 +72,49 @@ pub struct Shared {
     pub identity: ResumeIdentity,
     /// `If-Range` value, when the identity has a strong validator.
     pub if_range: Option<String>,
+    /// Retry decisions, budgets and the host cooldown of this download.
+    pub res: Arc<Resilience>,
     /// Fires when every worker must stop (a user stop or a failure).
     pub halt: CancellationToken,
     fatal: Mutex<Option<TaskStop>>,
     final_url: Mutex<Option<Url>>,
 }
 
+/// What [`Shared::new`] is built from.
+pub struct SharedInit {
+    /// The segment table.
+    pub table: SharedTable,
+    /// Where pieces are queued for the writer thread.
+    pub writer: WriteHandle,
+    /// Progress counters.
+    pub live: Arc<LiveDownload>,
+    /// The HTTP client.
+    pub client: HttpClient,
+    /// The original URL.
+    pub url: Url,
+    /// The remote identity every response is judged against.
+    pub identity: ResumeIdentity,
+    /// Retry decisions of this download.
+    pub res: Arc<Resilience>,
+    /// Should be a child of the download's stop token.
+    pub halt: CancellationToken,
+}
+
 impl Shared {
-    /// Builds the shared context; `halt` should be a child of the download's stop token.
+    /// Builds the shared context.
     #[must_use]
-    pub fn new(
-        table: SharedTable,
-        writer: WriteHandle,
-        live: Arc<LiveDownload>,
-        client: HttpClient,
-        url: Url,
-        identity: ResumeIdentity,
-        halt: CancellationToken,
-    ) -> Self {
-        let if_range = identity.if_range();
+    pub fn new(init: SharedInit) -> Self {
+        let if_range = init.identity.if_range();
         Self {
-            table,
-            writer,
-            live,
-            client,
-            url,
-            identity,
+            table: init.table,
+            writer: init.writer,
+            live: init.live,
+            client: init.client,
+            url: init.url,
+            identity: init.identity,
             if_range,
-            halt,
+            res: init.res,
+            halt: init.halt,
             fatal: Mutex::new(None),
             final_url: Mutex::new(None),
         }
@@ -151,7 +170,7 @@ fn table_bug(err: &TableError) -> TaskStop {
 fn client_failure(err: ClientError) -> TaskStop {
     match err {
         ClientError::Redirect(redirect) => TaskStop::Fail(Failure::new(redirect.code())),
-        ClientError::Transport(kind) => failure_from_transfer(kind),
+        ClientError::Transport(kind) => TaskStop::Retry(Fault::Transport(kind)),
         ClientError::Cancelled | ClientError::Build(_) => {
             TaskStop::Fail(Failure::new(DownloadErrorCode::Internal))
         }
@@ -190,15 +209,16 @@ pub fn judge_segment(decision: RangeDecision) -> Result<Accepted, TaskStop> {
         RangeDecision::UnsupportedContentEncoding => {
             Err(Failure::new(DownloadErrorCode::UnsupportedContentEncoding).into())
         }
-        RangeDecision::RangeUnsupported => {
-            Err(Failure::protocol_violation("ranges_no_longer_supported").into())
-        }
-        RangeDecision::Reprobe => Err(Failure::protocol_violation("reprobe_needed").into()),
+        RangeDecision::RangeUnsupported => Err(TaskStop::Reprobe("ranges_no_longer_supported")),
+        RangeDecision::Reprobe => Err(TaskStop::Reprobe("reprobe_needed")),
         RangeDecision::Violation(violation) => {
             Err(Failure::protocol_violation(violation.reason()).into())
         }
         RangeDecision::OtherStatus { status: 401 | 407 } => Err(TaskStop::NeedsCredentials),
-        RangeDecision::OtherStatus { status } => Err(Failure::http_status(status).into()),
+        RangeDecision::OtherStatus { status } => Err(TaskStop::Retry(Fault::Status {
+            status,
+            retry_after: None,
+        })),
     }
 }
 
@@ -284,21 +304,47 @@ async fn fetch_segment(
         if claim >= end {
             return Ok(SegmentEnd::Done);
         }
-        let Some((response, accepted)) = open(shared, no, claim, end, cancel).await? else {
+        if shared.res.gate(cancel).await.is_err() {
             return Ok(SegmentEnd::Cancelled);
-        };
-        let body = Body {
-            shared,
-            id,
-            no,
-            accepted,
-            cancel,
-        };
-        if body.stream(response, claim, buffer).await? == SegmentEnd::Cancelled {
-            return Ok(SegmentEnd::Cancelled);
+        }
+        let ranged = (claim, end);
+        match attempt(shared, id, no, ranged, cancel, buffer).await {
+            Ok(SegmentEnd::Done) => {}
+            Ok(SegmentEnd::Cancelled) => return Ok(SegmentEnd::Cancelled),
+            Err(TaskStop::Retry(fault)) => {
+                let phase = Phase::Transfer;
+                match shared.res.on_fault(phase, no, fault, cancel).await {
+                    Verdict::Retry => {}
+                    Verdict::Cancelled => return Ok(SegmentEnd::Cancelled),
+                    Verdict::Stop(stop) => return Err(stop),
+                }
+            }
+            Err(other) => return Err(other),
         }
     }
     Err(Failure::protocol_violation("too_many_partial_responses").into())
+}
+
+/// One request for `[claim, end)` and the reading of its body.
+async fn attempt(
+    shared: &Shared,
+    id: WorkerId,
+    no: u32,
+    (claim, end): (u64, u64),
+    cancel: &CancellationToken,
+    buffer: &mut Coalescer,
+) -> Result<SegmentEnd, TaskStop> {
+    let Some((response, accepted)) = open(shared, no, claim, end, cancel).await? else {
+        return Ok(SegmentEnd::Cancelled);
+    };
+    let body = Body {
+        shared,
+        id,
+        no,
+        accepted,
+        cancel,
+    };
+    body.stream(response, claim, buffer).await
 }
 
 /// Sends the request for `[claim, end)` and judges the response. `None` when cancelled.
@@ -330,6 +376,15 @@ async fn open(
         &shared.identity,
         &response_meta(&fetched.response),
     );
+    if let RangeDecision::OtherStatus { status } = decision
+        && !matches!(status, 401 | 407)
+    {
+        let retry_after = retry_after_of(&fetched.response);
+        return Err(TaskStop::Retry(Fault::Status {
+            status,
+            retry_after,
+        }));
+    }
     let accepted = judge_segment(decision)?;
     shared.note_final_url(fetched.final_url);
     Ok(Some((fetched.response, accepted)))
@@ -391,8 +446,14 @@ impl Body<'_> {
             };
             let bytes = match chunk {
                 Ok(Some(bytes)) => bytes,
-                Ok(None) => return Err(Failure::new(DownloadErrorCode::BodyIncomplete).into()),
-                Err(err) => return Err(failure_from_transfer(classify_reqwest(&err))),
+                Ok(None) => {
+                    let eof = TransferErrorKind::PrematureEof;
+                    return Err(TaskStop::Retry(Fault::Transport(eof)));
+                }
+                Err(err) => {
+                    let kind = classify_reqwest(&err);
+                    return Err(TaskStop::Retry(Fault::Transport(kind)));
+                }
             };
             let (taken, allowed) = self.claim(pos, bytes.len())?;
             let kept = usize::try_from(allowed).unwrap_or(0);
@@ -401,6 +462,7 @@ impl Body<'_> {
                 .map_err(|_| table_bug(&TableError::Order(self.no)))?;
             pos += allowed;
             received += allowed;
+            self.shared.res.on_progress(self.no, allowed);
             if published.elapsed() >= SPEED_PUBLISH {
                 meter.sample(Instant::now(), received);
                 self.shared.lock().set_speed(self.no, meter.speed());
